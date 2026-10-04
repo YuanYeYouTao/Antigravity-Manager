@@ -505,6 +505,19 @@ pub fn resolve_custom_budget(
     let is_flash =
         is_tiered_flash_model(&std_id) || lower.contains("flash") || is_gemini_v3_or_above(&std_id);
 
+    // Non-tiered Flash Default uses the pipeline's official-catalog fallback,
+    // not Custom values retained when the UI switches modes. Keep this before
+    // the legacy single-value override; tiered and Client policies stay intact.
+    if is_flash
+        && !is_pro
+        && !is_claude
+        && !is_tiered_flash_model(&std_id)
+        && !lower.contains("tiered")
+        && tb_config.flash_mode == ThinkingBudgetMode::Default
+    {
+        return None;
+    }
+
     // 兼容历史单值测试逻辑：仅针对未指定显式档位后缀且非 tiered 的裸模型生效
     if tb_config.mode == ThinkingBudgetMode::Custom
         && tb_config.custom_value != 24576
@@ -687,6 +700,89 @@ pub fn resolve_custom_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_non_tiered_flash_default_ignores_saved_custom_budgets() {
+        use crate::proxy::config::{ThinkingBudgetConfig, ThinkingBudgetMode};
+        for low in [32768, -1, 0] {
+            for legacy in [24576, 12345] {
+                let config = ThinkingBudgetConfig {
+                    flash_mode: ThinkingBudgetMode::Default,
+                    flash_low: low,
+                    flash_medium: 32768,
+                    flash_high: 65536,
+                    custom_value: legacy,
+                    ..ThinkingBudgetConfig::default()
+                };
+                for model in [
+                    "gemini-3.7-flash-low",
+                    "gemini-3.8-flash-low",
+                    "gemini-3.10-flash-low",
+                    "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-high",
+                    "gemini-3.8-flash",
+                ] {
+                    for effort in [None, Some("low"), Some("high")] {
+                        assert_eq!(
+                            resolve_custom_budget(model, effort, Some(8192), &config, None),
+                            None,
+                            "model={model}, effort={effort:?}, low={low}, legacy={legacy}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_flash_default_fix_preserves_other_budget_policies() {
+        use crate::proxy::config::{
+            ThinkingBudgetConfig, ThinkingBudgetMode, ThinkingControlSource,
+        };
+        let mut config = ThinkingBudgetConfig {
+            flash_low: 32768,
+            flash_medium: 32768,
+            flash_high: 65536,
+            flash_mode: ThinkingBudgetMode::Default,
+            ..ThinkingBudgetConfig::default()
+        };
+        for (effort, expected) in [
+            (None, -1),
+            (Some("low"), 32768),
+            (Some("medium"), 32768),
+            (Some("high"), 65536),
+        ] {
+            assert_eq!(
+                resolve_custom_budget("gemini-3.8-flash-tiered", effort, None, &config, None),
+                Some(expected)
+            );
+        }
+        for mode in [
+            ThinkingBudgetMode::Custom,
+            ThinkingBudgetMode::Auto,
+            ThinkingBudgetMode::Passthrough,
+            ThinkingBudgetMode::Adaptive,
+        ] {
+            config.flash_mode = mode;
+            assert_eq!(
+                resolve_custom_budget("gemini-3.8-flash-low", None, None, &config, None),
+                Some(32768)
+            );
+            // Preserve the existing named-low + high-effort policy too.
+            assert_eq!(
+                resolve_custom_budget("gemini-3.8-flash-low", Some("high"), None, &config, None),
+                Some(65536)
+            );
+        }
+        config.flash_mode = ThinkingBudgetMode::Default;
+        config.control_source = ThinkingControlSource::Client;
+        for budget in [None, Some(0), Some(8192)] {
+            assert_eq!(
+                resolve_custom_budget("gemini-3.8-flash-low", Some("low"), budget, &config, None),
+                budget.map(|value| value as i64)
+            );
+        }
+    }
 
     #[test]
     fn test_gemini_version_checks() {
