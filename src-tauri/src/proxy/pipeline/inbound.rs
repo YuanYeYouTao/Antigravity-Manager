@@ -2252,11 +2252,82 @@ mod tests {
     }
 
     #[test]
+    fn test_configure_non_tiered_flash_default_uses_official_budget() {
+        use crate::proxy::config::{
+            get_thinking_budget_config, update_thinking_budget_config, ThinkingBudgetConfig,
+            ThinkingBudgetMode,
+        };
+        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreConfig(ThinkingBudgetConfig);
+        impl Drop for RestoreConfig {
+            fn drop(&mut self) {
+                update_thinking_budget_config(self.0.clone());
+            }
+        }
+        let _restore = RestoreConfig(get_thinking_budget_config());
+        for mode in [ThinkingBudgetMode::Default, ThinkingBudgetMode::Custom] {
+            update_thinking_budget_config(ThinkingBudgetConfig {
+                flash_mode: mode.clone(),
+                flash_low: 32768,
+                flash_medium: 32768,
+                flash_high: 65536,
+                custom_value: 12345,
+                ..ThinkingBudgetConfig::default()
+            });
+            for (model, official) in [
+                ("gemini-3.8-flash-low", 1000),
+                ("gemini-3.8-flash-medium", 4000),
+            ] {
+                assert_eq!(
+                    crate::models::OfficialModelCatalog::get(model)
+                        .expect("embedded official model")
+                        .thinking_budget,
+                    Some(official)
+                );
+                let mut gc = json!({
+                    "maxOutputTokens": 8192,
+                    "thinkingConfig": {"thinkingBudget": 8192, "thinkingLevel": "HIGH"}
+                });
+                let result = InboundThinkingPipeline::configure_inbound_thinking(
+                    model,
+                    &mut gc,
+                    ClientThinkingSwitch::Enabled,
+                    None,
+                    Some(8192),
+                    None,
+                );
+                let expected = if mode == ThinkingBudgetMode::Default {
+                    official
+                } else {
+                    32768
+                };
+                assert_eq!(result, Some(expected));
+                assert_eq!(gc["thinkingConfig"]["thinkingBudget"], expected);
+                assert_eq!(gc["thinkingConfig"]["includeThoughts"], true);
+                assert!(gc["thinkingConfig"].get("thinkingLevel").is_none());
+                assert_eq!(
+                    gc["maxOutputTokens"],
+                    if mode == ThinkingBudgetMode::Default {
+                        8192
+                    } else {
+                        40960
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_configure_inbound_thinking_client_mode_routing_clean_isolation() {
         use crate::proxy::config::{
             update_thinking_budget_config, ThinkingBudgetConfig, ThinkingControlSource,
         };
 
+        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut config = ThinkingBudgetConfig::default();
         config.control_source = ThinkingControlSource::Client;
         update_thinking_budget_config(config);

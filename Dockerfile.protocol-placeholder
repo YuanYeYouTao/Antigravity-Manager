@@ -57,7 +57,7 @@ WORKDIR /app/src-tauri
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
-    cargo fmt -- --check && cargo clippy --all-targets --all-features --locked && cargo test --lib defense_tests --locked && cargo test --lib auto_heal::tests --locked && cargo build --release --bin antigravity-tools --locked && \
+    cargo fmt -- --check && cargo clippy --all-targets --all-features --locked && cargo test --lib flash_default --locked && cargo test --lib non_stream_timing_uses_handler_header_names --locked && cargo test --lib defense_tests --locked && cargo test --lib auto_heal::tests --locked && cargo build --release --bin antigravity-tools --locked && \
     cp target/release/antigravity-tools /tmp/antigravity-tools
 
 FROM lbjlaq/antigravity-manager@sha256:c661f26ecf85806071e2c76c894ce7b986fafc4c78ce854c3affd7c0142a4725
