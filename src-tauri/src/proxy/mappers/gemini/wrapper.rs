@@ -1237,6 +1237,109 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn test_flash_default_budget_reaches_wrapped_wire_without_custom_inflation() {
+        use crate::proxy::config::{
+            get_thinking_budget_config, update_thinking_budget_config, ThinkingBudgetConfig,
+            ThinkingBudgetMode, ThinkingControlSource,
+        };
+        let _test_lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreConfig(ThinkingBudgetConfig);
+        impl Drop for RestoreConfig {
+            fn drop(&mut self) {
+                update_thinking_budget_config(self.0.clone());
+            }
+        }
+        let _restore = RestoreConfig(get_thinking_budget_config());
+        let mut config = ThinkingBudgetConfig {
+            flash_low: 32768,
+            flash_medium: 32768,
+            flash_high: 65536,
+            custom_value: 12345,
+            ..ThinkingBudgetConfig::default()
+        };
+        let body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "Budget fixture"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 8192,
+                "thinkingConfig": {"thinkingLevel": "LOW", "includeThoughts": true}
+            }
+        });
+        let original = body.clone();
+        for mode in [
+            ThinkingBudgetMode::Default,
+            ThinkingBudgetMode::Custom,
+            ThinkingBudgetMode::Auto,
+            ThinkingBudgetMode::Passthrough,
+            ThinkingBudgetMode::Adaptive,
+        ] {
+            config.flash_mode = mode.clone();
+            update_thinking_budget_config(config.clone());
+            let wrapped = wrap_request(
+                &body,
+                "fixture-project",
+                "gemini-3.8-flash-low",
+                None,
+                None,
+                None,
+            );
+            let gc = &wrapped["request"]["generationConfig"];
+            let expected = if mode == ThinkingBudgetMode::Default {
+                1000
+            } else {
+                32768
+            };
+            assert_eq!(gc["thinkingConfig"]["thinkingBudget"], expected);
+            assert_eq!(gc["thinkingConfig"]["includeThoughts"], true);
+            assert!(gc["thinkingConfig"].get("thinkingLevel").is_none());
+            assert_eq!(
+                gc["maxOutputTokens"],
+                if mode == ThinkingBudgetMode::Default {
+                    8192
+                } else {
+                    40960
+                }
+            );
+            assert_eq!(body, original, "wrapping must not mutate the client body");
+        }
+
+        config.flash_mode = ThinkingBudgetMode::Default;
+        update_thinking_budget_config(config.clone());
+        let tiered = wrap_request(
+            &body,
+            "fixture-project",
+            "gemini-3.8-flash-tiered",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            tiered["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"], 32768,
+            "tiered level policy is unchanged"
+        );
+        assert_eq!(
+            tiered["request"]["generationConfig"]["maxOutputTokens"],
+            40960
+        );
+
+        config.control_source = ThinkingControlSource::Client;
+        update_thinking_budget_config(config);
+        let client = wrap_request(
+            &body,
+            "fixture-project",
+            "gemini-3.8-flash-low",
+            None,
+            None,
+            None,
+        );
+        let gc = &client["request"]["generationConfig"];
+        assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "LOW");
+        assert!(gc["thinkingConfig"].get("thinkingBudget").is_none());
+    }
+
+    #[test]
     fn test_wrap_request() {
         let body = json!({
             "model": "gemini-2.5-flash",

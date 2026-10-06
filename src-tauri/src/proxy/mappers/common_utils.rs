@@ -1922,18 +1922,18 @@ pub fn wrap_in_system_reminder(content: &str) -> String {
     )
 }
 
-/// [DEFENSE] 报文结构保底文本。只补一个中性短句，不引导模型进入分析或改代码。
-pub const TRANSIT_DEFENSE_FALLBACK_TEXT: &str = "ok go on";
+/// [DEFENSE] 非空协议占位；不代表新增用户输入或要求模型继续执行。
+pub const TRANSIT_DEFENSE_FALLBACK_TEXT: &str = "[Protocol placeholder: no additional user input.]";
 
 /// [DEFENSE] 通用中转报文保底防御节点（协议无关性）
-/// 确保发给 Google Gemini 的报文末尾轮次严格符合规范：
+/// 保留既有 CloudCode 末尾 user 兼容处理，不把协议补齐伪造成用户的继续指令：
 /// 1. 自动兼容平铺 payload 或包含 "request" 包装的 payload；
 /// 2. 若 contents 为空，追加 {"role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]}；
-/// 3. 若末尾轮次为 "model"（缺失用户轮次），追加 {"role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]}；
-///    例外：末尾 model 轮若携带 functionCall / functionResponse（模型主动发起的工具轮），
-///    视为合法中间态，不注入（否则会与 normalize_function_response_roles 的 fr@model 对齐
-///    打架，把官方合法报文误判为缺用户轮，注入中性占位造成工具死循环）；
-/// 4. 若末尾轮次为 "user" 且其 parts 为空、或仅含有空文本 / "(no content)" / "·" 且无工具/图片，规范化填充为 [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]；
+/// 3. 末尾 "model" / "assistant" 的纯工具回执（可伴随媒体）原样保留；目标 CloudCode
+///    gemini-3.8-flash-low 实测接受此结构，不据此推断所有 Google 协议行为。
+///    其余 model 尾轮（包括尚未获得回执的 functionCall）仍追加非指令协议占位；
+/// 4. 若末尾轮次为 "user" 且其 parts 为空、或仅含空白文本且无工具/图片，填充协议占位；
+///    非空用户文本（包括 "(no content)" / "·"）原样保留；
 /// 5. 修复中间轮次中 parts 为空的情况，防止 Google 返回 400 "parts must not be empty"。
 pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
     let contents = if let Some(contents) = body
@@ -1952,7 +1952,7 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
 
     // 防御 1: contents 整体为空
     if contents.is_empty() {
-        tracing::warn!("[Defense] Gemini contents array is empty, appending fallback user turn");
+        tracing::warn!("[Defense] Gemini contents array is empty, appending protocol placeholder");
         contents.push(json!({
             "role": "user",
             "parts": [{ "text": TRANSIT_DEFENSE_FALLBACK_TEXT }]
@@ -1980,14 +1980,32 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
     }
 
     // 防御 3: 检查末尾轮次。
-    // Google Gemini 严格禁止请求以 model/assistant 轮次结尾（上游抛出 400 "Requests ending with a model turn are not supported"）。
-    // 进站流水线 normalize_function_response_roles 在 Gemini 目标下会将工具回执对齐为 role=model，
-    // 若客户端（如 Claude Code CLI）在工具执行完后发送的消息列表以回执收尾（或尾部空 system-reminder 被剥离），
-    // 必须在此处为末尾 model 轮（无论含有文本、functionCall 还是 functionResponse）追加中性合规的 user 兜底轮，彻底杜绝 400 校验终止。
+    // 保留针对已报告 CloudCode 400 "Requests ending with a model turn are not supported"
+    // 的兼容处理，但已实测合法的纯工具回执不添加额外用户轮次。
+    // 不改已有 role、functionCall / functionResponse、签名或真实历史。
     let need_append_user = if let Some(last_turn) = contents.last_mut() {
         let role = last_turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "model" || role == "assistant" {
-            true
+            let pure_tool_response = last_turn
+                .get("parts")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part.get("functionResponse").is_some_and(Value::is_object))
+                        && parts.iter().all(|part| {
+                            part.as_object().is_some_and(|part| {
+                                !part.is_empty()
+                                    && part.iter().all(|(key, value)| {
+                                        matches!(
+                                            key.as_str(),
+                                            "functionResponse" | "inlineData" | "fileData"
+                                        ) && value.is_object()
+                                    })
+                            })
+                        })
+                });
+            !pure_tool_response
         } else {
             if let Some(parts) = last_turn.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 let has_substantive_part = parts.iter().any(|part| {
@@ -2000,7 +2018,7 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
                     }
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                         let t = text.trim();
-                        !t.is_empty() && t != "(no content)" && t != "·"
+                        !t.is_empty()
                     } else {
                         false
                     }
@@ -2008,8 +2026,7 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
 
                 if !has_substantive_part {
                     tracing::warn!(
-                        "[Defense] Last user turn has no substantive content, normalizing to '{}'",
-                        TRANSIT_DEFENSE_FALLBACK_TEXT
+                        "[Defense] Empty user content replaced with protocol placeholder"
                     );
                     *parts = vec![json!({ "text": TRANSIT_DEFENSE_FALLBACK_TEXT })];
                     modified = true;
@@ -2023,8 +2040,7 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
 
     if need_append_user {
         tracing::warn!(
-            "[Defense] Gemini payload ended with model turn, appending user turn with '{}'",
-            TRANSIT_DEFENSE_FALLBACK_TEXT
+            "[Defense] Model-ended payload repaired with protocol placeholder user turn"
         );
         contents.push(json!({
             "role": "user",
@@ -2098,10 +2114,10 @@ mod defense_tests {
     }
 
     #[test]
-    fn test_ensure_gemini_payload_ends_with_user_no_content() {
+    fn test_ensure_gemini_payload_ends_with_user_blank_content() {
         let mut payload = json!({
             "contents": [
-                { "role": "user", "parts": [{ "text": "(no content)" }] }
+                { "role": "user", "parts": [{ "text": " \n\t" }] }
             ]
         });
         assert!(ensure_gemini_payload_ends_with_user(&mut payload));
@@ -2127,8 +2143,8 @@ mod defense_tests {
 
     #[test]
     fn test_ensure_gemini_payload_ends_with_user_tool_turn_injected() {
-        // 末尾 model 轮无论是工具轮（functionCall / functionResponse）还是纯正文，
-        // 均注入中性合规 user 引导轮，防御 Google Gemini 400 'Requests ending with a model turn are not supported'。
+        // 尚未获得回执的 functionCall 尾轮仍保留非指令协议占位；
+        // 不改已有工具调用，不伪造回执或继续请求。
         let mut payload = json!({
             "contents": [
                 { "role": "user", "parts": [{ "text": "run the tool" }] },
@@ -2168,6 +2184,180 @@ mod defense_tests {
         let contents2 = payload2["contents"].as_array().unwrap();
         assert_eq!(contents2.len(), 3);
         assert_eq!(contents2[2]["role"], "user");
+    }
+
+    fn with_contents(contents: Value, wrapped: bool) -> Value {
+        let request = json!({
+            "contents": contents,
+            "systemInstruction": {"parts": [{"text": "Original system instruction."}]},
+            "tools": [{"functionDeclarations": [{"name": "send_message"}]}],
+            "generationConfig": {"temperature": 0.4}
+        });
+        if wrapped {
+            json!({"request": request, "model": "original-model"})
+        } else {
+            request
+        }
+    }
+
+    #[test]
+    fn test_nonempty_user_text_tool_and_media_are_untouched() {
+        let parts = [
+            json!([{"text": "·"}]),
+            json!([{"text": "(no content)"}]),
+            json!([{"text": "  (no content)  "}]),
+            json!([{"text": "Real user input.", "thoughtSignature": "original-signature"}]),
+            json!([{"inlineData": {"mimeType": "image/png", "data": "original-image"}}]),
+            json!([{"fileData": {"mimeType": "image/png", "fileUri": "original-file"}}]),
+            json!([{"functionResponse": {
+                "id": "call_send", "name": "send_message", "response": {"delivered": true}
+            }}]),
+        ];
+        for wrapped in [false, true] {
+            for part in &parts {
+                let mut payload = with_contents(json!([{"role": "user", "parts": part}]), wrapped);
+                let original = payload.clone();
+                assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+                assert_eq!(payload, original);
+            }
+        }
+    }
+
+    #[test]
+    fn test_pure_tool_response_tail_is_idempotent_and_preserves_signed_pairs() {
+        let receipt = json!({"functionResponse": {
+            "id": "call_send", "name": "send_message", "response": {"delivered": true}
+        }});
+        let other_receipt = json!({"functionResponse": {
+            "id": "call_status", "name": "get_status", "response": {"ok": true}
+        }});
+        let tails = [
+            json!([receipt]),
+            json!([receipt, other_receipt,
+                {"inlineData": {"mimeType": "image/png", "data": "original-image"}},
+                {"fileData": {"mimeType": "image/png", "fileUri": "original-file"}}]),
+        ];
+        for wrapped in [false, true] {
+            for role in ["model", "assistant"] {
+                for parts in &tails {
+                    let calls = parts.as_array().unwrap().iter().filter_map(|part| {
+                        part.get("functionResponse").map(|response| json!({
+                            "functionCall": {"id": response["id"], "name": response["name"], "args": {}},
+                            "thoughtSignature": "original-call-signature"
+                        }))
+                    }).collect::<Vec<_>>();
+                    let mut payload = with_contents(
+                        json!([
+                            {"role": "user", "parts": [{"text": "Original user request."}]},
+                            {"role": "model", "parts": calls},
+                            {"role": role, "parts": parts}
+                        ]),
+                        wrapped,
+                    );
+                    let original = payload.clone();
+                    assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+                    assert_eq!(payload, original);
+                    assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+                    assert_eq!(payload, original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_model_tail_placeholder_is_idempotent_and_preserves_real_prefix() {
+        let tails = [
+            json!([{"text": "Final model text.", "thoughtSignature": "final-signature"}]),
+            json!([{"functionCall": {
+                "id": "call_send", "name": "send_message", "args": {"text": "Original message."}
+            }, "thoughtSignature": "call-signature"}]),
+            json!([{"functionResponse": {
+                "id": "call_send", "name": "send_message", "response": {"delivered": true}
+            }}, {"text": "Additional model text."}]),
+            json!([{"functionResponse": {
+                "id": "call_send", "name": "send_message", "response": {"delivered": true}
+            }}, {"thought": true, "text": "Additional thought."}]),
+            json!([{"functionResponse": {
+                "id": "call_send", "name": "send_message", "response": {"delivered": true}
+            }}, {"functionCall": {"id": "call_next", "name": "send_message", "args": {}}}]),
+            json!([{"functionResponse": {
+                "id": "call_send", "name": "send_message", "response": {"delivered": true}
+            }, "text": "Mixed part text."}]),
+            json!([{"inlineData": {"mimeType": "image/png", "data": "original-image"}}]),
+        ];
+        for wrapped in [false, true] {
+            for role in ["model", "assistant"] {
+                for parts in &tails {
+                    let mut contents = vec![json!({
+                        "role": "user", "parts": [{"text": "Original user request."}]
+                    })];
+                    // A real receipt follows its original signed call; an awaiting
+                    // call is not duplicated or supplied with a fabricated receipt.
+                    if parts
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|part| part.get("functionResponse").is_some())
+                    {
+                        contents.push(json!({
+                            "role": "model", "parts": [{"functionCall": {
+                                "id": "call_send", "name": "send_message",
+                                "args": {"text": "Original message."}
+                            }, "thoughtSignature": "original-call-signature"}]
+                        }));
+                    }
+                    contents.push(json!({"role": role, "parts": parts}));
+                    let mut payload = with_contents(json!(contents), wrapped);
+                    let mut expected = payload.clone();
+                    let request = if wrapped {
+                        &mut expected["request"]
+                    } else {
+                        &mut expected
+                    };
+                    request["contents"].as_array_mut().unwrap().push(json!({
+                        "role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]
+                    }));
+                    assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+                    assert_eq!(payload, expected);
+                    assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+                    assert_eq!(payload, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_parts_and_blank_tail_are_repaired_without_continuation_instruction() {
+        for wrapped in [false, true] {
+            for tail in [json!([]), json!([{"text": " \n\t"}])] {
+                let mut payload = with_contents(
+                    json!([
+                        {"role": "user", "parts": []},
+                        {"role": "model", "parts": []},
+                        {"role": "user", "parts": tail}
+                    ]),
+                    wrapped,
+                );
+                let mut expected = payload.clone();
+                let request = if wrapped {
+                    &mut expected["request"]
+                } else {
+                    &mut expected
+                };
+                request["contents"][0]["parts"] = json!([{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]);
+                request["contents"][1]["parts"] = json!([{"text": "..."}]);
+                request["contents"][2]["parts"] = json!([{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]);
+                assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+                assert_eq!(payload, expected);
+                assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+                assert_eq!(payload, expected);
+            }
+            let mut payload = with_contents(json!([]), wrapped);
+            assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+            let once = payload.clone();
+            assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+            assert_eq!(payload, once);
+        }
     }
 
     #[test]

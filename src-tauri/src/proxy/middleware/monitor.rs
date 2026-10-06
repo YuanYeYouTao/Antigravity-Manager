@@ -646,7 +646,7 @@ fn consolidate_non_streaming_response(
         "stream_ms",
         "total_ms",
     ] {
-        let hdr_key = format!("x-timing-{}", key);
+        let hdr_key = format!("x-timing-{}", key.replace('_', "-"));
         if let Some(val) = headers_map.get(&hdr_key).and_then(|v| v.as_str()) {
             if let Ok(n) = val.parse::<f64>() {
                 let out_key = key.replace("_ms", "_s");
@@ -1674,6 +1674,42 @@ pub async fn monitor_middleware(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_stream_timing_uses_handler_header_names() {
+        let mut log = crate::proxy::monitor::prompt_log_tests::sample_log("timing-fixture", 0);
+        log.duration = 9999;
+        let response = serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "Fixture output"}]}}]
+        });
+        let headers = serde_json::json!({
+            "x-timing-clean-ms": "1.250",
+            "x-timing-norm-ms": "2.500",
+            "x-timing-thinking-ms": "30.000",
+            "x-timing-ttft-ms": "1500.000",
+            "x-timing-stream-ms": "2000.000",
+            "x-timing-total-ms": "3500.000"
+        });
+        let consolidated = super::consolidate_non_streaming_response(
+            &response,
+            &log,
+            headers.as_object().unwrap(),
+        )
+        .expect("non-stream content is consolidated");
+        assert_eq!(consolidated["content"], "Fixture output");
+        assert_eq!(
+            consolidated["_timing"],
+            serde_json::json!({
+                "clean_s": 0.00125, "norm_s": 0.0025, "thinking_s": 0.03,
+                "ttft_s": 1.5, "stream_s": 2.0, "total_s": 3.5
+            })
+        );
+        let fallback =
+            super::consolidate_non_streaming_response(&response, &log, &serde_json::Map::new())
+                .unwrap();
+        assert_eq!(fallback["_timing"]["total_s"], 9.999);
+        assert!(fallback["_timing"].get("ttft_s").is_none());
+    }
+
     use super::next_chunk_while_receiver_open;
     use futures::stream;
     use std::sync::{
