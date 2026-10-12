@@ -81,14 +81,14 @@ pub struct ModelTokenStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelTrendPoint {
     pub period: String,
-    pub model_data: std::collections::HashMap<String, u64>,
+    pub model_data: std::collections::HashMap<String, Option<u64>>,
 }
 
 /// Account trend data point (for stacked area chart)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountTrendPoint {
     pub period: String,
-    pub account_data: std::collections::HashMap<String, u64>,
+    pub account_data: std::collections::HashMap<String, Option<u64>>,
 }
 
 pub(crate) fn get_db_path() -> Result<PathBuf, String> {
@@ -761,7 +761,7 @@ pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String
         .prepare(
             "SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'unixepoch', 'localtime')) as hour_bucket,
                 model,
-                COALESCE(SUM(reported_total_tokens), 0) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY hour_bucket, model
@@ -769,15 +769,17 @@ pub fn get_model_trend_hourly(hours: i64) -> Result<Vec<ModelTrendPoint>, String
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -805,7 +807,7 @@ pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> 
         .prepare(
             "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day_bucket,
                 model,
-                COALESCE(SUM(reported_total_tokens), 0) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY day_bucket, model
@@ -813,15 +815,17 @@ pub fn get_model_trend_daily(days: i64) -> Result<Vec<ModelTrendPoint>, String> 
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -849,7 +853,7 @@ pub fn get_account_trend_hourly(hours: i64) -> Result<Vec<AccountTrendPoint>, St
         .prepare(
             "SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'unixepoch', 'localtime')) as hour_bucket,
                 account_email,
-                COALESCE(SUM(reported_total_tokens), 0) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY hour_bucket, account_email
@@ -857,15 +861,17 @@ pub fn get_account_trend_hourly(hours: i64) -> Result<Vec<AccountTrendPoint>, St
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -896,7 +902,7 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
         .prepare(
             "SELECT strftime('%Y-%m-%d', datetime(timestamp, 'unixepoch', 'localtime')) as day_bucket,
                 account_email,
-                COALESCE(SUM(reported_total_tokens), 0) as total
+                SUM(reported_total_tokens) as total
          FROM token_usage
          WHERE timestamp >= ?1
          GROUP BY day_bucket, account_email
@@ -904,15 +910,17 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
         )
         .map_err(|e| e.to_string())?;
 
-    let mut trend_map: std::collections::BTreeMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::BTreeMap::new();
+    let mut trend_map: std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, Option<u64>>,
+    > = std::collections::BTreeMap::new();
 
     let rows = stmt
         .query_map([cutoff], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, Option<u64>>(2)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -1001,6 +1009,30 @@ mod tests {
         assert_eq!(summary.total_requests, 4);
         assert_eq!(summary.total_tokens, 0);
         assert_eq!(summary.total_reported_requests, 1);
+        for trend in [
+            get_model_trend_hourly(0).unwrap(),
+            get_model_trend_daily(0).unwrap(),
+        ] {
+            let totals: Vec<_> = trend
+                .iter()
+                .flat_map(|point| point.model_data.values())
+                .copied()
+                .collect();
+            assert!(totals.contains(&None));
+            assert!(totals.contains(&Some(0)));
+        }
+        for trend in [
+            get_account_trend_hourly(0).unwrap(),
+            get_account_trend_daily(0).unwrap(),
+        ] {
+            let totals: Vec<_> = trend
+                .iter()
+                .flat_map(|point| point.account_data.values())
+                .copied()
+                .collect();
+            assert!(totals.contains(&None));
+            assert!(totals.contains(&Some(0)));
+        }
     }
 
     use super::*;

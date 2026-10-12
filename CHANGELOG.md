@@ -4,9 +4,9 @@
 
 *   **版本演进**:
     *   **v4.9.7-beta.9 (2026-10-13)**:
-        -   **[会话与缓存证据] 分离上游会话与私有思考归属，退出签名尾部盲猜 (Ref PR #3, Thanks to @YuanYeYouTao)**:
+        -   **[会话与缓存证据] 分离上游会话与私有思考归属，退出签名尾部盲猜 (PR #4, Thanks to @YuanYeYouTao)**:
             -   四协议沿真实请求编号及原affinity升代；原工具签名继续按真实调用匹配，不给公开文本借最近签名。删除显式thinking budget的经验回落。
-        -   **[计量] 保留真实用量、缺值与派发次数 (Ref PR #3, Thanks to @YuanYeYouTao)**:
+        -   **[计量] 保留真实用量、缺值与派发次数 (PR #4, Thanks to @YuanYeYouTao)**:
             -   统计沿缩放前上游数据保存input/cache/output/thinking及实报total；缺值不补成零，旧派生总量另存。缓存比例使用同一已知子集，并显示覆盖；流式晚到用量和实际派发在原holder收尾。名义价格与缺项分别展示，不宣称已证明生产省钱。
 
     *   **v4.9.7-beta.8 (2026-10-11)**:

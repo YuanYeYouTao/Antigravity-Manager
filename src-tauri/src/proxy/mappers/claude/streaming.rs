@@ -1131,6 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_native_usage_survives_the_actual_claude_stream_and_collector() {
+        use futures::StreamExt;
         let frames = [
             json!({
                 "responseId":"partial-fixture","modelVersion":"gemini-fixture",
@@ -1158,7 +1159,11 @@ mod tests {
             None,
             Vec::new(),
         );
-        let collected = super::super::collect_stream_to_json(mapped).await.unwrap();
+        let collected = super::super::collect_stream_to_json(
+            mapped.map(|chunk| chunk.map_err(std::io::Error::other)),
+        )
+        .await
+        .unwrap();
         assert_eq!(collected.usage.input_tokens, Some(20));
         assert_eq!(collected.usage.output_tokens, Some(23));
         assert_eq!(

@@ -69,7 +69,9 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
         const totalOutput = summary?.total_output_tokens || 0;
         const totalReasoning = summary?.total_reasoning_tokens || 0;
 
-        const avgTokensPerReq = Math.round(totalTokens / totalReqs);
+        const avgTokensPerReq = summary && summary.total_reported_requests > 0
+            ? Math.round(totalTokens / summary.total_reported_requests)
+            : null;
         const reasoningPctOfOutput = totalOutput > 0 ? Math.round((totalReasoning / totalOutput) * 100) : 0;
         const avgReasoningPerReq = Math.round(totalReasoning / totalReqs);
 
@@ -89,6 +91,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
         const mainList = sorted.slice(0, 4).map((m, idx) => ({
             name: m.model,
             tokens: m.total_tokens,
+            reportedRequests: m.total_reported_requests,
             requests: m.request_count,
             pct: Math.max(1, Math.round((m.total_tokens / total) * 100)),
             color: MODEL_NEON_COLORS[idx % MODEL_NEON_COLORS.length],
@@ -101,6 +104,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
             mainList.push({
                 name: t('token_stats.other_models', '其他模型汇总'),
                 tokens: otherTokens,
+                reportedRequests: sorted.slice(4).reduce((acc, m) => acc + m.total_reported_requests, 0),
                 requests: otherReqs,
                 pct: Math.max(1, Math.round((otherTokens / total) * 100)),
                 color: '#64748b',
@@ -177,6 +181,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
             const point = map.get(key) || {
                 hour: key,
                 total_tokens: 0,
+                total_reported_requests: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
@@ -232,6 +237,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                 email: acc.account_email,
                 name: acc.account_email.split('@')[0],
                 tokens: acc.total_tokens,
+                reportedRequests: acc.total_reported_requests,
                 requests: acc.request_count,
                 sharePct,
                 relativePct,
@@ -255,6 +261,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                 rank: idx + 1,
                 name: m.model,
                 tokens: m.total_tokens,
+                reportedRequests: m.total_reported_requests,
                 requests: m.request_count,
                 sharePct,
                 relativePct,
@@ -306,7 +313,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                             <div className="col-span-5 flex flex-col justify-between space-y-2">
                                 <div>
                                     <span className="text-[11px] font-mono text-gray-500 dark:text-gray-400 font-semibold uppercase">
-                                        {t('token_stats.total_usage', '总消耗量')}
+                                        {t('token_stats.reported_total_tokens', '上游实报总量')}
                                     </span>
                                     <div className="text-3xl sm:text-4xl font-black font-mono tracking-tight text-gray-900 dark:text-white leading-none mt-1 flex items-baseline gap-1.5">
                                         <span>{summary && summary.total_reported_requests > 0 ? formatNumber(summary.total_tokens) : t('token_stats.cache_not_reported', '未返回')}</span>
@@ -359,8 +366,8 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                                     </span>
                                                 </div>
                                                 <div className="flex items-center gap-2 shrink-0">
-                                                    <span className="text-gray-500 dark:text-gray-400 text-[10px] font-mono">{formatNumber(m.tokens)}</span>
-                                                    <span className="text-gray-900 dark:text-white font-bold text-[11px] font-mono">{m.pct}%</span>
+                                                    <span className="text-gray-500 dark:text-gray-400 text-[10px] font-mono">{(m.reportedRequests > 0 ? formatNumber(m.tokens) : t('token_stats.cache_not_reported', '未返回'))}</span>
+                                                    <span className="text-gray-900 dark:text-white font-bold text-[11px] font-mono">{m.reportedRequests > 0 ? `${m.pct}%` : '—'}</span>
                                                 </div>
                                             </div>
                                         );
@@ -419,10 +426,10 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                     {/* 环心微缩总览 */}
                                     <div className="absolute flex flex-col items-center pointer-events-none text-center px-1">
                                         <span className="text-sm font-extrabold font-mono text-gray-900 dark:text-white leading-none">
-                                            {focusedModel ? formatNumber(focusedModel.tokens) : formatNumber(summary?.total_tokens || 0)}
+                                            {focusedModel ? focusedModel.reportedRequests > 0 ? formatNumber(focusedModel.tokens) : t('token_stats.cache_not_reported', '未返回') : summary && summary.total_reported_requests > 0 ? formatNumber(summary.total_tokens) : t('token_stats.cache_not_reported', '未返回')}
                                         </span>
                                         <span className="text-[9px] font-mono text-gray-500 dark:text-gray-400 uppercase tracking-widest mt-0.5 truncate max-w-[68px]">
-                                            {focusedModel ? `${focusedModel.pct}% ${t('token_stats.percentage', '占比')}` : 'SUMMARY'}
+                                            {focusedModel ? focusedModel.reportedRequests > 0 ? `${focusedModel.pct}% ${t('token_stats.percentage', '占比')}` : '—' : 'SUMMARY'}
                                         </span>
                                     </div>
                                 </div>
@@ -480,7 +487,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                 </span>
                                 <div className="flex items-center gap-2 font-mono text-[11px]">
                                     <span className="text-gray-500 dark:text-gray-400">
-                                        {t('token_stats.cockpit_avg_load', '均次')}: <strong className="text-gray-900 dark:text-white font-mono">{formatNumber(deepMetrics.avgTokensPerReq)}</strong>
+                                        {t('token_stats.reported_average_interaction', '实报请求平均量')}: <strong className="text-gray-900 dark:text-white font-mono">{(deepMetrics.avgTokensPerReq === null ? t('token_stats.cache_not_reported', '未返回') : formatNumber(deepMetrics.avgTokensPerReq))}</strong>
                                     </span>
                                     <span className="text-gray-300 dark:text-white/[0.2]">|</span>
                                     <span className="text-blue-600 dark:text-emerald-400 font-bold font-mono">
@@ -533,7 +540,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                 <span>
                                     {activeHour ? (
                                         <span className="text-blue-600 dark:text-emerald-400 font-bold font-mono">
-                                            {activeHour.hourLabel} · {formatNumber(activeHour.data.total_tokens)} tok
+                                            {activeHour.hourLabel} · {(activeHour.data.total_reported_requests > 0 ? formatNumber(activeHour.data.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} tok
                                         </span>
                                     ) : (
                                         <span>{t('token_stats.cockpit_trough', '低谷')}: <strong className="text-gray-700 dark:text-gray-300 font-mono">{troughHourLabel}</strong></span>
@@ -696,7 +703,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                                 )}
                                             </div>
                                             <span className="text-blue-600 dark:text-emerald-400 font-bold font-mono shrink-0">
-                                                {formatNumber(acc.tokens)}
+                                                {acc.reportedRequests > 0 ? formatNumber(acc.tokens) : t('token_stats.cache_not_reported', '未返回')}
                                             </span>
                                         </div>
 
@@ -712,7 +719,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                         </div>
 
                                         <div className="flex items-center justify-between text-[10px] font-mono text-gray-500 dark:text-gray-400">
-                                            <span>{t('token_stats.percentage', '占比')}: {acc.sharePct}% ({acc.requests} {t('token_stats.times', '次')})</span>
+                                            <span>{t('token_stats.percentage', '占比')}: {acc.reportedRequests > 0 ? `${acc.sharePct}%` : '—'} ({acc.requests} {t('token_stats.times', '次')})</span>
                                             {acc.isHighConcentration && (
                                                 <span className="text-amber-600 dark:text-amber-400 font-bold flex items-center gap-0.5">
                                                     <AlertTriangle className="w-3 h-3" /> {t('token_stats.cockpit_high_concentration', '流量高度集中')}
@@ -753,7 +760,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                                 </span>
                                             </div>
                                             <span className="text-blue-600 dark:text-blue-400 font-bold font-mono shrink-0">
-                                                {formatNumber(m.tokens)}
+                                                {(m.reportedRequests > 0 ? formatNumber(m.tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                             </span>
                                         </div>
 
@@ -765,7 +772,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                         </div>
 
                                         <div className="flex items-center justify-between text-[10px] font-mono text-gray-500 dark:text-gray-400">
-                                            <span>{t('token_stats.percentage', '占比')}: {m.sharePct}% ({m.requests} {t('token_stats.times', '次')})</span>
+                                            <span>{t('token_stats.percentage', '占比')}: {m.reportedRequests > 0 ? `${m.sharePct}%` : '—'} ({m.requests} {t('token_stats.times', '次')})</span>
                                         </div>
                                     </div>
                                 ))

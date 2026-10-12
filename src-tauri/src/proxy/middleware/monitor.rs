@@ -1742,7 +1742,16 @@ mod tests {
         wait_for_persisted_requests(expected.len() as u64).await;
         let conn = rusqlite::Connection::open(crate::modules::token_stats::get_db_path().unwrap())
             .unwrap();
+        let hourly_trend = crate::modules::token_stats::get_model_trend_hourly(0).unwrap();
+        let daily_trend = crate::modules::token_stats::get_model_trend_daily(0).unwrap();
         for (model, input, output, cached, total) in expected {
+            for trend in [&hourly_trend, &daily_trend] {
+                assert_eq!(
+                    trend.iter().find_map(|point| point.model_data.get(&model)),
+                    Some(&total.map(u64::from)),
+                    "{model}"
+                );
+            }
             let recorded: (Option<u32>, Option<u32>, Option<u32>, Option<u32>) = conn.query_row("SELECT input_tokens, output_tokens, cached_tokens, reported_total_tokens FROM token_usage WHERE model = ?1", [&model], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
             assert_eq!(recorded, (input, output, cached, total), "{model}");
             let log = crate::modules::proxy_db::get_logs_summary(100, 0)

@@ -6,6 +6,7 @@ import type { CacheReportedStats } from './usageMetrics';
 export interface DayUsagePoint extends CacheReportedStats {
     date: string; // YYYY-MM-DD
     total_tokens: number;
+    total_reported_requests: number;
     request_count: number;
     total_input_tokens: number;
     total_output_tokens: number;
@@ -46,6 +47,7 @@ export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
                 existing || {
                     date: dateStr,
                     total_tokens: 0,
+                    total_reported_requests: 0,
                     request_count: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
@@ -185,7 +187,7 @@ export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
                                                 ? 'ring-1.5 ring-blue-500/80 dark:ring-blue-400/80'
                                                 : ''
                                         }`}
-                                        title={`${day.date}: ${formatNumber(day.total_tokens)} Tokens (${t('token_stats.requests_count', { count: day.request_count, defaultValue: `${day.request_count} requests` })})`}
+                                        title={`${day.date}: ${(day.total_reported_requests > 0 ? formatNumber(day.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} Tokens (${t('token_stats.requests_count', { count: day.request_count, defaultValue: `${day.request_count} requests` })})`}
                                     />
                                 );
                             })}
@@ -199,7 +201,7 @@ export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
                     <div>
                         <div className="flex items-baseline gap-2">
                             <span className="text-2xl font-bold font-mono tracking-tight text-gray-900 dark:text-white">
-                                {formatNumber(totalRangeTokens)}
+                                {(dailyData.some(day => day.total_reported_requests > 0) ? formatNumber(totalRangeTokens) : t('token_stats.cache_not_reported', '未返回'))}
                             </span>
                             <span className="text-[11px] text-gray-500 dark:text-white/50 font-medium">
                                 {t('token_stats.weeks_count', { count: 13, defaultValue: '13 周' })}
@@ -221,7 +223,7 @@ export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
                                     {formatFriendlyDate(hoveredDayData.date)}
                                 </span>
                                 <span className="font-mono font-medium text-blue-600 dark:text-blue-400">
-                                    {formatNumber(hoveredDayData.total_tokens)}
+                                    {(hoveredDayData.total_reported_requests > 0 ? formatNumber(hoveredDayData.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                 </span>
                             </div>
                         ) : busiestDay ? (
@@ -230,7 +232,7 @@ export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
                                     {t('token_stats.busiest_day', '峰值消耗日')}
                                 </span>
                                 <span className="font-mono font-medium text-gray-900 dark:text-white/90 whitespace-nowrap">
-                                    {formatFriendlyDate(busiestDay.date)} · {formatNumber(busiestDay.total_tokens)}
+                                    {formatFriendlyDate(busiestDay.date)} · {(busiestDay.total_reported_requests > 0 ? formatNumber(busiestDay.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                 </span>
                             </div>
                         ) : null}

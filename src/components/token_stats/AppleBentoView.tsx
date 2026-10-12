@@ -103,6 +103,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                 existing || {
                     date: dateStr,
                     total_tokens: 0,
+                    total_reported_requests: 0,
                     request_count: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
@@ -200,6 +201,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
             const point = map.get(key) || {
                 hour: key,
                 total_tokens: 0,
+                total_reported_requests: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
@@ -339,7 +341,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                     <div className="bg-white/95 dark:bg-base-100 backdrop-blur-xl rounded-2xl p-4 sm:p-5 border border-black/[0.05] dark:border-base-200 shadow-sm flex flex-col justify-between transition-all hover:shadow-md relative overflow-hidden group">
                         <div className="flex items-start justify-between">
                             <span className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 tracking-wider uppercase">
-                                {t('token_stats.total_usage', '总消耗量')}
+                                {t('token_stats.reported_total_tokens', '上游实报总量')}
                             </span>
                             {/* 右上方：真实数据曲线 Sparkline */}
                             <div className="w-[100px] h-[34px] shrink-0 relative">
@@ -656,7 +658,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                                         ? 'ring-1.5 ring-blue-500/80'
                                                         : ''
                                                 }`}
-                                                title={`${day.date}: ${formatNumber(day.total_tokens)} Tokens (${day.request_count} ${t('token_stats.times', '次')})`}
+                                                title={`${day.date}: ${(day.total_reported_requests > 0 ? formatNumber(day.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} Tokens (${day.request_count} ${t('token_stats.times', '次')})`}
                                             />
                                         );
                                     })}
@@ -669,7 +671,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                             <div>
                                 <span className="text-[11px] text-gray-400 dark:text-gray-500">{t('token_stats.total_activity_13w', '13周累计活跃')}</span>
                                 <div className="text-xl font-bold font-mono text-gray-900 dark:text-white mt-0.5">
-                                    {formatNumber(totalRangeTokens)} <span className="text-xs font-normal text-gray-400">Tokens</span>
+                                    {(dailyData.some(day => day.total_reported_requests > 0) ? formatNumber(totalRangeTokens) : t('token_stats.cache_not_reported', '未返回'))} <span className="text-xs font-normal text-gray-400">Tokens</span>
                                 </div>
                             </div>
                             <div className="mt-2.5 space-y-1.5 text-xs">
@@ -682,12 +684,12 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                 {hoveredDay ? (
                                     <div className="flex items-center justify-between text-blue-600 dark:text-blue-400 font-medium pt-1 border-t border-black/[0.03] dark:border-white/[0.04]">
                                         <span className="text-[11px] font-mono">{hoveredDay.date.slice(5)}</span>
-                                        <span className="font-mono">{formatNumber(hoveredDay.total_tokens)}</span>
+                                        <span className="font-mono">{(hoveredDay.total_reported_requests > 0 ? formatNumber(hoveredDay.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}</span>
                                     </div>
                                 ) : busiestDay ? (
                                     <div className="flex items-center justify-between text-gray-500 dark:text-gray-400 pt-1 border-t border-black/[0.03] dark:border-white/[0.04]">
                                         <span className="text-[11px]">{t('token_stats.peak_day', '峰值日 {{date}}', { date: busiestDay.date.slice(5) })}</span>
-                                        <span className="font-mono text-gray-900 dark:text-white">{formatNumber(busiestDay.total_tokens)}</span>
+                                        <span className="font-mono text-gray-900 dark:text-white">{(busiestDay.total_reported_requests > 0 ? formatNumber(busiestDay.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}</span>
                                     </div>
                                 ) : null}
                             </div>
@@ -725,10 +727,10 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         <span className="text-xs font-mono text-gray-400 dark:text-gray-500">
                             {activeHourData ? (
                                 <span className="text-[#0071e3] font-semibold">
-                                    {activeHourData.hourLabel} · {formatNumber(activeHourData.data.total_tokens)}
+                                    {activeHourData.hourLabel} · {(activeHourData.data.total_reported_requests > 0 ? formatNumber(activeHourData.data.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                 </span>
                             ) : (
-                                t('token_stats.peak_and_total', '峰值: {{peak}} · 全天: {{total}}', { peak: peakHourLabel, total: formatNumber(totalPast24h) })
+                                t('token_stats.peak_and_total', '峰值: {{peak}} · 全天: {{total}}', { peak: peakHourLabel, total: (hourBuckets.some(bucket => bucket.data.total_reported_requests > 0) ? formatNumber(totalPast24h) : t('token_stats.cache_not_reported', '未返回')) })
                             )}
                         </span>
                     </div>
@@ -745,7 +747,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                     onMouseEnter={() => setHoveredHourIdx(idx)}
                                     onMouseLeave={() => setHoveredHourIdx(null)}
                                     className="flex-1 h-full flex flex-col justify-end items-center cursor-pointer group"
-                                    title={`${b.hourLabel}: ${formatNumber(b.data.total_tokens)} Tokens`}
+                                    title={`${b.hourLabel}: ${(b.data.total_reported_requests > 0 ? formatNumber(b.data.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} Tokens`}
                                 >
                                     {hasValue ? (
                                         <motion.div
@@ -767,11 +769,11 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                     {/* 宏观效能诊断胶囊双格 */}
                     <div className="grid grid-cols-2 gap-2.5 py-1">
                         <div className="bg-gray-50/80 dark:bg-base-200 rounded-2xl p-2.5 flex flex-col justify-between">
-                            <span className="text-[11px] text-gray-400 dark:text-gray-400">{t('token_stats.avg_interaction', '平均单次交互量')}</span>
+                            <span className="text-[11px] text-gray-400 dark:text-gray-400">{t('token_stats.reported_average_interaction', '实报请求平均量')}</span>
                             <span className="text-base font-bold font-mono text-gray-900 dark:text-base-content mt-0.5">
-                                {summary && summary.total_requests > 0
-                                    ? formatNumber(Math.round(summary.total_tokens / summary.total_requests))
-                                    : '0'} <span className="text-[10px] font-normal text-gray-400">Tokens</span>
+                                {summary && summary.total_reported_requests > 0
+                                    ? formatNumber(Math.round(summary.total_tokens / summary.total_reported_requests))
+                                    : t('token_stats.cache_not_reported', '未返回')} <span className="text-[10px] font-normal text-gray-400">Tokens</span>
                             </span>
                         </div>
 
@@ -838,10 +840,10 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                         </div>
                                         <div className="w-20 text-right font-mono flex items-baseline justify-end gap-1.5 flex-shrink-0">
                                             <span className="text-gray-900 dark:text-base-content font-semibold">
-                                                {formatNumber(item.total_tokens)}
+                                                {(item.total_reported_requests > 0 ? formatNumber(item.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                             </span>
                                             <span className="text-[10px] text-gray-400">
-                                                {pct.toFixed(0)}%
+                                                {item.total_reported_requests > 0 ? `${pct.toFixed(0)}%` : '—'}
                                             </span>
                                         </div>
                                     </div>
@@ -903,7 +905,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                         </div>
                                         <div className="w-20 text-right font-mono flex items-baseline justify-end gap-1.5 flex-shrink-0">
                                             <span className="text-gray-900 dark:text-base-content font-semibold">
-                                                {formatNumber(acc.total_tokens)}
+                                                {(acc.total_reported_requests > 0 ? formatNumber(acc.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                             </span>
                                             <span className="text-[10px] text-gray-400">
                                                 {acc.request_count} {t('token_stats.times', '次')}
@@ -1011,7 +1013,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                     axisLine={false}
                                     tickLine={false}
                                 />
-                                <Tooltip content={<CustomTrendTooltip />} />
+                                <Tooltip filterNull={false} content={<CustomTrendTooltip />} />
                                 {(viewMode === 'model' ? allModels : allAccounts).map((key, i) => (
                                     <Area
                                         key={key}
@@ -1054,7 +1056,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                     axisLine={false}
                                     tickLine={false}
                                 />
-                                <Tooltip content={<CustomTrendTooltip />} cursor={{ fill: 'rgba(150, 150, 150, 0.05)' }} />
+                                <Tooltip filterNull={false} content={<CustomTrendTooltip />} cursor={{ fill: 'rgba(150, 150, 150, 0.05)' }} />
                                 {(viewMode === 'model' ? allModels : allAccounts).map((key, i) => (
                                     <Bar
                                         key={key}

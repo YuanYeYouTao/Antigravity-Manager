@@ -54,9 +54,9 @@ export interface TokenStatsAggregated extends CacheReportedStats {
     output_reported_requests: number;
     input_reported_requests: number;
     request_count: number;
-    uncached_input_tokens?: number;
+    uncached_input_tokens?: number | null;
     known_cached_tokens?: number | null;
-    unknown_cache_input_tokens?: number;
+    unknown_cache_input_tokens?: number | null;
 }
 
 export interface AccountTokenStats extends CacheReportedStats {
@@ -87,12 +87,12 @@ export interface ModelTokenStats extends CacheReportedStats {
 
 export interface ModelTrendPoint {
     period: string;
-    model_data: Record<string, number>;
+    model_data: Record<string, number | null>;
 }
 
 export interface AccountTrendPoint {
     period: string;
-    account_data: Record<string, number>;
+    account_data: Record<string, number | null>;
 }
 
 export interface TokenStatsSummary extends CacheReportedStats {
@@ -323,6 +323,7 @@ const TokenStats: React.FC = () => {
         return modelData.map(m => ({
             model: m.model,
             total_tokens: m.total_tokens,
+            total_reported_requests: m.total_reported_requests,
             request_count: m.request_count,
             total_input_tokens: m.total_input_tokens,
             total_output_tokens: m.total_output_tokens,
@@ -335,6 +336,7 @@ const TokenStats: React.FC = () => {
         return accountData.slice(0, 8).map((account, index) => ({
             name: account.account_email.split('@')[0] + '...',
             value: account.total_tokens,
+            total_reported_requests: account.total_reported_requests,
             fullEmail: account.account_email,
             color: PIE_COLORS[index % PIE_COLORS.length],
         }));
@@ -373,13 +375,13 @@ const TokenStats: React.FC = () => {
                     classicDataPromise = invoke<TokenStatsAggregated[]>('get_token_stats_weekly', { weeks: 12 });
 
                     // 按周合并聚合 modelTrend
-                    const weeklyModelMap = new Map<string, Record<string, number>>();
+                    const weeklyModelMap = new Map<string, Record<string, number | null>>();
                     for (const pt of rawDailyModelTrend) {
                         const wb = getSqliteWeekBucket(pt.period);
                         if (!weeklyModelMap.has(wb)) weeklyModelMap.set(wb, {});
                         const acc = weeklyModelMap.get(wb)!;
                         for (const [m, count] of Object.entries(pt.model_data)) {
-                            acc[m] = (acc[m] || 0) + count;
+                            acc[m] = count === null ? acc[m] ?? null : (acc[m] ?? 0) + count;
                         }
                     }
                     modelTrend = Array.from(weeklyModelMap.entries())
@@ -387,13 +389,13 @@ const TokenStats: React.FC = () => {
                         .map(([period, model_data]) => ({ period, model_data }));
 
                     // 按周合并聚合 accountTrend
-                    const weeklyAccountMap = new Map<string, Record<string, number>>();
+                    const weeklyAccountMap = new Map<string, Record<string, number | null>>();
                     for (const pt of rawDailyAccountTrend) {
                         const wb = getSqliteWeekBucket(pt.period);
                         if (!weeklyAccountMap.has(wb)) weeklyAccountMap.set(wb, {});
                         const acc = weeklyAccountMap.get(wb)!;
                         for (const [a, count] of Object.entries(pt.account_data)) {
-                            acc[a] = (acc[a] || 0) + count;
+                            acc[a] = count === null ? acc[a] ?? null : (acc[a] ?? 0) + count;
                         }
                     }
                     accountTrend = Array.from(weeklyAccountMap.entries())
@@ -416,7 +418,7 @@ const TokenStats: React.FC = () => {
             const modelTotals: Record<string, number> = {};
             modelTrend.forEach(p => {
                 Object.entries(p.model_data).forEach(([m, val]) => {
-                    modelTotals[m] = (modelTotals[m] || 0) + val;
+                    if (val !== null) modelTotals[m] = (modelTotals[m] ?? 0) + val;
                 });
             });
             const sortedModels = Array.from(modelsSet).sort((a, b) => (modelTotals[b] || 0) - (modelTotals[a] || 0));
@@ -428,16 +430,19 @@ const TokenStats: React.FC = () => {
 
             const transformedTrend = modelTrend.map(point => {
                 const row: Record<string, any> = { period: point.period };
-                let otherSum = 0;
                 Object.entries(point.model_data).forEach(([model, val]) => {
                     if (top5Models.includes(model)) {
                         row[model] = val;
-                    } else {
-                        otherSum += val;
                     }
                 });
-                if (hasOther) {
-                    row[otherModelKey] = otherSum;
+                const otherValues = Object.entries(point.model_data)
+                    .filter(([model]) => !top5Models.includes(model))
+                    .map(([, value]) => value);
+                if (hasOther && otherValues.length > 0) {
+                    row[otherModelKey] = otherValues.reduce<number | null>(
+                        (sum, value) => value === null ? sum : (sum ?? 0) + value,
+                        null,
+                    );
                 }
                 return row;
             });
@@ -452,11 +457,7 @@ const TokenStats: React.FC = () => {
             setAllAccounts(accountList);
 
             const transformedAccountTrend = accountTrend.map(point => {
-                const row: Record<string, any> = { period: point.period };
-                accountList.forEach(acc => {
-                    row[acc] = point.account_data[acc] || 0;
-                });
-                return row;
+                return { period: point.period, ...point.account_data };
             });
             setAccountTrendData(transformedAccountTrend);
 
@@ -479,8 +480,8 @@ const TokenStats: React.FC = () => {
                 classicData.map(point => ({
                     ...point,
                     known_cached_tokens: point.cache_reported_requests > 0 ? point.cache_reported_tokens : null,
-                    uncached_input_tokens: Math.max(point.cache_reported_input_tokens - point.cache_reported_tokens, 0),
-                    unknown_cache_input_tokens: point.total_input_tokens - point.cache_reported_input_tokens,
+                    uncached_input_tokens: point.cache_reported_requests > 0 ? Math.max(point.cache_reported_input_tokens - point.cache_reported_tokens, 0) : null,
+                    unknown_cache_input_tokens: point.input_reported_requests > 0 ? point.total_input_tokens - point.cache_reported_input_tokens : null,
                 }))
             );
 
@@ -489,6 +490,7 @@ const TokenStats: React.FC = () => {
                 raw91Days.map(d => ({
                     date: d.period,
                     total_tokens: d.total_tokens,
+                    total_reported_requests: d.total_reported_requests,
                     request_count: d.request_count,
                     total_input_tokens: d.total_input_tokens,
                     total_output_tokens: d.total_output_tokens,
@@ -504,6 +506,7 @@ const TokenStats: React.FC = () => {
                 raw24Hours.map(h => ({
                     hour: h.period,
                     total_tokens: h.total_tokens,
+                    total_reported_requests: h.total_reported_requests,
                     input_tokens: h.total_input_tokens,
                     output_tokens: h.total_output_tokens,
                     cached_tokens: h.total_cached_tokens,
@@ -547,7 +550,8 @@ const TokenStats: React.FC = () => {
     // 趋势图 Tooltip（双主题适配）
     const CustomTrendTooltip = ({ active, payload, label }: any) => {
         if (!active || !payload || !payload.length) return null;
-        const sortedPayload = [...payload].sort((a: any, b: any) => b.value - a.value);
+        const sortedPayload = payload.filter((entry: any) => entry.value !== undefined)
+            .sort((a: any, b: any) => (b.value ?? 0) - (a.value ?? 0));
 
         return (
             <div className="bg-white/95 dark:bg-base-100/95 backdrop-blur-md p-3 rounded-xl shadow-xl border border-gray-200 dark:border-base-200 text-xs z-[100] min-w-[190px] pointer-events-none text-gray-900 dark:text-base-content">
@@ -567,7 +571,7 @@ const TokenStats: React.FC = () => {
                                     </span>
                                 </div>
                                 <span className="font-mono font-medium text-gray-800 dark:text-base-content">
-                                    {formatNumber(entry.value)}
+                                    {entry.value === null ? t('token_stats.cache_not_reported', '未返回') : formatNumber(entry.value)}
                                 </span>
                             </div>
                         );
@@ -598,7 +602,7 @@ const TokenStats: React.FC = () => {
                                 </span>
                             </div>
                             <span className="font-mono font-medium text-gray-800 dark:text-white">
-                                {formatNumber(item.value)}
+                                {item.value === null ? t('token_stats.cache_not_reported', '未返回') : formatNumber(item.value)}
                             </span>
                         </div>
                     ))}
@@ -651,7 +655,7 @@ const TokenStats: React.FC = () => {
                         {entry.payload.fullEmail || entry.name}:
                     </span>
                     <span className="font-mono font-medium text-gray-800 dark:text-base-content">
-                        {formatNumber(entry.value)}
+                        {entry.payload.total_reported_requests > 0 ? formatNumber(entry.value) : t('token_stats.cache_not_reported', '未返回')}
                     </span>
                 </div>
             </div>
@@ -1028,7 +1032,7 @@ const TokenStats: React.FC = () => {
                                                     tickLine={false}
                                                 />
                                                 <Tooltip
-                                                    content={<CustomTrendTooltip />}
+                                                    filterNull={false} content={<CustomTrendTooltip />}
                                                     cursor={{ fill: 'rgba(150, 150, 150, 0.08)' }}
                                                     allowEscapeViewBox={{ x: true, y: true }}
                                                     position={tooltipPosition}
@@ -1079,7 +1083,7 @@ const TokenStats: React.FC = () => {
                                                     tickLine={false}
                                                 />
                                                 <Tooltip
-                                                    content={<CustomTrendTooltip />}
+                                                    filterNull={false} content={<CustomTrendTooltip />}
                                                     cursor={{ stroke: 'rgba(150, 150, 150, 0.3)', strokeWidth: 1, strokeDasharray: '4 4' }}
                                                     allowEscapeViewBox={{ x: true, y: true }}
                                                     position={tooltipPosition}
@@ -1149,7 +1153,7 @@ const TokenStats: React.FC = () => {
                                                     tickLine={false}
                                                 />
                                                 <Tooltip
-                                                    content={<UsageTrendTooltip />}
+                                                    filterNull={false} content={<UsageTrendTooltip />}
                                                     cursor={{ fill: 'rgba(150, 150, 150, 0.08)' }}
                                                     allowEscapeViewBox={{ x: true, y: true }}
                                                 />
