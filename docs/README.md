@@ -18,4 +18,4 @@ This folder contains developer-focused documentation (architecture, implementati
 
 ## Operations
 
-- [`AGM official beta.8 adaptation`](operations/agm-official-beta8-adaptation-2026-10-12.md) — fork patch scope, runtime image provenance, helper migration, and current validation/deployment status.
+- [`AGM official beta.8 adaptation`](operations/agm-official-beta8-adaptation-2026-10-12.md) — fork patch scope, merged source and deployed image, validation evidence, and rollback.

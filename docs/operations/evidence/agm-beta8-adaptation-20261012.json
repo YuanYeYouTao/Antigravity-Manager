@@ -1,0 +1,146 @@
+{
+  "pull_request": "https://github.com/YuanYeYouTao/Antigravity-Manager/pull/3",
+  "source_revision": "b2e57ec30c17c37d145a33443603b06943af6d0b",
+  "official_revision": "15f4bc938ecfa0286097ec6246a3d1583bc683a7",
+  "version": "4.9.7-beta.8",
+  "image_tag": "antigravity-manager:beta8-b2e57ec3",
+  "local_image_descriptor": "sha256:16316d401e74ec1a83b7d8bcdc4c06c1e54eb839caa9052cfe97f9bd3b665f25",
+  "server_image_id": "sha256:4c6439eead5e6d78617c2b66f7e8990384296bdcbcf993bddc7533d41ecf7f5d",
+  "official_runtime_digest": "sha256:e1a74221a6f2df268874e712eaff16edb0fc3447447bd0615b3769d8f3e5fd7d",
+  "binary_sha256": "9f9015f22199431a4176a902ecdc5ab706a4462ed7db98b00ec38f8d8d4d8b4e",
+  "rust_patch_sha256": "3861f5569cc9965a576dba393684c64f20354a6574bdc68e6d3191a0aa1fb9f9",
+  "rust_patch_scope": "src-tauri/src relative to official beta8",
+  "archive_sha256": "9a4fa938da5345262b574e701098182de6e9093e7d476c68791e783b7b7af803",
+  "validation": {
+    "fmt": "passed",
+    "clippy": "all-targets/all-features passed",
+    "frontend_build": "passed",
+    "locked_release_build": "passed",
+    "targeted_tests": {
+      "passed": 85,
+      "failed": 0,
+      "specs": 6,
+      "inbound": 44,
+      "timing": 1,
+      "defense": 12,
+      "auto_heal": 10,
+      "collector": 12
+    },
+    "ci_code_commit": "b2e57ec30c17c37d145a33443603b06943af6d0b",
+    "ci_run": "https://github.com/YuanYeYouTao/Antigravity-Manager/actions/runs/38209415109",
+    "ci_result": "success",
+    "official_inbound_fixture_replay": {
+      "passed": 41,
+      "failed": 3,
+      "scope": "official inbound file in the adaptation source tree; old Claude-signature expectations"
+    }
+  },
+  "database_rehearsal": {
+    "new_version": "4.9.7-beta.8",
+    "old_version": "4.9.0",
+    "databases": [
+      "proxy_logs.db",
+      "security.db",
+      "thinking_store.db",
+      "token_stats.db",
+      "user_tokens.db"
+    ],
+    "passed": true,
+    "network": "none",
+    "accounts_copied": false,
+    "existing_row_counts_preserved": true,
+    "stats_readback_passed": true,
+    "quick_check": "ok",
+    "all_cell_values_compared": false
+  },
+  "deployment": {
+    "old_image": "sha256:337e5875ac6d7deef2b82347e9039b796b71745a22d9473db07354790a3261b9",
+    "new_image": "sha256:4c6439eead5e6d78617c2b66f7e8990384296bdcbcf993bddc7533d41ecf7f5d",
+    "started_at": "2026-10-12T05:56:12.538016713Z",
+    "restart_count": 0,
+    "compose_image_only": true,
+    "environment_preserved": true,
+    "mounts_preserved": true,
+    "mihomo_preserved": true,
+    "data_restored": false
+  },
+  "live_health": {
+    "health": {
+      "status": "ok",
+      "version": "4.9.7-beta.8"
+    },
+    "docker_health": "healthy",
+    "restart_count": 0,
+    "source_revision": "b2e57ec30c17c37d145a33443603b06943af6d0b",
+    "image_id": "sha256:4c6439eead5e6d78617c2b66f7e8990384296bdcbcf993bddc7533d41ecf7f5d",
+    "frontend_status": 200,
+    "admin_stats_passed": true,
+    "stats_total_requests": 836,
+    "saved_auth_preserved": true,
+    "account_file_identities_preserved": true,
+    "changed_proxy_config_keys": [
+      "custom_mapping",
+      "experimental",
+      "stream_timeouts"
+    ]
+  },
+  "configuration_migration": {
+    "obsolete_mapping_removed": "gemini-3.x-flash",
+    "other_existing_model_mappings_preserved": true,
+    "thinking_configuration_preserved": true
+  },
+  "synthetic_protocol_probes": {
+    "observed_at": "2026-10-12T05:56:59.144723+00:00",
+    "revision": "b2e57ec30c17c37d145a33443603b06943af6d0b",
+    "image": "sha256:4c6439eead5e6d78617c2b66f7e8990384296bdcbcf993bddc7533d41ecf7f5d",
+    "synthetic": true,
+    "requests": [
+      {
+        "name": "native_function_call",
+        "status": 200,
+        "elapsed_seconds": 3.813,
+        "usage": {
+          "promptTokenCount": 86,
+          "candidatesTokenCount": 12,
+          "totalTokenCount": 185,
+          "thoughtsTokenCount": 87
+        },
+        "error_present": false,
+        "function_call_received": true,
+        "signature_preserved": true
+      },
+      {
+        "name": "native_empty_tool_return",
+        "status": 200,
+        "elapsed_seconds": 2.546,
+        "usage": {
+          "promptTokenCount": 200,
+          "candidatesTokenCount": 10,
+          "totalTokenCount": 266,
+          "thoughtsTokenCount": 56
+        },
+        "error_present": false,
+        "marker_returned": true
+      },
+      {
+        "name": "native_google_search_grounding",
+        "status": 200,
+        "elapsed_seconds": 14.948,
+        "usage": {
+          "promptTokenCount": 482,
+          "candidatesTokenCount": 65,
+          "totalTokenCount": 1126,
+          "thoughtsTokenCount": 579
+        },
+        "error_present": false,
+        "grounding_metadata_received": true,
+        "grounding_chunks": 1,
+        "grounding_supports": 2
+      }
+    ],
+    "passed": true
+  },
+  "natural_qq_acceptance": "not asserted",
+  "cache_alternation_root_cause": "unproven",
+  "release_published": false
+}

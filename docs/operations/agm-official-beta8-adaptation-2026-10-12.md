@@ -2,9 +2,12 @@
 
 ## 当前状态
 
-终审已删除第二次 auto-heal 流的附加输出检查，最终 fmt、Clippy 和 85 项定向测试通过。
-最终 locked release 编译及候选隔离烟测通过。
-提交、推送、PR、CI、合并和生产部署仍待完成；目标为 fork 的 `beta` 预览分支。
+[PR #3](https://github.com/YuanYeYouTao/Antigravity-Manager/pull/3)已合入 fork 的 `beta` 预览分支，
+适配源码为 `b2e57ec30c17c37d145a33443603b06943af6d0b`，生产已切换至 `4.9.7-beta.8`。
+启动时间为 `2026-10-12T05:56:12.538016713Z`；本次检查 health 正常、Docker healthy、restart=0。
+[CI 38209415109](https://github.com/YuanYeYouTao/Antigravity-Manager/actions/runs/38209415109)的7个job成功；
+[Windows Installer 38209415047](https://github.com/YuanYeYouTao/Antigravity-Manager/actions/runs/38209415047)在本记录时仍pending。
+未创建 tag/Release；真实 QQ 行为和缓存改善尚未验收。
 
 ## 基线与保留项
 
@@ -30,7 +33,9 @@
 linux/amd64 为 `sha256:f65cad3803a93f83d5bfc8ec4c4c6f204b2a5abd26893e89ec78119f45801283`。
 来源见[官方 Docker 标签元数据](https://hub.docker.com/v2/repositories/lbjlaq/antigravity-manager/tags/v4.9.7-beta.8)；
 源码 base label 同步至上述官方修订，`.dockerignore` 排除 `.cache`。
-最终 `SOURCE_REVISION`、`PATCH_SHA256`、image ID 和 binary SHA256 需对应本次实际构建输入。
+线上标签为 `antigravity-manager:beta8-b2e57ec3`，实际 image ID 为
+`sha256:4c6439eead5e6d78617c2b66f7e8990384296bdcbcf993bddc7533d41ecf7f5d`。
+线上源码标签及后端 SHA256 已与本次构建记录核对，不混用本地 Docker manifest descriptor 与服务器 image ID。
 
 ## 真实验证
 
@@ -41,32 +46,34 @@ linux/amd64 为 `sha256:f65cad3803a93f83d5bfc8ec4c4c6f204b2a5abd26893e89ec78119f
 | 官方 inbound 局部对照 | 只替换 beta.8 原始 inbound，其余为本次源码；41 passed / 3 failed，记录在 `.cache/inbound-baseline-corrected.log`。这是局部失败复现，不是全仓官方验收。 |
 | 前端 | `npm run build` 实际通过。 |
 | 最终候选烟测 | 本地无账号、network none：health 版本 `4.9.7-beta.8`，`/` HTTP 200，admin stats 返回 JSON，restart=0。没有 Provider/QQ 调用。 |
-| 最终 release | `cargo build --release --bin antigravity-tools --locked` 通过，后端 SHA256 为 `9f9015f22199431a4176a902ecdc5ab706a4462ed7db98b00ec38f8d8d4d8b4e`。 |
-| 数据与上线 | 隔离 schema 迁移、旧镜像读回、PR/CI/合并、生产切换和自然 QQ 观察待完成。 |
+| 最终 release | `cargo build --release --bin antigravity-tools --locked` 通过；线上后端 SHA256 为 `9f9015f22199431a4176a902ecdc5ab706a4462ed7db98b00ec38f8d8d4d8b4e`。 |
+| 数据迁移与旧版读回 | 5 个数据库在无账号、断网副本上完成 beta.8 迁移及旧4.9.0读回；两版 stats query、quick_check 与已有表行数保持检查通过。 |
+| 生产检查 | health、Docker健康、首页 HTTP 200、admin stats JSON通过；restart=0，Compose仅image变化，环境、挂载及Mihomo身份保持。 |
+| 合成协议探测 | 三项均 HTTP 200、无error：FC 3.813s且signature保留；空FR 2.546s且marker返回；Native Google Search 14.948s且grounding为1 chunk、2 supports。 |
 
 构建修正 Cargo 缓存路径为实际的 `/usr/local/cargo/registry`、`/usr/local/cargo/git`。
 官方 inbound 对照借旧 grounding builder 的编译缓存，重新复制本次源码与锁文件，
 不沿用旧源码或旧通过结果。旧 helper 只复用构建输入核对、真实 Compose 读取与单服务回退方法，
 不沿用旧 4.9.0 runtime、image/hash 或硬编码验收状态。
 
-缓存交替的根因与真实 QQ 效果仍待观察，不声称本次已排除完整链路的签名副作用。
+构建、迁移、部署、线上检查和合成探测记录分别保存在 ignored `.cache/` 的
+`build-manifest.json`、`rehearsal.json`、`deployment.json`、`live-health.json`、`protocol-probes.json`。
+不含凭据的汇总证据已保存为 [agm-beta8-adaptation-20261012.json](evidence/agm-beta8-adaptation-20261012.json)。
+合成探测不等于真实 QQ 验收；缓存交替的根因仍待观察，不声称已排除完整链路的签名副作用。
 auto-heal 会产生额外物理上游请求，最后一份 usage 或一次客户端 HTTP 不能代表全部物理消耗。
 
 ## 部署与回退
 
-一次性 `.cache/rollout_agm_beta8.py` 已通过 Python 语法检查及静态复核，尚未上传或执行。
-它从当前容器读取真实 Compose，仅覆盖 AGM 的 image；按实际环境、挂载和 peer 身份比较。
-临时容器只按本次创建的 CID 清理，命令 timeout 为 60 秒，备份及 rehearsal 使用独立时间目录。
-上传前由执行方建立 mode700 的服务器 STAGE；完整私有数据备份始终位于该私有父目录。
-隔离迁移复制数据库及现配置，将两种认证改为测试凭据，无账号、network none；SQLite 完整性、schema 与行数需按实际结果记录。
-行数相等不代表所有内容不变。
+已执行一次性 `.cache/rollout_agm_beta8.py`，从当前容器读取真实 Compose，仅切 AGM 的 image。
+切换前已停写并保存完整当前私有数据备份，位于服务器 mode700 的私有 STAGE 内；没有恢复旧数据。
+验收后已删除本次演练数据副本和上传镜像归档，保留切换前备份及原镜像供回退。
+隔离副本复制数据库及现配置，两种认证改为测试凭据、无账号、network none；迁移新增 reasoning 字段，
+完整性和已有行数检查通过。行数相等不代表所有内容不变。
 
-beta.8 启动会添加 reasoning 统计字段，也可能迁移旧 32k thinking 默认配置。
-正式切换前需在隔离副本确认新镜像迁移和旧镜像可读，再停止 AGM 写入并备份完整当前数据，
-包含必要 WAL/SHM；不在仓库或输出中记录账号、API Key 等凭据。
-上线仅切 AGM 服务并核对旧/新 image、实际版本、health、restart 和同机 peer。
-回退使用旧镜像与当前数据，不恢复旧数据库、不重放会话或重发回执。
+启动实际配置变化仅涉及 `custom_mapping`、`experimental`、`stream_timeouts`。
+官方移除 legacy `gemini-3.x-flash` 映射；现有其余映射、thinking与认证设置保持，账号文件身份保持。
+回退使用原4.9.0镜像与当前数据，不恢复旧数据库、不重放会话或重发回执；旧镜像读回已在副本验证。
 服务没有可证明的请求排空接口，重启不能称为无中断升级。
 
-本次不修改 Yuki、账号、路由或代理，不清空签名/思考缓存。
+本次未修改 Yuki 或代理，未主动清空签名/思考缓存；私有备份与凭据不进入仓库或公开输出。
 本适配遵循上游 [CC-BY-NC-SA-4.0 许可](https://github.com/lbjlaq/Antigravity-Manager/blob/15f4bc938ecfa0286097ec6246a3d1583bc683a7/LICENSE)。
