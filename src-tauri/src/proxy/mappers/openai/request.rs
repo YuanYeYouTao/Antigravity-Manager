@@ -1607,7 +1607,7 @@ mod tests {
             1000
         );
 
-        // 3. 裸模型 Flash 客户端未填或试图关闭：绝不关闭思考，强制回填 -high (-1) 或 -medium (4000)
+        // 3. 省略等级沿动态预算；none 沿现有 low 预算。
         let req_flash_none: OpenAIRequest = serde_json::from_value(json!({
             "model": "gemini-3-flash",
             "messages": [{"role": "user", "content": "hi"}]
@@ -1630,7 +1630,7 @@ mod tests {
             transform_openai_request(&req_flash_disabled, "test-p", "gemini-3-flash", None);
         assert_eq!(
             body["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            4000
+            1000
         );
 
         // 4. 裸模型 Flash 客户端传入自定义 budget_tokens：彻底被忽略，由服务端权威等级回填
@@ -1759,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_reads_the_parent_signature_instead_of_the_routing_identity() {
+    fn responses_does_not_assign_parent_session_signature_to_an_unsigned_tool() {
         let previous_response_id = format!("resp-parent-{}", uuid::Uuid::new_v4());
         let routing_session_id = format!("resp-root-{}", uuid::Uuid::new_v4());
         use base64::Engine;
@@ -1811,7 +1811,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(returned_session_id, routing_session_id);
-        assert_eq!(tool_part["thoughtSignature"], signature);
+        assert_ne!(tool_part["thoughtSignature"], signature);
+        assert_eq!(
+            tool_part["thoughtSignature"],
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE
+        );
     }
 
     #[test]
@@ -2177,7 +2181,7 @@ mod tests {
         assert_eq!(max_output_tokens, 57344);
     }
     #[test]
-    fn test_vertex_ai_drops_sentinel_injection() {
+    fn test_vertex_ai_unsigned_tool_uses_protocol_skip_marker() {
         // [FIX #1650] Verify sentinel signature injection for Vertex AI models
         let req = OpenAIRequest {
             model: "claude-3-7-sonnet-thinking".to_string(), // Triggers is_thinking_model
@@ -2218,11 +2222,9 @@ mod tests {
             .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
             .expect("Should find functionCall part");
 
-        // 铁律：functionCall **绝不**携带哨兵 —— 官方报文 0/23 处出现哨兵，
-        // 它不属于 Antigravity 协议；签名归位统一交给流水线终审 `place_turn_signature`。
-        assert!(
-            tool_part.get("thoughtSignature").is_none(),
-            "functionCall must not carry a sentinel signature"
+        assert_eq!(
+            tool_part["thoughtSignature"],
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE
         );
     }
 
@@ -2265,12 +2267,10 @@ mod tests {
                 .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
                 .expect(&format!("[{model}] Should find functionCall part"));
 
-            // 铁律：无缓存签名时**留空**（字段缺席），绝不发明哨兵。
-            // 官方报文里哨兵出现 0 次；签名缺失是被上游容忍的（在飞轮即缺席），
-            // 且该轮签名由流水线终审 `place_turn_signature` 按锚点归位。
-            assert!(
-                tool_part.get("thoughtSignature").is_none(),
-                "[{model}] functionCall must not carry a sentinel signature when unsigned"
+            assert_eq!(
+                tool_part["thoughtSignature"],
+                crate::proxy::thinking_store::SENTINEL_SIGNATURE,
+                "{model}"
             );
         }
     }
@@ -2536,18 +2536,7 @@ mod tests {
             .iter()
             .find(|c| c["role"] == "model")
             .expect("model turn");
-        let thought = model_msg["parts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&serde_json::json!(true)))
-            .expect("thought part");
-        // Reasoning content is preserved (Anthropic alignment)
-        assert_eq!(thought["text"], client_thought);
-        assert!(
-            thought.get("thoughtSignature").is_none(),
-            "Gemini thought parts do not carry signatures"
-        );
+        assert_eq!(model_msg["parts"], json!([{ "text": "a1" }]));
         let dumped = serde_json::to_string(&result).unwrap();
         assert!(
             !dumped.contains("fake_client_sig_that_must_be_ignored"),
@@ -2911,14 +2900,7 @@ mod tests {
         };
         let resp_parts = model_parts(&resp_result);
         let chat_parts = model_parts(&chat_result);
-        let thought = resp_parts
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&json!(true)))
-            .unwrap();
-        assert_eq!(thought["text"], client_thought);
-        assert!(thought.get("thoughtSignature").is_none());
+        assert_eq!(resp_parts, json!([{ "text": "assistant answer" }]));
         assert_eq!(resp_parts, chat_parts);
         let dumped = serde_json::to_string(&resp_parts).unwrap();
         assert!(
@@ -3108,8 +3090,9 @@ mod tests {
             .find(|p| p.get("functionCall").is_some())
             .unwrap();
         let sig_2 = fc_2["thoughtSignature"].as_str().unwrap();
-        // 最新一条 model 应当正确采纳 prev_resp_id 的签名
-        assert_eq!(sig_2, sig_round_2, "最新一条 model 应当正确继承上一轮签名");
+        // 会话最新签名不是这个工具调用的原件，不能借给新一轮。
+        assert_ne!(sig_2, sig_round_2);
+        assert_eq!(sig_2, crate::proxy::thinking_store::SENTINEL_SIGNATURE);
     }
 
     #[test]
@@ -3298,19 +3281,23 @@ mod tests {
         let (result, _, _, _) =
             transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
         let contents = result["request"]["contents"].as_array().unwrap();
-        let tool_turn_parts = contents[2]["parts"].as_array().unwrap();
-
-        // 验证同时存在 functionResponse 和 inlineData 两个 parts
-        assert_eq!(tool_turn_parts.len(), 2);
-        assert!(tool_turn_parts[0].get("functionResponse").is_some());
-        assert!(tool_turn_parts[1].get("inlineData").is_some());
-
-        let inline_data = &tool_turn_parts[1]["inlineData"];
+        let parts: Vec<_> = contents
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .collect();
+        let function_response = parts
+            .iter()
+            .find(|part| part["functionResponse"]["id"] == "call_shot_1")
+            .unwrap();
+        let inline_data = &parts
+            .iter()
+            .find(|part| part.get("inlineData").is_some())
+            .unwrap()["inlineData"];
         assert_eq!(inline_data["mimeType"], "image/png");
         assert_eq!(inline_data["data"], fake_b64);
 
         // 验证文本中的 base64 已被替换为摘要说明，防止 functionResponse 体积膨胀
-        let func_res_str = tool_turn_parts[0]["functionResponse"]["response"]["output"]
+        let func_res_str = function_response["functionResponse"]["response"]["output"]
             .as_str()
             .unwrap();
         assert!(!func_res_str.contains(fake_b64));

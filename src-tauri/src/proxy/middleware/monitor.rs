@@ -1737,9 +1737,9 @@ mod tests {
                     );
                 }
                 expected.push((model, *input, *output, *cached, *total));
+                wait_for_persisted_requests(expected.len() as u64).await;
             }
         }
-        wait_for_persisted_requests(expected.len() as u64).await;
         let conn = rusqlite::Connection::open(crate::modules::token_stats::get_db_path().unwrap())
             .unwrap();
         let hourly_trend = crate::modules::token_stats::get_model_trend_hourly(0).unwrap();

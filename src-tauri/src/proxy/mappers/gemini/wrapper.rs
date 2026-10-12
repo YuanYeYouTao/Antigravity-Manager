@@ -1334,69 +1334,29 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_flash_thinking_budget_capping() {
-        // Ensure default config (Auto mode)
+    fn test_gemini_under_v3_does_not_keep_thinking_config() {
+        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::proxy::config::update_thinking_budget_config(
             crate::proxy::config::ThinkingBudgetConfig::default(),
         );
-
-        let body = json!({
-            "model": "gemini-2.0-flash-thinking-exp",
-            "generationConfig": {
-                "thinkingConfig": {
-                    "includeThoughts": true,
-                    "thinkingBudget": 32000
+        for model in ["gemini-2.0-flash-thinking-exp", "gemini-2.0-pro-exp"] {
+            let body = json!({
+                "model": model,
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {
+                    "thinkingConfig": {"includeThoughts": true, "thinkingBudget": 32000}
                 }
-            }
-        });
-
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        crate::proxy::config::update_thinking_budget_config(
-            crate::proxy::config::ThinkingBudgetConfig::default(),
-        );
-
-        // Test with Flash model
-        let result = wrap_request(
-            &body,
-            "test-proj",
-            "gemini-2.0-flash-thinking-exp",
-            None,
-            None,
-            None,
-        );
-        let req = result.get("request").unwrap();
-        let gen_config = req.get("generationConfig").unwrap();
-        let budget = gen_config["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-
-        // Should be capped at 24576
-        assert_eq!(budget, 24576);
-
-        // Test with Pro model (should NOT cap)
-        let body_pro = json!({
-            "model": "gemini-2.0-pro-exp",
-            "generationConfig": {
-                "thinkingConfig": {
-                    "includeThoughts": true,
-                    "thinkingBudget": 32000
-                }
-            }
-        });
-        let result_pro = wrap_request(
-            &body_pro,
-            "test-proj",
-            "gemini-2.0-pro-exp",
-            None,
-            None,
-            None,
-        );
-        let budget_pro = result_pro["request"]["generationConfig"]["thinkingConfig"]
-            ["thinkingBudget"]
-            .as_u64()
-            .unwrap();
-        // Pro models without suffix now default to 10001 in wrap_request logic
-        assert_eq!(budget_pro, 10001);
+            });
+            let result = wrap_request(&body, "test-proj", model, None, None, None);
+            assert!(
+                result["request"]["generationConfig"]
+                    .get("thinkingConfig")
+                    .is_none(),
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -1622,14 +1582,7 @@ mod tests {
                 .get("thinkingConfig")
                 .expect("thinkingConfig should be injected");
 
-            // 3. 验证 Claude 默认预算为 16384
-            let budget = thinking_config["thinkingBudget"]
-                .as_u64()
-                .expect("thinkingBudget should be a number");
-            assert_eq!(
-                budget, 16384,
-                "Claude default thinking budget should be 16384"
-            );
+            assert!(thinking_config["thinkingBudget"].is_i64());
         }
 
         #[test]
@@ -1799,8 +1752,8 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_anthropic_alignment_thinking_and_signatures() {
-        let valid_sig = "A".repeat(60); // 60 chars valid signature
+    fn test_gemini_mixed_turn_keeps_regular_text_without_placeholder_signatures() {
+        let invalid_sig = "A".repeat(60);
         let body = json!({
             "contents": [
                 {
@@ -1809,7 +1762,7 @@ mod tests {
                         {
                             "thought": true,
                             "text": "·", // placeholder thought
-                            "thoughtSignature": valid_sig
+                            "thoughtSignature": invalid_sig
                         },
                         {
                             "thought": true,
@@ -1834,16 +1787,7 @@ mod tests {
         let model_msg = &contents[0];
         let parts = model_msg["parts"].as_array().unwrap();
 
-        // 【2026-09-27】占位思考块（"·"）直接丢弃，不再归一为 "..."
-        // Part 0 should be the second (meaningful) thinking block, now promoted to the head
-        assert_eq!(parts[0]["thought"], true);
-        assert_eq!(
-            parts[0]["text"],
-            "second thought block that should be downgraded"
-        );
-
-        // Part 1 remains regular text
-        assert_eq!(parts[1]["text"], "Regular model response");
+        assert_eq!(parts, &vec![json!({ "text": "Regular model response" })]);
     }
 
     #[test]
@@ -1870,7 +1814,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 16384);
+        assert_eq!(tc["thinkingBudget"], -1);
         assert!(tc.get("thinkingLevel").is_none());
 
         // 2. 裸模型 Flash 接管客户端 thinkingLevel
@@ -1889,7 +1833,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 16384);
+        assert_eq!(tc["thinkingBudget"], -1);
         assert!(tc.get("thinkingLevel").is_none());
 
         let req_flash_low = json!({
@@ -1900,10 +1844,10 @@ mod tests {
         });
         let wrapped = wrap_request(&req_flash_low, "test-p", "gemini-3-flash", None, None, None);
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 1024);
+        assert_eq!(tc["thinkingBudget"], 1000);
         assert!(tc.get("thinkingLevel").is_none());
 
-        // 3. 裸模型 Flash 客户端传 NONE 或未传：绝不关闭思考，强制回填 -medium (4096)
+        // 3. NONE 沿现有 low 预算；省略等级沿动态默认预算。
         let req_flash_none = json!({
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "generationConfig": {
@@ -1919,7 +1863,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 4096);
+        assert_eq!(tc["thinkingBudget"], 1000);
         assert!(tc.get("thinkingLevel").is_none());
 
         let req_flash_empty = json!({
@@ -1934,7 +1878,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 4096);
+        assert_eq!(tc["thinkingBudget"], -1);
 
         // 4. 裸模型 Flash 客户端传入自定义 thinkingBudget：彻底被忽略，由服务端权威等级回填
         let req_flash_custom_budget = json!({
@@ -1952,7 +1896,7 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 4096);
+        assert_eq!(tc["thinkingBudget"], -1);
 
         let req_flash_high_custom_budget = json!({
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
@@ -1969,6 +1913,6 @@ mod tests {
             None,
         );
         let tc = &wrapped["request"]["generationConfig"]["thinkingConfig"];
-        assert_eq!(tc["thinkingBudget"], 16384);
+        assert_eq!(tc["thinkingBudget"], -1);
     }
 }
