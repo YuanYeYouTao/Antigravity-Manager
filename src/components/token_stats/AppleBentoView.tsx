@@ -33,7 +33,7 @@ interface AppleBentoViewProps {
     summary: TokenStatsSummary | null;
     dailyData: DayUsagePoint[];
     hourlyData: HourlyUsagePoint[];
-    timelineData?: TokenStatsAggregated[];
+    timelineData?: Pick<TokenStatsAggregated, 'total_tokens' | 'cache_reported_requests' | 'cache_reported_tokens' | 'request_count'>[];
     modelShareItems: ModelShareItem[];
     accountData: AccountTokenStats[];
     modelTrendData: any[];
@@ -244,15 +244,6 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
         return sorted.slice(0, 5);
     }, [accountData]);
 
-    // 计算输入输出比例 (Apple 环形/条形对比)
-    const inOutRatio = useMemo(() => {
-        if (!summary || summary.total_tokens === 0) return { inputPct: 50, outputPct: 50 };
-        const total = summary.total_input_tokens + summary.total_output_tokens;
-        if (total === 0) return { inputPct: 50, outputPct: 50 };
-        const inputPct = Math.round((summary.total_input_tokens / total) * 100);
-        return { inputPct, outputPct: 100 - inputPct };
-    }, [summary]);
-
     // 计算顶部4个卡片的极简微缩趋势线（Sparkline SVG 曲线，基于当前选择周期的真实时间线数据）
     const cardSparklines = useMemo(() => {
         const createSmoothPath = (values: number[], width = 96, height = 32) => {
@@ -399,25 +390,6 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                             </div>
                         </div>
 
-                        {/* 胶囊比例条 */}
-                        <div className="space-y-1.5 pt-2 border-t border-black/[0.04] dark:border-base-200">
-                            <div className="w-full h-1.5 bg-gray-100 dark:bg-base-200 rounded-full overflow-hidden flex">
-                                <div
-                                    className="h-full bg-[#0071e3] rounded-full"
-                                    style={{ width: `${inOutRatio.inputPct}%` }}
-                                    title={t('token_stats.input_ratio_hint', '输入占比: {{pct}}%', { pct: inOutRatio.inputPct })}
-                                />
-                                <div
-                                    className="h-full bg-[#af52de] rounded-full"
-                                    style={{ width: `${inOutRatio.outputPct}%` }}
-                                    title={t('token_stats.output_ratio_hint', '输出占比: {{pct}}%', { pct: inOutRatio.outputPct })}
-                                />
-                            </div>
-                            <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 dark:text-gray-500">
-                                <span>{inOutRatio.inputPct}% 入</span>
-                                <span>{inOutRatio.outputPct}% 出</span>
-                            </div>
-                        </div>
                     </div>
 
                     {/* Bento 2: 按已配置单价分列名义估算 */}

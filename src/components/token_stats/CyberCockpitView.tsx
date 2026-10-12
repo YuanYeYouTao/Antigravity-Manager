@@ -8,7 +8,6 @@ import {
     Cpu,
     Clock,
     Zap,
-    Scale,
 } from 'lucide-react';
 import { HourlyUsagePoint } from './HourlyTrendBarCard';
 import { ModelShareItem } from './TopModelsShareCard';
@@ -50,36 +49,16 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
     const [selectedModelIdx, setSelectedModelIdx] = useState<number | null>(null);
     const [hoveredHourIdx, setHoveredHourIdx] = useState<number | null>(null);
 
-    // 1. 输入输出比例与生成比
-    const inOutRatio = useMemo(() => {
-        if (!summary || summary.total_tokens === 0) return { inPct: 50, outPct: 50, inOutMultiplier: '1.0' };
-        const total = summary.total_input_tokens + summary.total_output_tokens;
-        if (total === 0) return { inPct: 50, outPct: 50, inOutMultiplier: '1.0' };
-        const inPct = Math.round((summary.total_input_tokens / total) * 100);
-        const mult = summary.total_output_tokens > 0
-            ? (summary.total_input_tokens / summary.total_output_tokens).toFixed(1)
-            : '0.0';
-        return { inPct, outPct: 100 - inPct, inOutMultiplier: mult };
-    }, [summary]);
-
     // 2. 均次负载与真实未缓存输入
     const deepMetrics = useMemo(() => {
-        const totalReqs = summary?.total_requests || 1;
         const totalTokens = summary?.total_tokens || 0;
-        const totalOutput = summary?.total_output_tokens || 0;
-        const totalReasoning = summary?.total_reasoning_tokens || 0;
 
         const avgTokensPerReq = summary && summary.total_reported_requests > 0
             ? Math.round(totalTokens / summary.total_reported_requests)
             : null;
-        const reasoningPctOfOutput = totalOutput > 0 ? Math.round((totalReasoning / totalOutput) * 100) : 0;
-        const avgReasoningPerReq = Math.round(totalReasoning / totalReqs);
 
         return {
             avgTokensPerReq,
-            totalReasoning,
-            reasoningPctOfOutput,
-            avgReasoningPerReq,
         };
     }, [summary]);
 
@@ -93,7 +72,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
             tokens: m.total_tokens,
             reportedRequests: m.total_reported_requests,
             requests: m.request_count,
-            pct: Math.max(1, Math.round((m.total_tokens / total) * 100)),
+            pct: Math.round((m.total_tokens / total) * 100),
             color: MODEL_NEON_COLORS[idx % MODEL_NEON_COLORS.length],
             modelIdx: idx,
         }));
@@ -106,7 +85,7 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                 tokens: otherTokens,
                 reportedRequests: sorted.slice(4).reduce((acc, m) => acc + m.total_reported_requests, 0),
                 requests: otherReqs,
-                pct: Math.max(1, Math.round((otherTokens / total) * 100)),
+                pct: Math.round((otherTokens / total) * 100),
                 color: '#64748b',
                 modelIdx: 4,
             });
@@ -322,22 +301,12 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                     <div className="text-[11px] font-mono text-gray-500 dark:text-gray-400 mt-1 flex items-center flex-wrap gap-x-1.5 gap-y-0.5">
                                         <span>
                                             {t('token_stats.input_short', '入')}:{' '}
-                                            <strong className="text-gray-800 dark:text-white font-mono">{summary && summary.input_reported_requests > 0 ? formatNumber(summary.total_input_tokens) : t('token_stats.cache_not_reported', '未返回')}</strong> ({inOutRatio.inPct}%)
+                                            <strong className="text-gray-800 dark:text-white font-mono">{summary && summary.input_reported_requests > 0 ? formatNumber(summary.total_input_tokens) : t('token_stats.cache_not_reported', '未返回')}</strong>
                                         </span>
                                         <span>/</span>
                                         <span>
                                             {t('token_stats.output_short', '出')}:{' '}
-                                            <strong className="text-purple-600 dark:text-purple-300 font-mono">{summary && summary.output_reported_requests > 0 ? formatNumber(summary.total_output_tokens) : t('token_stats.cache_not_reported', '未返回')}</strong> ({inOutRatio.outPct}%)
-                                        </span>
-                                        <span
-                                            className={`px-1.5 py-0.5 rounded text-[10px] font-semibold transition-colors ${
-                                                deepMetrics.totalReasoning > 0
-                                                    ? 'bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 ring-1 ring-purple-500/20'
-                                                    : 'bg-gray-100 dark:bg-white/[0.06] text-gray-500 dark:text-gray-400'
-                                            }`}
-                                            title={`${t('token_stats.cockpit_thinking_share', '思考占比')}: ${deepMetrics.reasoningPctOfOutput}% (${formatNumber(deepMetrics.totalReasoning)} Tokens)`}
-                                        >
-                                            {t('token_stats.reasoning_short', '思')}: {formatNumber(deepMetrics.totalReasoning)} ({deepMetrics.reasoningPctOfOutput}%)
+                                            <strong className="text-purple-600 dark:text-purple-300 font-mono">{summary && summary.output_reported_requests > 0 ? formatNumber(summary.total_output_tokens) : t('token_stats.cache_not_reported', '未返回')}</strong>
                                         </span>
                                     </div>
                                 </div>
@@ -533,10 +502,6 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                             </div>
 
                             <div className="shrink-0 pt-1.5 border-t border-gray-100 dark:border-white/[0.06] flex items-center justify-between text-[11px] font-mono text-gray-500 dark:text-gray-400">
-                                <span className="flex items-center gap-1.5">
-                                    <Scale className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
-                                    <span>{t('token_stats.cockpit_in_out_ratio', '入出倍率')}: <strong className="text-purple-600 dark:text-purple-300 font-mono">{inOutRatio.inOutMultiplier} : 1</strong></span>
-                                </span>
                                 <span>
                                     {activeHour ? (
                                         <span className="text-blue-600 dark:text-emerald-400 font-bold font-mono">
@@ -557,11 +522,6 @@ export const CyberCockpitView: React.FC<CyberCockpitViewProps> = ({
                                     {t('token_stats.cockpit_efficiency_index', '效能指数')} · J23
                                 </span>
                                 <div className="flex items-center gap-2">
-                                    {deepMetrics.totalReasoning > 0 && (
-                                        <span className="font-mono text-[10px] text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/40 px-1.5 py-0.2 rounded font-semibold" title={t('token_stats.cockpit_avg_thinking_per_req', '均次思考')}>
-                                            ~{formatNumber(deepMetrics.avgReasoningPerReq)} {t('token_stats.reasoning_short', '思')} / req
-                                        </span>
-                                    )}
                                     <span className="font-mono text-[11px] text-teal-600 dark:text-teal-400 font-semibold flex items-center gap-1">
                                         <Zap className="w-3 h-3" />
                                         {t('token_stats.zero_latency', '0 延时吞吐')}

@@ -290,7 +290,9 @@ const TokenStats: React.FC = () => {
     const [loading, setLoading] = useState(true);
 
     // 经典模式专属堆叠图数据
-    const [classicChartData, setClassicChartData] = useState<TokenStatsAggregated[]>([]);
+    const [classicChartData, setClassicChartData] = useState<
+        (Omit<TokenStatsAggregated, 'total_output_tokens'> & { total_output_tokens: number | null })[]
+    >([]);
 
     // Insights 模式专属热力图与 24 小时紧凑柱状图数据
     const [heatmapData, setHeatmapData] = useState<DayUsagePoint[]>([]);
@@ -479,6 +481,7 @@ const TokenStats: React.FC = () => {
             setClassicChartData(
                 classicData.map(point => ({
                     ...point,
+                    total_output_tokens: point.output_reported_requests > 0 ? point.total_output_tokens : null,
                     known_cached_tokens: point.cache_reported_requests > 0 ? point.cache_reported_tokens : null,
                     uncached_input_tokens: point.cache_reported_requests > 0 ? Math.max(point.cache_reported_input_tokens - point.cache_reported_tokens, 0) : null,
                     unknown_cache_input_tokens: point.input_reported_requests > 0 ? point.total_input_tokens - point.cache_reported_input_tokens : null,
