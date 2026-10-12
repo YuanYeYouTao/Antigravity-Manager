@@ -22,6 +22,16 @@ const MAX_RETRY_ATTEMPTS: usize = 3;
 const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TOTAL_INPUT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
+
+fn bump_session_on_input_limit(
+    status: u16,
+    error_text: &str,
+    account_id: &str,
+    affinity_key: &str,
+) -> Option<u64> {
+    (status == 400 && error_text.contains("exceeds the maximum number of tokens"))
+        .then(|| crate::proxy::common::session::bump_session(account_id, affinity_key))
+}
 use super::common::{
     apply_retry_strategy, next_rotation_attempt, should_rotate_account, FailureStatusTracker,
     RequestRetryState, RetryStrategy,
@@ -915,6 +925,93 @@ fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool 
 
 #[cfg(test)]
 mod stream_peek_tests {
+    #[test]
+    fn responses_input_limit_bumps_the_same_affinity_used_by_its_mapper() {
+        use crate::proxy::common::session::{apply_upstream_session, current_bump};
+        use crate::proxy::mappers::openai::{transform_openai_request_with_session, OpenAIRequest};
+        let account = uuid::Uuid::new_v4().to_string();
+        let affinity = "a:responses-current-conversation";
+        let store = "t:responses-private-execution";
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let token = crate::proxy::token_manager::ProxyToken {
+            account_id: account.clone(),
+            priority: 0,
+            access_token: "fixture".into(),
+            refresh_token: "fixture".into(),
+            expires_in: 3600,
+            timestamp: 0,
+            email: "fixture@invalid".into(),
+            account_path: Default::default(),
+            project_id: Some("project".into()),
+            subscription_tier: None,
+            remaining_quota: None,
+            protected_models: Default::default(),
+            health_score: 1.0,
+            reset_time: None,
+            weekly_reset_time: None,
+            validation_blocked: false,
+            validation_blocked_until: 0,
+            validation_url: None,
+            model_quotas: Default::default(),
+            model_limits: Default::default(),
+        };
+        let request: OpenAIRequest = serde_json::from_value(serde_json::json!({"model":"gemini-fixture","messages":[{"role":"user","content":"Same conversation"}]})).unwrap();
+        let (before, ..) = transform_openai_request_with_session(
+            &request,
+            "project",
+            "gemini-3.8-flash",
+            Some(&token),
+            affinity,
+            Some(store),
+            true,
+        );
+        assert_eq!(
+            super::bump_session_on_input_limit(
+                400,
+                "The input token count exceeds the maximum number of tokens allowed 1048576",
+                &account,
+                affinity
+            ),
+            Some(1)
+        );
+        let (after, ..) = transform_openai_request_with_session(
+            &request,
+            "project",
+            "gemini-3.8-flash",
+            Some(&token),
+            affinity,
+            Some(store),
+            true,
+        );
+        assert_ne!(
+            before["request"]["sessionId"],
+            after["request"]["sessionId"]
+        );
+        let mut actual = serde_json::json!({});
+        apply_upstream_session(&mut actual, &account, affinity);
+        assert_eq!(after["request"]["sessionId"], actual["sessionId"]);
+        assert_eq!(current_bump(&account, store), 0);
+        assert_eq!(
+            super::bump_session_on_input_limit(
+                429,
+                "exceeds the maximum number of tokens",
+                &account,
+                affinity
+            ),
+            None
+        );
+        assert_eq!(
+            super::bump_session_on_input_limit(
+                400,
+                "unrelated invalid request",
+                &account,
+                affinity
+            ),
+            None
+        );
+        assert_eq!(current_bump(&account, affinity), 1);
+    }
+
     use super::build_image_contents;
     use super::build_image_edit_body;
     use super::convert_chat_response_to_responses;
@@ -1127,7 +1224,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             .expect("inline image data");
 
         assert_eq!(
-            function_response["functionResponse"]["response"]["result"],
+            function_response["functionResponse"]["response"]["output"],
             "image generated"
         );
         assert!(!function_response.to_string().contains("data:image/"));
@@ -2717,6 +2814,14 @@ pub async fn handle_chat_completions(
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
 
+            if let Some(usage) = gemini_resp
+                .get("response")
+                .unwrap_or(&gemini_resp)
+                .get("usageMetadata")
+            {
+                crate::proxy::monitor::record_upstream_usage(usage);
+            }
+
             crate::proxy::thinking_store::capture_gemini_response(&session_id, &gemini_resp);
 
             // [CACHE] 从 Gemini 响应中提取缓存信息，关闭反馈循环
@@ -3060,8 +3165,9 @@ pub async fn handle_chat_completions(
         // [FIX session-1M] 上游按 sessionId 在服务端累计会话输入,长工具循环会把累计推过 1M,
         // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
         // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
-        if status_code == 400 && error_text.contains("exceeds the maximum number of tokens") {
-            let generation = crate::proxy::common::session::bump_session(&account_id, &store_key);
+        if let Some(generation) =
+            bump_session_on_input_limit(status_code, &error_text, &account_id, &affinity_key)
+        {
             tracing::warn!(
                 "[OpenAI] Upstream session token accumulation exceeded 1M on account {}. sessionId bumped to generation {}, retrying with a fresh upstream session.",
                 email, generation
@@ -4650,6 +4756,13 @@ pub async fn handle_completions(
                 }
             };
 
+            if let Some(usage) = gemini_resp
+                .get("response")
+                .unwrap_or(&gemini_resp)
+                .get("usageMetadata")
+            {
+                crate::proxy::monitor::record_upstream_usage(usage);
+            }
             crate::proxy::thinking_store::capture_gemini_response(&session_id_str, &gemini_resp);
 
             let chat_resp = transform_openai_response(
@@ -4777,6 +4890,12 @@ pub async fn handle_completions(
             status_code,
             error_text
         );
+        if let Some(generation) =
+            bump_session_on_input_limit(status_code, &error_text, &account_id, &affinity_key)
+        {
+            tracing::warn!("[Codex-Upstream] Session input limit exceeded; generation {} for account {}, retrying with the existing request loop.", generation, email);
+            continue;
+        }
 
         // 3. 统一流水线判定与标记限流状态(用于 UI 显示)
         let classification = crate::proxy::pipeline::UpstreamClassification::classify(

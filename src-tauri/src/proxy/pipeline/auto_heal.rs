@@ -170,6 +170,9 @@ where
                                     } else {
                                         &mut json
                                     };
+                                    if let Some(usage) = inner.get("usageMetadata") {
+                                        crate::proxy::monitor::record_upstream_usage(usage);
+                                    }
                                     let mut chunk_has_finish = false;
                                     let mut chunk_has_parts = false;
 

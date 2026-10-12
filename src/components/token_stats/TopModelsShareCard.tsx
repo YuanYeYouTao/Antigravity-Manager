@@ -5,11 +5,11 @@ import { useTranslation } from 'react-i18next';
 export interface ModelShareItem {
     model: string;
     total_tokens: number;
+    total_reported_requests: number;
     request_count: number;
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
-    cost: number;
 }
 
 interface TopModelsShareCardProps {
@@ -76,7 +76,7 @@ export const TopModelsShareCard: React.FC<TopModelsShareCardProps> = ({
                             <div
                                 key={item.model}
                                 className="flex items-center justify-between gap-3 text-xs group"
-                                title={`${item.model}: ${formatNumber(item.total_tokens)} Tokens ($${item.cost.toFixed(2)})`}
+                                title={`${item.model}: ${(item.total_reported_requests > 0 ? formatNumber(item.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} Tokens`}
                             >
                                 {/* 模型名 */}
                                 <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -105,14 +105,11 @@ export const TopModelsShareCard: React.FC<TopModelsShareCardProps> = ({
                                 <div className="flex items-center gap-2 flex-shrink-0 justify-end font-mono">
                                     <div className="flex flex-col items-end">
                                         <span className="text-gray-800 dark:text-white/80 font-medium leading-none">
-                                            {formatNumber(item.total_tokens)}
-                                        </span>
-                                        <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium mt-0.5 leading-none">
-                                            ${item.cost.toFixed(2)}
+                                            {(item.total_reported_requests > 0 ? formatNumber(item.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                         </span>
                                     </div>
                                     <span className="text-[10px] text-gray-400 dark:text-white/40 min-w-[28px] text-right">
-                                        {percent.toFixed(0)}%
+                                        {item.total_reported_requests > 0 ? `${percent.toFixed(0)}%` : '—'}
                                     </span>
                                 </div>
                             </div>

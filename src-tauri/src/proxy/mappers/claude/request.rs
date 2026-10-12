@@ -395,7 +395,7 @@ pub fn transform_claude_request_in_timed(
     is_retry: bool,
     account_id: Option<&str>,
     thinking_session_id: &str,
-    _upstream_session_id: &str,
+    upstream_session_id: &str,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] 支持动态规格
 ) -> Result<(Value, TransformTiming), String> {
     let mut timing = TransformTiming::default();
@@ -743,7 +743,7 @@ pub fn transform_claude_request_in_timed(
         crate::proxy::common::session::apply_upstream_session(
             &mut inner_request,
             account_id,
-            &session_id,
+            upstream_session_id,
         );
     }
 

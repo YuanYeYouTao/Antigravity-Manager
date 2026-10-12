@@ -1,10 +1,12 @@
 import React, { useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Sparkles } from 'lucide-react';
+import type { CacheReportedStats } from './usageMetrics';
 
-export interface HourlyUsagePoint {
+export interface HourlyUsagePoint extends CacheReportedStats {
     hour: string; // "YYYY-MM-DD HH:00" or "HH:00"
     total_tokens: number;
+    total_reported_requests: number;
     input_tokens: number;
     output_tokens: number;
     cached_tokens: number;
@@ -13,13 +15,11 @@ export interface HourlyUsagePoint {
 
 interface HourlyTrendBarCardProps {
     hourlyData: HourlyUsagePoint[];
-    totalEstimatedCost?: number;
     formatNumber: (n: number) => string;
 }
 
 export const HourlyTrendBarCard: React.FC<HourlyTrendBarCardProps> = ({
     hourlyData,
-    totalEstimatedCost,
     formatNumber,
 }) => {
     const { t } = useTranslation();
@@ -55,10 +55,14 @@ export const HourlyTrendBarCard: React.FC<HourlyTrendBarCardProps> = ({
             const point: HourlyUsagePoint = existing || {
                 hour: keyWithMin,
                 total_tokens: 0,
+                total_reported_requests: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
                 request_count: 0,
+                cache_reported_requests: 0,
+                cache_reported_input_tokens: 0,
+                cache_reported_tokens: 0,
             };
 
             total += point.total_tokens;
@@ -98,16 +102,11 @@ export const HourlyTrendBarCard: React.FC<HourlyTrendBarCardProps> = ({
                 <div className="text-xs font-mono font-medium text-gray-500 dark:text-white/70">
                     {hoveredBucket ? (
                         <span className="text-amber-600 dark:text-amber-400">
-                            {hoveredBucket.label} · {formatNumber(hoveredBucket.data.total_tokens)}
+                            {hoveredBucket.label} · {(hoveredBucket.data.total_reported_requests > 0 ? formatNumber(hoveredBucket.data.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                         </span>
                     ) : (
                         <span>
-                            24h · {formatNumber(past24hTotalTokens)}
-                            {totalEstimatedCost !== undefined && totalEstimatedCost > 0 ? (
-                                <span className="text-emerald-600 dark:text-emerald-400 ml-1 font-semibold">
-                                    (~${totalEstimatedCost.toFixed(2)})
-                                </span>
-                            ) : null}
+                            24h · {(buckets.some(bucket => bucket.data.total_reported_requests > 0) ? formatNumber(past24hTotalTokens) : t('token_stats.cache_not_reported', '未返回'))}
                         </span>
                     )}
                 </div>
@@ -131,7 +130,7 @@ export const HourlyTrendBarCard: React.FC<HourlyTrendBarCardProps> = ({
                             onMouseEnter={() => setHoveredIndex(idx)}
                             onMouseLeave={() => setHoveredIndex(null)}
                             className="flex-1 h-full flex flex-col justify-end items-center cursor-pointer group"
-                            title={`${b.fullTime}: ${formatNumber(b.data.total_tokens)} Tokens`}
+                            title={`${b.fullTime}: ${(b.data.total_reported_requests > 0 ? formatNumber(b.data.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} Tokens`}
                         >
                             {hasValue ? (
                                 <div

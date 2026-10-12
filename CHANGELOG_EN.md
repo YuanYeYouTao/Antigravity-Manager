@@ -3,6 +3,12 @@
 > Complete version history for Antigravity Tools. Return to project home at [README.md](README.md).
 
 *   **Version History**:
+    *   **v4.9.7-beta.9 (2026-10-13)**:
+        -   **[Session and cache evidence] Separate upstream affinity from private thinking ownership and remove signature guessing (PR #4, Thanks to @YuanYeYouTao)**:
+            -   All four protocols retain the supplied request identity and the existing affinity generation. Tool signatures match real calls; public text no longer borrows a recent signature. Explicit thinking budgets no longer fall back to an empirical fast cap.
+        -   **[Usage] Preserve reported fields, missing values and actual dispatches (PR #4, Thanks to @YuanYeYouTao)**:
+            -   Statistics use upstream usage before client display scaling, including reported totals and late stream fields. Missing values remain unknown; historical derived totals stay separate. Cache ratios use paired known fields and show coverage. Nominal costs and missing items are separate, without a production savings claim.
+
     *   **v4.9.7-beta.8 (2026-10-11)**:
         -   **[Token Stats Overview & Deep Insights Dashboard, Full-Stack Thinking (Reasoning) Stats & Unified Dark Theme]**:
             -   **Full-Stack Thinking / Reasoning Token Analytics**:

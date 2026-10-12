@@ -446,6 +446,16 @@ pub fn init_db() -> Result<(), String> {
         [],
     );
 
+    let _ = conn.execute(
+        "ALTER TABLE request_logs ADD COLUMN physical_requests INTEGER",
+        [],
+    );
+
+    let _ = conn.execute(
+        "ALTER TABLE request_logs ADD COLUMN total_tokens INTEGER",
+        [],
+    );
+
     // 复合索引：客户端IP与时间戳倒序（针对安全审计与IP过滤）
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_client_ip_timestamp ON request_logs (client_ip, timestamp DESC)",
@@ -507,22 +517,24 @@ fn map_request_log_row(row: &rusqlite::Row) -> rusqlite::Result<ProxyRequestLog>
         duration: row.get(5)?,
         model: row.get(6)?,
         error: row.get(7)?,
-        request_body: row.get(8).unwrap_or(None),
-        upstream_request_body: row.get(9).unwrap_or(None),
-        response_body: row.get(10).unwrap_or(None),
-        input_tokens: row.get(11).unwrap_or(None),
-        output_tokens: row.get(12).unwrap_or(None),
-        cached_tokens: row.get(13).unwrap_or(None),
-        reasoning_tokens: row.get(14).unwrap_or(None),
-        account_email: row.get(15).unwrap_or(None),
-        mapped_model: row.get(16).unwrap_or(None),
-        protocol: row.get(17).unwrap_or(None),
-        client_ip: row.get(18).unwrap_or(None),
-        username: row.get(19).unwrap_or(None),
-        request_headers: row.get(20).unwrap_or(None),
-        upstream_request_headers: row.get(21).unwrap_or(None),
-        response_headers: row.get(22).unwrap_or(None),
-        session_id: row.get(23).unwrap_or(None),
+        request_body: row.get(8)?,
+        upstream_request_body: row.get(9)?,
+        response_body: row.get(10)?,
+        input_tokens: row.get(11)?,
+        output_tokens: row.get(12)?,
+        cached_tokens: row.get(13)?,
+        reasoning_tokens: row.get(14)?,
+        account_email: row.get(15)?,
+        mapped_model: row.get(16)?,
+        protocol: row.get(17)?,
+        client_ip: row.get(18)?,
+        username: row.get(19)?,
+        request_headers: row.get(20)?,
+        upstream_request_headers: row.get(21)?,
+        response_headers: row.get(22)?,
+        session_id: row.get(23)?,
+        physical_requests: row.get(24)?,
+        total_tokens: row.get(25)?,
     })
 }
 
@@ -1113,64 +1125,6 @@ pub fn load_thinking_by_signature(
     }
 }
 
-/// 为 UI 展示层兜底提供：按会话查找最新记录中的权威签名 (支持带租户前缀的容错匹配)
-pub fn lookup_latest_thinking_signature(session_id: &str) -> Option<String> {
-    if session_id.trim().is_empty() {
-        return None;
-    }
-    let conn = thinking_db().ok()?;
-    let suffix = format!("%:{}", session_id.trim());
-    let (id, raw_sig): (i64, String) = conn
-        .query_row(
-            "SELECT id, signature FROM thinking_records 
-         WHERE (session_key = ?1 OR session_key LIKE ?2) 
-           AND signature IS NOT NULL 
-         ORDER BY id DESC LIMIT 1",
-            rusqlite::params![session_id.trim(), suffix],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok()?;
-    let healed = normalize_and_heal_signature(&raw_sig);
-    if let Some(ref h) = healed {
-        if h != &raw_sig {
-            let _ = conn.execute(
-                "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                rusqlite::params![h, id],
-            );
-        }
-    }
-    healed
-}
-
-/// 为 UI 展示层兜底提供：按思考内容片段模糊查找权威签名
-pub fn lookup_signature_by_thought_snippet(snippet: &str) -> Option<String> {
-    let clean = snippet.trim();
-    if clean.is_empty() {
-        return None;
-    }
-    let conn = thinking_db().ok()?;
-    let pattern = format!("%{}%", clean);
-    let (id, raw_sig): (i64, String) = conn
-        .query_row(
-            "SELECT id, signature FROM thinking_records 
-         WHERE thought LIKE ?1 AND signature IS NOT NULL 
-         ORDER BY id DESC LIMIT 1",
-            rusqlite::params![pattern],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok()?;
-    let healed = normalize_and_heal_signature(&raw_sig);
-    if let Some(ref h) = healed {
-        if h != &raw_sig {
-            let _ = conn.execute(
-                "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                rusqlite::params![h, id],
-            );
-        }
-    }
-    healed
-}
-
 /// 根据 fingerprint 精准穿透点查纯文本历史思考（利用 idx_thinking_rec_fp 索引）
 pub fn load_thinking_by_fingerprint(
     session_key: &str,
@@ -1724,8 +1678,8 @@ fn save_log_with_connection(
     make_room(conn, budget, log_bytes)?;
 
     conn.execute(
-        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, upstream_request_body, response_body, input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username, request_headers, upstream_request_headers, response_headers, session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, upstream_request_body, response_body, input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username, request_headers, upstream_request_headers, response_headers, session_id, physical_requests, total_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         params![
             log.id,
             log.timestamp,
@@ -1751,6 +1705,8 @@ fn save_log_with_connection(
             log.upstream_request_headers,
             log.response_headers,
             log.session_id,
+            log.physical_requests,
+            log.total_tokens,
         ],
     ).map_err(|e| e.to_string())?;
 
@@ -1767,7 +1723,7 @@ pub fn get_logs_summary(limit: usize, offset: usize) -> Result<Vec<ProxyRequestL
                 NULL as request_body, NULL as upstream_request_body, NULL as response_body,
                 input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 NULL as request_headers, NULL as upstream_request_headers, NULL as response_headers,
-                session_id
+                session_id, physical_requests, total_tokens
          FROM request_logs 
          ORDER BY timestamp DESC 
          LIMIT ?1 OFFSET ?2",
@@ -1824,7 +1780,7 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
                 request_body, upstream_request_body, response_body, input_tokens, output_tokens,
                 cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 request_headers, upstream_request_headers, response_headers,
-                session_id
+                session_id, physical_requests, total_tokens
          FROM request_logs
          WHERE id = ?1",
         )
@@ -2619,9 +2575,9 @@ pub fn get_logs_filtered(
     let sql = if errors_only {
         "SELECT id, timestamp, method, url, status, duration, model, substr(error, 1, 1024),
                 NULL as request_body, NULL as upstream_request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username,
+                input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 NULL as request_headers, NULL as upstream_request_headers, NULL as response_headers,
-                session_id
+                session_id, physical_requests, total_tokens
          FROM request_logs
          WHERE (status < 200 OR status >= 400)
          ORDER BY timestamp DESC
@@ -2629,18 +2585,18 @@ pub fn get_logs_filtered(
     } else if filter.is_empty() {
         "SELECT id, timestamp, method, url, status, duration, model, substr(error, 1, 1024),
                 NULL as request_body, NULL as upstream_request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username,
+                input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 NULL as request_headers, NULL as upstream_request_headers, NULL as response_headers,
-                session_id
+                session_id, physical_requests, total_tokens
          FROM request_logs
          ORDER BY timestamp DESC
          LIMIT ?1 OFFSET ?2"
     } else {
         "SELECT id, timestamp, method, url, status, duration, model, substr(error, 1, 1024),
                 NULL as request_body, NULL as upstream_request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username,
+                input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 NULL as request_headers, NULL as upstream_request_headers, NULL as response_headers,
-                session_id
+                session_id, physical_requests, total_tokens
          FROM request_logs
          WHERE (url LIKE ?3 OR method LIKE ?3 OR model LIKE ?3 OR CAST(status AS TEXT) LIKE ?3 OR account_email LIKE ?3 OR client_ip LIKE ?3 OR session_id LIKE ?3)
          ORDER BY timestamp DESC
@@ -2652,13 +2608,17 @@ pub fn get_logs_filtered(
         let logs_iter = stmt
             .query_map([limit, offset], map_request_log_row)
             .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
+        logs_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     } else if errors_only {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let logs_iter = stmt
             .query_map([limit, offset], map_request_log_row)
             .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
+        logs_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     } else {
         let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
         let logs_iter = stmt
@@ -2667,7 +2627,9 @@ pub fn get_logs_filtered(
                 map_request_log_row,
             )
             .map_err(|e| e.to_string())?;
-        logs_iter.filter_map(|r| r.ok()).collect()
+        logs_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     };
 
     Ok(logs)
@@ -2681,9 +2643,9 @@ pub fn get_all_logs_for_export() -> Result<Vec<ProxyRequestLog>, String> {
         .prepare(
             "SELECT id, timestamp, method, url, status, duration, model, error,
                 request_body, upstream_request_body, response_body, input_tokens, output_tokens,
-                cached_tokens, account_email, mapped_model, protocol, client_ip, username,
+                cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 request_headers, upstream_request_headers, response_headers,
-                session_id
+                session_id, physical_requests, total_tokens
          FROM request_logs
          ORDER BY timestamp DESC",
         )

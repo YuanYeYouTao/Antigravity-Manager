@@ -461,13 +461,7 @@ impl NonStreamingProcessor {
             .usage_metadata
             .as_ref()
             .map(|u| to_claude_usage(u, self.scaling_enabled, self.context_limit))
-            .unwrap_or(Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_input_tokens: None,
-                cache_creation_input_tokens: None,
-                server_tool_use: None,
-            });
+            .unwrap_or_default();
 
         ClaudeResponse {
             id: gemini_response.response_id.clone().unwrap_or_else(|| {
@@ -522,6 +516,7 @@ mod tests {
                 grounding_metadata: None,
             }]),
             usage_metadata: Some(UsageMetadata {
+                thoughts_token_count: None,
                 prompt_token_count: Some(10),
                 candidates_token_count: Some(5),
                 total_token_count: Some(15),

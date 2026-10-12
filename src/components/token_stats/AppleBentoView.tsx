@@ -24,38 +24,30 @@ import {
 import { HourlyUsagePoint } from './HourlyTrendBarCard';
 import { ModelShareItem } from './TopModelsShareCard';
 import { DayUsagePoint } from './ActivityHeatmapCard';
-import { AccountTokenStats, TokenStatsAggregated } from '../../pages/TokenStats';
-
-interface TokenStatsSummary {
-    total_input_tokens: number;
-    total_output_tokens: number;
-    total_cached_tokens: number;
-    total_tokens: number;
-    total_requests: number;
-    unique_accounts: number;
-}
+import type { AccountTokenStats, TokenStatsAggregated, TokenStatsSummary } from '../../pages/TokenStats';
+import type { CacheMetrics, NominalCostTotals } from './usageMetrics';
+import { CacheCoverage } from './CacheCoverage';
+import { NominalCostBreakdown } from './NominalCostBreakdown';
 
 interface AppleBentoViewProps {
     summary: TokenStatsSummary | null;
     dailyData: DayUsagePoint[];
     hourlyData: HourlyUsagePoint[];
-    timelineData?: TokenStatsAggregated[];
+    timelineData?: Pick<TokenStatsAggregated, 'total_tokens' | 'cache_reported_requests' | 'cache_reported_tokens' | 'request_count'>[];
     modelShareItems: ModelShareItem[];
     accountData: AccountTokenStats[];
-    displayModelTrendData: any[];
-    displayAccountTrendData: any[];
+    modelTrendData: any[];
+    accountTrendData: any[];
     allModels: string[];
     allAccounts: string[];
     viewMode: 'model' | 'account';
-    metricType: 'tokens' | 'cost';
     chartType: 'bar' | 'area';
     timeRange: 'hourly' | 'daily' | 'weekly' | 'all';
-    totalEstimatedCost: number;
-    cacheMetrics: { hitRate: number; savings: number };
+    nominalCosts: NominalCostTotals;
+    cacheMetrics: CacheMetrics;
     formatNumber: (n: number) => string;
     formatCurrency: (n: number) => string;
     switchChartType: (t: 'bar' | 'area') => void;
-    switchMetricType: (m: 'tokens' | 'cost') => void;
     switchViewMode: (v: 'model' | 'account') => void;
     setShowPricingModal: (s: boolean) => void;
     customTooltip: React.FC<any>;
@@ -70,20 +62,18 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
     timelineData,
     modelShareItems,
     accountData,
-    displayModelTrendData,
-    displayAccountTrendData,
+    modelTrendData,
+    accountTrendData,
     allModels,
     allAccounts,
     viewMode,
-    metricType,
     chartType,
     timeRange,
-    totalEstimatedCost,
+    nominalCosts,
     cacheMetrics,
     formatNumber,
     formatCurrency,
     switchChartType,
-    switchMetricType,
     switchViewMode,
     setShowPricingModal,
     customTooltip: CustomTrendTooltip,
@@ -113,10 +103,14 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                 existing || {
                     date: dateStr,
                     total_tokens: 0,
+                    total_reported_requests: 0,
                     request_count: 0,
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     total_cached_tokens: 0,
+                    cache_reported_requests: 0,
+                    cache_reported_input_tokens: 0,
+                    cache_reported_tokens: 0,
                 }
             );
         }
@@ -207,10 +201,14 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
             const point = map.get(key) || {
                 hour: key,
                 total_tokens: 0,
+                total_reported_requests: 0,
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
                 request_count: 0,
+                cache_reported_requests: 0,
+                cache_reported_input_tokens: 0,
+                cache_reported_tokens: 0,
             };
             total += point.total_tokens;
             if (point.total_tokens > peak) {
@@ -245,15 +243,6 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
         const sorted = [...accountData].sort((a, b) => b.total_tokens - a.total_tokens);
         return sorted.slice(0, 5);
     }, [accountData]);
-
-    // 计算输入输出比例 (Apple 环形/条形对比)
-    const inOutRatio = useMemo(() => {
-        if (!summary || summary.total_tokens === 0) return { inputPct: 50, outputPct: 50 };
-        const total = summary.total_input_tokens + summary.total_output_tokens;
-        if (total === 0) return { inputPct: 50, outputPct: 50 };
-        const inputPct = Math.round((summary.total_input_tokens / total) * 100);
-        return { inputPct, outputPct: 100 - inputPct };
-    }, [summary]);
 
     // 计算顶部4个卡片的极简微缩趋势线（Sparkline SVG 曲线，基于当前选择周期的真实时间线数据）
     const cardSparklines = useMemo(() => {
@@ -323,13 +312,12 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
             : hourBuckets.map(b => b.data);
 
         const tokensSeries = sourceData.map((d: any) => d.total_tokens || 0);
-        const inputSeries = sourceData.map((d: any) => d.total_input_tokens || d.input_tokens || 0);
-        const cacheSeries = sourceData.map((d: any) => d.total_cached_tokens || d.cached_tokens || 0);
+        const cacheSeries = sourceData.filter((d: any) => d.cache_reported_requests > 0)
+            .map((d: any) => d.cache_reported_tokens);
         const requestSeries = sourceData.map((d: any) => d.request_count || 0);
 
         return {
             tokens: createSmoothPath(tokensSeries, 96, 32),
-            cost: createSmoothPath(inputSeries, 96, 32),
             cache: createSmoothPath(cacheSeries, 96, 32),
             network: createSmoothPath(requestSeries, 96, 32),
         };
@@ -344,7 +332,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                     <div className="bg-white/95 dark:bg-base-100 backdrop-blur-xl rounded-2xl p-4 sm:p-5 border border-black/[0.05] dark:border-base-200 shadow-sm flex flex-col justify-between transition-all hover:shadow-md relative overflow-hidden group">
                         <div className="flex items-start justify-between">
                             <span className="text-[11px] font-semibold text-gray-500 dark:text-gray-400 tracking-wider uppercase">
-                                {t('token_stats.total_usage', '总消耗量')}
+                                {t('token_stats.reported_total_tokens', '上游实报总量')}
                             </span>
                             {/* 右上方：真实数据曲线 Sparkline */}
                             <div className="w-[100px] h-[34px] shrink-0 relative">
@@ -393,98 +381,36 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         {/* 中间主指标 */}
                         <div className="my-2">
                             <div className="text-3xl font-extrabold tracking-tight text-gray-900 dark:text-white font-mono leading-none">
-                                {formatNumber(summary.total_tokens)}
+                                {summary.total_reported_requests === 0 ? t('token_stats.cache_not_reported', '未返回') : formatNumber(summary.total_tokens)}
                             </div>
                             <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-2 flex items-center gap-1.5 font-mono">
-                                <span>{t('token_stats.input_short', '入')} {formatNumber(summary.total_input_tokens)}</span>
+                                <span>{t('token_stats.input_short', '入')} {summary.input_reported_requests === 0 ? t('token_stats.cache_not_reported', '未返回') : formatNumber(summary.total_input_tokens)}</span>
                                 <span className="text-gray-300 dark:text-gray-600">/</span>
-                                <span>{t('token_stats.output_short', '出')} {formatNumber(summary.total_output_tokens)}</span>
+                                <span>{t('token_stats.output_short', '出')} {summary.output_reported_requests === 0 ? t('token_stats.cache_not_reported', '未返回') : formatNumber(summary.total_output_tokens)}</span>
                             </div>
                         </div>
 
-                        {/* 胶囊比例条 */}
-                        <div className="space-y-1.5 pt-2 border-t border-black/[0.04] dark:border-base-200">
-                            <div className="w-full h-1.5 bg-gray-100 dark:bg-base-200 rounded-full overflow-hidden flex">
-                                <div
-                                    className="h-full bg-[#0071e3] rounded-full"
-                                    style={{ width: `${inOutRatio.inputPct}%` }}
-                                    title={t('token_stats.input_ratio_hint', '输入占比: {{pct}}%', { pct: inOutRatio.inputPct })}
-                                />
-                                <div
-                                    className="h-full bg-[#af52de] rounded-full"
-                                    style={{ width: `${inOutRatio.outputPct}%` }}
-                                    title={t('token_stats.output_ratio_hint', '输出占比: {{pct}}%', { pct: inOutRatio.outputPct })}
-                                />
-                            </div>
-                            <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 dark:text-gray-500">
-                                <span>{inOutRatio.inputPct}% 入</span>
-                                <span>{inOutRatio.outputPct}% 出</span>
-                            </div>
-                        </div>
                     </div>
 
-                    {/* Bento 2: 预估花费价值 */}
+                    {/* Bento 2: 按已配置单价分列名义估算 */}
                     <div className="bg-white/95 dark:bg-base-100 backdrop-blur-xl rounded-2xl p-4 sm:p-5 border border-black/[0.05] dark:border-base-200 shadow-sm flex flex-col justify-between transition-all hover:shadow-md relative overflow-hidden group">
                         <div className="flex items-start justify-between">
                             <span className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 tracking-wider uppercase">
-                                {t('token_stats.estimated_spending', '预估算支出')}
+                                {t('token_stats.nominal_cost', '配置单价名义估算')}
                             </span>
-                            {/* 右上方：真实支出走势 Sparkline */}
-                            <div className="w-[100px] h-[34px] shrink-0 relative">
-                                <svg width="100" height="34" className="overflow-visible">
-                                    <defs>
-                                        <linearGradient id="costSparklineGrad" x1="0" y1="0" x2="0" y2="1">
-                                            <stop offset="0%" stopColor="#10b981" stopOpacity="0.25" />
-                                            <stop offset="100%" stopColor="#10b981" stopOpacity="0.0" />
-                                        </linearGradient>
-                                    </defs>
-                                    <path
-                                        d={cardSparklines.cost.area}
-                                        fill="url(#costSparklineGrad)"
-                                    />
-                                    <path
-                                        d={cardSparklines.cost.path}
-                                        fill="none"
-                                        stroke="#10b981"
-                                        strokeWidth="2"
-                                        strokeLinecap="round"
-                                        strokeLinejoin="round"
-                                    />
-                                    {cardSparklines.cost.hasData && (
-                                        <>
-                                            <circle
-                                                cx={cardSparklines.cost.lastX}
-                                                cy={cardSparklines.cost.lastY}
-                                                r="5"
-                                                fill="#10b981"
-                                                fillOpacity="0.25"
-                                                className="animate-ping"
-                                                style={{ animationDuration: '2.5s' }}
-                                            />
-                                            <circle
-                                                cx={cardSparklines.cost.lastX}
-                                                cy={cardSparklines.cost.lastY}
-                                                r="2.5"
-                                                fill="#10b981"
-                                            />
-                                        </>
-                                    )}
-                                </svg>
-                            </div>
                         </div>
 
                         {/* 中间主指标 */}
                         <div className="my-2">
-                            <div className="text-3xl font-extrabold tracking-tight text-emerald-600 dark:text-emerald-400 font-mono leading-none">
-                                ${totalEstimatedCost.toFixed(2)}
-                            </div>
-                            <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-2 truncate">
-                                {t('token_stats.pricing_snapshot_hint', '基于当前单价快照加权累计')}
+                            <NominalCostBreakdown costs={nominalCosts} formatCurrency={formatCurrency} />
+                            <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-2">
+                                {t('token_stats.nominal_cost_note', '只估算已知用量，不代表实际账单')}
                             </div>
                         </div>
 
                         <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 dark:text-gray-500 pt-2 border-t border-black/[0.04] dark:border-base-200">
-                            <span>{t('token_stats.billing_baseline', '实时计费基线')}</span>
+                            <span>{t('token_stats.price_assumptions', '配置的单价假设')}
+                            </span>
                             <button
                                 onClick={() => setShowPricingModal(true)}
                                 className="text-emerald-600 dark:text-emerald-400 hover:underline flex items-center gap-0.5 font-sans font-medium"
@@ -498,7 +424,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                     <div className="bg-white/95 dark:bg-base-100 backdrop-blur-xl rounded-2xl p-4 sm:p-5 border border-black/[0.05] dark:border-base-200 shadow-sm flex flex-col justify-between transition-all hover:shadow-md relative overflow-hidden group">
                         <div className="flex items-start justify-between">
                             <span className="text-[11px] font-semibold text-[#30b0c7] tracking-wider uppercase">
-                                {t('token_stats.cache_efficiency', '缓存节省效能')}
+                                {t('token_stats.reported_cache_tokens', '已报告缓存 token')}
                             </span>
                             {/* 右上方：真实缓存走势 Sparkline */}
                             <div className="w-[100px] h-[34px] shrink-0 relative">
@@ -548,14 +474,16 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         <div className="my-2">
                             <div className="flex items-center gap-2">
                                 <span className="text-3xl font-extrabold tracking-tight text-gray-900 dark:text-white font-mono leading-none">
-                                    {formatNumber(summary.total_cached_tokens)}
+                                    {cacheMetrics.cachedTokens === null
+                                        ? t('token_stats.cache_not_reported', '未返回')
+                                        : formatNumber(cacheMetrics.cachedTokens)}
                                 </span>
                                 <span className="text-[11px] font-bold px-1.5 py-0.5 rounded-md bg-[#30b0c7]/10 text-[#30b0c7] border border-[#30b0c7]/20 shrink-0">
-                                    {cacheMetrics.hitRate.toFixed(1)}% 命中
+                                    {cacheMetrics.hitRate === null ? '—' : `${cacheMetrics.hitRate.toFixed(1)}%`}
                                 </span>
                             </div>
                             <div className="text-[11px] text-gray-400 dark:text-gray-500 mt-2 font-mono truncate">
-                                {t('token_stats.saved_funds', '节省资金约 ${{amount}}', { amount: cacheMetrics.savings.toFixed(2) })}
+                                <CacheCoverage metrics={cacheMetrics} />
                             </div>
                         </div>
 
@@ -702,7 +630,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                                         ? 'ring-1.5 ring-blue-500/80'
                                                         : ''
                                                 }`}
-                                                title={`${day.date}: ${formatNumber(day.total_tokens)} Tokens (${day.request_count} ${t('token_stats.times', '次')})`}
+                                                title={`${day.date}: ${(day.total_reported_requests > 0 ? formatNumber(day.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} Tokens (${day.request_count} ${t('token_stats.times', '次')})`}
                                             />
                                         );
                                     })}
@@ -715,7 +643,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                             <div>
                                 <span className="text-[11px] text-gray-400 dark:text-gray-500">{t('token_stats.total_activity_13w', '13周累计活跃')}</span>
                                 <div className="text-xl font-bold font-mono text-gray-900 dark:text-white mt-0.5">
-                                    {formatNumber(totalRangeTokens)} <span className="text-xs font-normal text-gray-400">Tokens</span>
+                                    {(dailyData.some(day => day.total_reported_requests > 0) ? formatNumber(totalRangeTokens) : t('token_stats.cache_not_reported', '未返回'))} <span className="text-xs font-normal text-gray-400">Tokens</span>
                                 </div>
                             </div>
                             <div className="mt-2.5 space-y-1.5 text-xs">
@@ -728,12 +656,12 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                 {hoveredDay ? (
                                     <div className="flex items-center justify-between text-blue-600 dark:text-blue-400 font-medium pt-1 border-t border-black/[0.03] dark:border-white/[0.04]">
                                         <span className="text-[11px] font-mono">{hoveredDay.date.slice(5)}</span>
-                                        <span className="font-mono">{formatNumber(hoveredDay.total_tokens)}</span>
+                                        <span className="font-mono">{(hoveredDay.total_reported_requests > 0 ? formatNumber(hoveredDay.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}</span>
                                     </div>
                                 ) : busiestDay ? (
                                     <div className="flex items-center justify-between text-gray-500 dark:text-gray-400 pt-1 border-t border-black/[0.03] dark:border-white/[0.04]">
                                         <span className="text-[11px]">{t('token_stats.peak_day', '峰值日 {{date}}', { date: busiestDay.date.slice(5) })}</span>
-                                        <span className="font-mono text-gray-900 dark:text-white">{formatNumber(busiestDay.total_tokens)}</span>
+                                        <span className="font-mono text-gray-900 dark:text-white">{(busiestDay.total_reported_requests > 0 ? formatNumber(busiestDay.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}</span>
                                     </div>
                                 ) : null}
                             </div>
@@ -771,10 +699,10 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         <span className="text-xs font-mono text-gray-400 dark:text-gray-500">
                             {activeHourData ? (
                                 <span className="text-[#0071e3] font-semibold">
-                                    {activeHourData.hourLabel} · {formatNumber(activeHourData.data.total_tokens)}
+                                    {activeHourData.hourLabel} · {(activeHourData.data.total_reported_requests > 0 ? formatNumber(activeHourData.data.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                 </span>
                             ) : (
-                                t('token_stats.peak_and_total', '峰值: {{peak}} · 全天: {{total}}', { peak: peakHourLabel, total: formatNumber(totalPast24h) })
+                                t('token_stats.peak_and_total', '峰值: {{peak}} · 全天: {{total}}', { peak: peakHourLabel, total: (hourBuckets.some(bucket => bucket.data.total_reported_requests > 0) ? formatNumber(totalPast24h) : t('token_stats.cache_not_reported', '未返回')) })
                             )}
                         </span>
                     </div>
@@ -791,7 +719,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                     onMouseEnter={() => setHoveredHourIdx(idx)}
                                     onMouseLeave={() => setHoveredHourIdx(null)}
                                     className="flex-1 h-full flex flex-col justify-end items-center cursor-pointer group"
-                                    title={`${b.hourLabel}: ${formatNumber(b.data.total_tokens)} Tokens`}
+                                    title={`${b.hourLabel}: ${(b.data.total_reported_requests > 0 ? formatNumber(b.data.total_tokens) : t('token_stats.cache_not_reported', '未返回'))} Tokens`}
                                 >
                                     {hasValue ? (
                                         <motion.div
@@ -813,20 +741,18 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                     {/* 宏观效能诊断胶囊双格 */}
                     <div className="grid grid-cols-2 gap-2.5 py-1">
                         <div className="bg-gray-50/80 dark:bg-base-200 rounded-2xl p-2.5 flex flex-col justify-between">
-                            <span className="text-[11px] text-gray-400 dark:text-gray-400">{t('token_stats.avg_interaction', '平均单次交互量')}</span>
+                            <span className="text-[11px] text-gray-400 dark:text-gray-400">{t('token_stats.reported_average_interaction', '实报请求平均量')}</span>
                             <span className="text-base font-bold font-mono text-gray-900 dark:text-base-content mt-0.5">
-                                {summary && summary.total_requests > 0
-                                    ? formatNumber(Math.round(summary.total_tokens / summary.total_requests))
-                                    : '0'} <span className="text-[10px] font-normal text-gray-400">Tokens</span>
+                                {summary && summary.total_reported_requests > 0
+                                    ? formatNumber(Math.round(summary.total_tokens / summary.total_reported_requests))
+                                    : t('token_stats.cache_not_reported', '未返回')} <span className="text-[10px] font-normal text-gray-400">Tokens</span>
                             </span>
                         </div>
 
                         <div className="bg-gray-50/80 dark:bg-base-200 rounded-2xl p-2.5 flex flex-col justify-between">
-                            <span className="text-[11px] text-gray-400 dark:text-gray-400">{t('token_stats.cost_per_million', '单位百万人次成本')}</span>
+                            <span className="text-[11px] text-gray-400 dark:text-gray-400">{t('token_stats.cache_field_coverage', '缓存字段覆盖')}</span>
                             <span className="text-base font-bold font-mono text-emerald-600 dark:text-emerald-400 mt-0.5">
-                                {summary && summary.total_tokens > 0
-                                    ? `$${((totalEstimatedCost / summary.total_tokens) * 1_000_000).toFixed(2)}`
-                                    : '$0.00'} <span className="text-[10px] font-normal text-gray-400">/ 1M</span>
+                                {cacheMetrics.reportedRequests}/{cacheMetrics.totalRequests}
                             </span>
                         </div>
                     </div>
@@ -886,10 +812,10 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                         </div>
                                         <div className="w-20 text-right font-mono flex items-baseline justify-end gap-1.5 flex-shrink-0">
                                             <span className="text-gray-900 dark:text-base-content font-semibold">
-                                                {formatNumber(item.total_tokens)}
+                                                {(item.total_reported_requests > 0 ? formatNumber(item.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                             </span>
                                             <span className="text-[10px] text-gray-400">
-                                                {pct.toFixed(0)}%
+                                                {item.total_reported_requests > 0 ? `${pct.toFixed(0)}%` : '—'}
                                             </span>
                                         </div>
                                     </div>
@@ -900,7 +826,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
 
                     <div className="flex items-center justify-between text-[11px] font-mono text-gray-400 dark:text-gray-500 pt-2.5 border-t border-black/[0.03] dark:border-base-200">
                         <span>{t('token_stats.top_models_load', 'Top 5 模型承载大部负荷')}</span>
-                        <span>{t('token_stats.cost_accumulated', '费用累计: ${{amount}}', { amount: topModels.reduce((acc, cur) => acc + cur.cost, 0).toFixed(2) })}</span>
+                        <span>{formatNumber(topModels.reduce((acc, cur) => acc + cur.request_count, 0))} {t('token_stats.requests', '请求数')}</span>
                     </div>
                 </div>
 
@@ -951,7 +877,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                         </div>
                                         <div className="w-20 text-right font-mono flex items-baseline justify-end gap-1.5 flex-shrink-0">
                                             <span className="text-gray-900 dark:text-base-content font-semibold">
-                                                {formatNumber(acc.total_tokens)}
+                                                {(acc.total_reported_requests > 0 ? formatNumber(acc.total_tokens) : t('token_stats.cache_not_reported', '未返回'))}
                                             </span>
                                             <span className="text-[10px] text-gray-400">
                                                 {acc.request_count} {t('token_stats.times', '次')}
@@ -979,12 +905,8 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                         </div>
                         <span className="text-sm font-semibold tracking-tight text-gray-900 dark:text-base-content">
                             {viewMode === 'model'
-                                ? metricType === 'cost'
-                                    ? t('token_stats.model_cost_trend_evolution', '分模型支出时序演进')
-                                    : t('token_stats.model_token_trend_evolution', '分模型 Token 吞吐演进')
-                                : metricType === 'cost'
-                                    ? t('token_stats.account_cost_trend_evolution', '分账号支出时序演进')
-                                    : t('token_stats.account_token_trend_evolution', '分账号 Token 吞吐演进')}
+                                ? t('token_stats.model_token_trend_evolution', '分模型 Token 吞吐演进')
+                                : t('token_stats.account_token_trend_evolution', '分账号 Token 吞吐演进')}
                         </span>
                     </div>
 
@@ -1003,22 +925,6 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                 className={`px-3 py-1 rounded-full transition-all font-medium ${chartType === 'bar' ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm' : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'}`}
                             >
                                 {t('token_stats.stacked_bar', '堆叠柱状')}
-                            </button>
-                        </div>
-
-                        {/* Token / 金额 */}
-                        <div className="flex bg-gray-100/90 dark:bg-base-200 border border-gray-200/80 dark:border-base-300 rounded-full p-0.5 text-xs">
-                            <button
-                                onClick={() => switchMetricType('tokens')}
-                                className={`px-3 py-1 rounded-full transition-all font-medium ${metricType === 'tokens' ? 'bg-white dark:bg-base-100 text-gray-900 dark:text-base-content shadow-sm' : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'}`}
-                            >
-                                {t('token_stats.metric_tokens', 'Token')}
-                            </button>
-                            <button
-                                onClick={() => switchMetricType('cost')}
-                                className={`px-3 py-1 rounded-full transition-all font-medium ${metricType === 'cost' ? 'bg-white dark:bg-base-100 text-emerald-600 dark:text-emerald-400 shadow-sm' : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-base-content'}`}
-                            >
-                                {t('token_stats.metric_cost_symbol', '金额 ($)')}
                             </button>
                         </div>
 
@@ -1043,7 +949,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                 <div className="h-64">
                     <ResponsiveContainer width="100%" height="100%">
                         {chartType === 'area' ? (
-                            <AreaChart data={viewMode === 'model' ? displayModelTrendData : displayAccountTrendData}>
+                            <AreaChart data={viewMode === 'model' ? modelTrendData : accountTrendData}>
                                 <defs>
                                     {(viewMode === 'model' ? allModels : allAccounts).map((key, i) => (
                                         <linearGradient key={`apple-grad-${key}`} id={`apple-grad-${i}`} x1="0" y1="0" x2="0" y2="1">
@@ -1075,11 +981,11 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                 />
                                 <YAxis
                                     tick={{ fontSize: 10, fill: '#8e8e93', fontFamily: 'monospace' }}
-                                    tickFormatter={(val) => metricType === 'cost' ? formatCurrency(val) : formatNumber(val)}
+                                    tickFormatter={(val) => formatNumber(val)}
                                     axisLine={false}
                                     tickLine={false}
                                 />
-                                <Tooltip content={<CustomTrendTooltip />} />
+                                <Tooltip filterNull={false} content={<CustomTrendTooltip />} />
                                 {(viewMode === 'model' ? allModels : allAccounts).map((key, i) => (
                                     <Area
                                         key={key}
@@ -1094,7 +1000,7 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                 ))}
                             </AreaChart>
                         ) : (
-                            <BarChart data={viewMode === 'model' ? displayModelTrendData : displayAccountTrendData}>
+                            <BarChart data={viewMode === 'model' ? modelTrendData : accountTrendData}>
                                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(150, 150, 150, 0.1)" />
                                 <XAxis
                                     dataKey="period"
@@ -1118,11 +1024,11 @@ export const AppleBentoView: React.FC<AppleBentoViewProps> = ({
                                 />
                                 <YAxis
                                     tick={{ fontSize: 10, fill: '#8e8e93', fontFamily: 'monospace' }}
-                                    tickFormatter={(val) => metricType === 'cost' ? formatCurrency(val) : formatNumber(val)}
+                                    tickFormatter={(val) => formatNumber(val)}
                                     axisLine={false}
                                     tickLine={false}
                                 />
-                                <Tooltip content={<CustomTrendTooltip />} cursor={{ fill: 'rgba(150, 150, 150, 0.05)' }} />
+                                <Tooltip filterNull={false} content={<CustomTrendTooltip />} cursor={{ fill: 'rgba(150, 150, 150, 0.05)' }} />
                                 {(viewMode === 'model' ? allModels : allAccounts).map((key, i) => (
                                     <Bar
                                         key={key}

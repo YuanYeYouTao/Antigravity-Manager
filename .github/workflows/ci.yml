@@ -83,11 +83,6 @@ jobs:
           cd src-tauri
           cargo clippy --all-targets --all-features
 
-      - name: Check Rust compilation
-        run: |
-          cd src-tauri
-          cargo check
-
   # Tauri 构建测试（不打包）
   build-tauri:
     name: Build Tauri App
@@ -96,7 +91,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [ubuntu-latest, windows-2025, macos-latest]
+        platform: [ubuntu-22.04, windows-2025, macos-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -141,3 +136,23 @@ jobs:
           # CI 环境不需要签名
           TAURI_SIGNING_PRIVATE_KEY: ""
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+
+      - name: Compile Linux regression executable
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib --no-run
+
+      - name: Stage Linux validation executables
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          mkdir -p validation-artifacts
+          cp src-tauri/target/debug/antigravity-tools validation-artifacts/
+          find src-tauri/target/debug/deps -maxdepth 1 -type f -name 'antigravity_tools_lib-*' -executable -exec cp {} validation-artifacts/ \;
+          strip validation-artifacts/*
+
+      - name: Upload Linux validation executables
+        if: startsWith(matrix.platform, 'ubuntu')
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-validation-${{ github.sha }}
+          path: validation-artifacts/
+          retention-days: 7
