@@ -33,6 +33,10 @@ pub struct ProxyRequestLog {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
+    #[serde(default)]
+    pub total_tokens: Option<u32>,
+    #[serde(default)]
+    pub physical_requests: Option<u32>,
     pub reasoning_tokens: Option<u32>,
     pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
@@ -52,6 +56,17 @@ pub(crate) mod prompt_log_tests {
             "error": "错".repeat(2048)
         }))
         .unwrap()
+    }
+
+    pub(crate) fn test_monitor() -> ProxyMonitor {
+        ProxyMonitor {
+            logs: RwLock::new(VecDeque::new()),
+            stats: RwLock::new(ProxyStats::default()),
+            max_logs: 100,
+            enabled: Arc::new(AtomicBool::new(true)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
+            app_handle: None,
+        }
     }
 
     // Tests using ABV_DATA_DIR run serially and restore the previous process setting.
@@ -115,7 +130,12 @@ pub(crate) mod prompt_log_tests {
             capture_health_logs: Arc::new(AtomicBool::new(false)),
             app_handle: None,
         };
-        let log = sample_log("detail", 4096);
+        let mut log = sample_log("detail", 4096);
+        log.input_tokens = Some(100);
+        log.output_tokens = Some(2);
+        log.cached_tokens = Some(0);
+        log.physical_requests = Some(3);
+        log.total_tokens = Some(123);
         let response = log.response_body.clone();
         monitor.log_request(log).await;
         let _finished = LOG_WRITERS.acquire_many(4).await.unwrap();
@@ -124,6 +144,23 @@ pub(crate) mod prompt_log_tests {
         assert_eq!(logs[0].error.as_ref().unwrap().chars().count(), 1024);
         let detail = crate::modules::proxy_db::get_log_detail("detail").unwrap();
         assert_eq!(detail.response_body, response);
+        for record in [
+            detail.clone(),
+            crate::modules::proxy_db::get_logs_summary(10, 0)
+                .unwrap()
+                .remove(0),
+            crate::modules::proxy_db::get_logs_filtered("", false, 10, 0)
+                .unwrap()
+                .remove(0),
+            crate::modules::proxy_db::get_all_logs_for_export()
+                .unwrap()
+                .remove(0),
+        ] {
+            assert_eq!(record.cached_tokens, Some(0));
+            assert_eq!(record.physical_requests, Some(3));
+            assert_eq!(record.total_tokens, Some(123));
+            assert_eq!(record.input_tokens, Some(100));
+        }
         assert_eq!(
             detail.request_body.as_deref(),
             Some("q".repeat(4096).as_str())
@@ -160,6 +197,8 @@ impl ProxyRequestLog {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cached_tokens: self.cached_tokens,
+            total_tokens: self.total_tokens,
+            physical_requests: self.physical_requests,
             reasoning_tokens: self.reasoning_tokens,
             protocol: self.protocol.clone(),
             username: self.username.clone(),
@@ -172,6 +211,8 @@ impl ProxyRequestLog {
 pub(crate) struct UpstreamCapture {
     body: Option<String>,
     headers: Option<String>,
+    physical_requests: Option<u32>,
+    usage: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Clone, Default)]
@@ -182,6 +223,38 @@ tokio::task_local! {
 }
 
 impl UpstreamRequestBodyHolder {
+    pub fn record_dispatch(&self) {
+        if let Ok(mut capture) = self.0.lock() {
+            capture.physical_requests = Some(capture.physical_requests.unwrap_or(0) + 1);
+            // 同一 holder 只保留当前物理响应，不能拼接不同响应的部分用量。
+            capture.usage = Some(serde_json::Map::new());
+        }
+    }
+
+    pub fn physical_requests(&self) -> Option<u32> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|capture| capture.physical_requests)
+    }
+
+    pub fn record_usage(&self, usage: &serde_json::Value) {
+        if let Some(reported) = usage.as_object() {
+            if let Ok(mut capture) = self.0.lock() {
+                let current = capture.usage.get_or_insert_with(serde_json::Map::new);
+                for (field, value) in reported {
+                    if !value.is_null() || !current.contains_key(field) {
+                        current.insert(field.clone(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn usage(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        self.0.lock().ok().and_then(|capture| capture.usage.clone())
+    }
+
     pub fn new() -> Self {
         Self(std::sync::Arc::new(std::sync::Mutex::new(
             UpstreamCapture::default(),
@@ -214,6 +287,12 @@ impl UpstreamRequestBodyHolder {
     pub fn take_headers(&self) -> Option<String> {
         self.0.lock().ok().and_then(|mut g| g.headers.take())
     }
+}
+
+pub(crate) fn record_upstream_usage(raw: &serde_json::Value) {
+    let raw = raw.get("response").unwrap_or(raw);
+    let usage = raw.get("usageMetadata").unwrap_or(raw);
+    let _ = CURRENT_UPSTREAM_CAPTURE.try_with(|capture| capture.record_usage(usage));
 }
 
 fn sanitize_upstream_debug_value(val: &serde_json::Value) -> serde_json::Value {
@@ -398,16 +477,17 @@ impl ProxyMonitor {
     }
 
     pub async fn log_request(&self, log: ProxyRequestLog) {
-        if let (Some(account), Some(input), Some(output)) =
-            (&log.account_email, log.input_tokens, log.output_tokens)
-        {
+        if let Some(account) = &log.account_email {
             let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
             let account = account.clone();
-            let cached = log.cached_tokens.unwrap_or(0);
-            let reasoning = log.reasoning_tokens.unwrap_or(0);
+            let cached = log.cached_tokens;
+            let input = log.input_tokens;
+            let output = log.output_tokens;
+            let reasoning = log.reasoning_tokens;
+            let total = log.total_tokens;
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::modules::token_stats::record_usage(
-                    &account, &model, input, output, cached, reasoning,
+                    &account, &model, input, output, cached, reasoning, total,
                 ) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }

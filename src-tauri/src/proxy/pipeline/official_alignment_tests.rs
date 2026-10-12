@@ -5,6 +5,103 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn four_protocols_use_upstream_affinity_without_merging_private_stores() {
+        use crate::proxy::mappers::{claude, gemini, openai};
+        use crate::proxy::thinking_store::SessionScope;
+        use crate::proxy::token_manager::ProxyToken;
+        use axum::http::HeaderMap;
+        let _data = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let account = format!("account-{}", uuid::Uuid::new_v4());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-id",
+            "trusted:conversation:g2:main".parse().unwrap(),
+        );
+        let left = SessionScope::from_headers(&headers, "private-branch-a");
+        let right = SessionScope::from_headers(&headers, "private-branch-b");
+        assert_eq!(left.affinity_key, right.affinity_key);
+        assert_ne!(left.store_key, right.store_key);
+        let token = ProxyToken {
+            account_id: account.clone(),
+            priority: 0,
+            access_token: "synthetic".into(),
+            refresh_token: "synthetic".into(),
+            expires_in: 3600,
+            timestamp: 0,
+            email: "test@invalid".into(),
+            account_path: Default::default(),
+            project_id: Some("project".into()),
+            subscription_tier: None,
+            remaining_quota: None,
+            protected_models: Default::default(),
+            health_score: 1.0,
+            reset_time: None,
+            weekly_reset_time: None,
+            validation_blocked: false,
+            validation_blocked_until: 0,
+            validation_url: None,
+            model_quotas: Default::default(),
+            model_limits: Default::default(),
+        };
+        for generation in [0, 1] {
+            let expected = crate::proxy::common::session::derive_session_scoped(
+                &account,
+                &left.affinity_key,
+                generation,
+            );
+            for scope in [&left, &right] {
+                let wire = gemini::wrap_request_v2(
+                    &json!({"contents": [{"role":"user","parts":[{"text":"hello"}]}]}),
+                    "project",
+                    "gemini-3.8-flash",
+                    Some(&account),
+                    Some(&scope.store_key),
+                    None,
+                    None,
+                    None,
+                    Some(&scope.affinity_key),
+                );
+                assert_eq!(wire["request"]["sessionId"], expected);
+                let request: claude::models::ClaudeRequest = serde_json::from_value(json!({
+                    "model": "gemini-3.8-flash", "messages":[{"role":"user","content":"hello"}]
+                }))
+                .unwrap();
+                let (wire, _) = claude::transform_claude_request_in_timed(
+                    &request,
+                    "project",
+                    false,
+                    Some(&account),
+                    &scope.store_key,
+                    &scope.affinity_key,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(wire["request"]["sessionId"], expected);
+                for responses in [false, true] {
+                    let request: openai::models::OpenAIRequest = serde_json::from_value(json!({
+                        "model":"gemini-3.8-flash", "session_id": scope.store_key,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .unwrap();
+                    let (wire, _, _, _) = openai::transform_openai_request_with_session(
+                        &request,
+                        "project",
+                        "gemini-3.8-flash",
+                        Some(&token),
+                        &scope.affinity_key,
+                        Some(&scope.store_key),
+                        responses,
+                    );
+                    assert_eq!(wire["request"]["sessionId"], expected);
+                }
+            }
+            if generation == 0 {
+                crate::proxy::common::session::bump_session(&account, &left.affinity_key);
+            }
+        }
+    }
+
+    #[test]
     fn test_official_claude_alignment() {
         let mut body = json!({
             "_session_thinking_id": "agent/a76e1573-c906-435a-89d2-18b6683313b1/1790530802878/0181971f-961c-4ba9-a320-2ae44361bc1d/1",
@@ -758,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_budget_fast_intent_6x_ratio_compression() {
+    fn explicit_thinking_budget_is_not_reinterpreted_as_fast_response_intent() {
         use crate::proxy::config::{
             update_thinking_budget_config, ThinkingBudgetConfig, ThinkingControlSource,
             TEST_CONFIG_LOCK,
@@ -778,70 +875,41 @@ mod tests {
         }
         let _guard = ResetGuard;
 
-        // 场景 1: 客户端明确传 m=1024，但思考预算 t=8192 (>= 6*m) -> 极速意图，预算压缩为 0
-        let mut gc1 = json!({
-            "maxOutputTokens": 1024
-        });
-        InboundThinkingPipeline::configure_inbound_thinking(
-            "claude-sonnet-4-6",
-            &mut gc1,
-            ClientThinkingSwitch::Enabled,
-            None,
-            Some(8192),
-            None,
-        );
+        for (max_output, budget) in [(1024, 8192), (1500, 9000)] {
+            let mut generation = json!({"maxOutputTokens": max_output});
+            InboundThinkingPipeline::configure_inbound_thinking(
+                "claude-sonnet-4-6",
+                &mut generation,
+                ClientThinkingSwitch::Enabled,
+                None,
+                Some(budget),
+                None,
+            );
+            assert_eq!(generation["thinkingConfig"]["thinkingBudget"], budget);
 
-        let max_tokens1 = gc1["maxOutputTokens"].as_i64().unwrap();
-        let budget1 = gc1["thinkingConfig"]["thinkingBudget"].as_i64().unwrap();
-        assert_eq!(max_tokens1, 1024);
-        assert_eq!(budget1, 0, "6倍反差且m<=1024时思考预算应压缩为0以秒回");
-
-        // 场景 2: 客户端明确传 m=1500，思考预算 t=9000 (>= 6*m) -> 预算压缩为 1500 - 1024 = 476
-        let mut gc2 = json!({
-            "maxOutputTokens": 1500
-        });
-        InboundThinkingPipeline::configure_inbound_thinking(
-            "claude-sonnet-4-6",
-            &mut gc2,
-            ClientThinkingSwitch::Enabled,
-            None,
-            Some(9000),
-            None,
-        );
-
-        let max_tokens2 = gc2["maxOutputTokens"].as_i64().unwrap();
-        let budget2 = gc2["thinkingConfig"]["thinkingBudget"].as_i64().unwrap();
-        assert_eq!(max_tokens2, 1500);
-        assert_eq!(budget2, 476, "6倍反差且m>1024时思考预算应压缩为 m - 1024");
-        assert!(max_tokens2 > budget2);
-
-        // 场景 3: 验证 Gemini Wrapper 层同样遵守 6 倍极速压缩规则
-        let body = json!({
-            "model": "gemini-3.8-flash-high",
-            "generationConfig": {
-                "maxOutputTokens": 1024,
-                "thinkingConfig": {
-                    "includeThoughts": true,
-                    "thinkingBudget": 8192
+            let body = json!({
+                "generationConfig": {
+                    "maxOutputTokens": max_output,
+                    "thinkingConfig": {"includeThoughts": true, "thinkingBudget": budget}
                 }
-            }
-        });
-        let wrapped = crate::proxy::mappers::gemini::wrapper::wrap_request(
-            &body,
-            "test-proj",
-            "gemini-3.8-flash-high",
-            None,
-            None,
-            None,
-        );
-        let wrapped_gc = &wrapped["request"]["generationConfig"];
-        let wrapped_max = wrapped_gc["maxOutputTokens"].as_u64().unwrap();
-        let wrapped_budget = wrapped_gc["thinkingConfig"]["thinkingBudget"]
-            .as_i64()
-            .unwrap();
-        assert_eq!(wrapped_max, 1024);
-        assert_eq!(wrapped_budget, 0);
-        assert_eq!(wrapped_gc["thinkingConfig"]["includeThoughts"], false);
+            });
+            let wrapped = crate::proxy::mappers::gemini::wrapper::wrap_request(
+                &body,
+                "test-project",
+                "gemini-3.8-flash-high",
+                None,
+                None,
+                None,
+            );
+            assert_eq!(
+                wrapped["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+                budget
+            );
+            assert_eq!(
+                wrapped["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"],
+                true
+            );
+        }
     }
 
     #[test]

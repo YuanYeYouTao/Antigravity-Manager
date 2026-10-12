@@ -12,6 +12,7 @@ export interface ConcisePayloadLog {
     input_tokens?: number;
     output_tokens?: number;
     cached_tokens?: number | null;
+    total_tokens?: number | null;
 }
 
 const ID_KEYS = [
@@ -115,20 +116,18 @@ function presentPayload(slimmed: unknown): unknown {
 
 function attachResponseUsage(obj: Record<string, unknown>, log: ConcisePayloadLog): void {
     if (obj.usage != null || obj.usageMetadata != null) return;
-    if (!log.input_tokens && !log.output_tokens) return;
-    const input = log.input_tokens ?? 0;
-    const cached = log.cached_tokens ?? 0;
-    const totalIn = cached > input ? input + cached : input;
-    const output = log.output_tokens ?? 0;
+    if (log.input_tokens == null && log.output_tokens == null && log.total_tokens == null) return;
+    const totalIn = log.input_tokens;
+    const output = log.output_tokens;
     const usage: Record<string, unknown> = {
         input_tokens: totalIn,
         output_tokens: output,
-        total_tokens: totalIn + output,
+        total_tokens: log.total_tokens ?? null,
     };
     if (log.cached_tokens != null) {
         usage.cached_tokens = log.cached_tokens;
-        if (totalIn > 0) {
-            const rate = Math.min(100, Math.max(0, (log.cached_tokens / totalIn) * 100));
+        if (totalIn != null && totalIn > 0) {
+            const rate = (log.cached_tokens / totalIn) * 100;
             usage.cache_hit_rate = `${rate.toFixed(1)}%`;
         }
     }

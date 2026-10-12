@@ -695,6 +695,9 @@ pub async fn handle_generate(
 
                                     match serde_json::from_str::<Value>(json_part) {
                                         Ok(mut json) => {
+                                            if let Some(usage) = json.get("response").unwrap_or(&json).get("usageMetadata") {
+                                                crate::proxy::monitor::record_upstream_usage(usage);
+                                            }
                                             if track_image_success && response_has_inline_image_data(&json) {
                                                 saw_image_data = true;
                                             }
@@ -891,6 +894,13 @@ pub async fn handle_generate(
                 .json()
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            if let Some(usage) = gemini_resp
+                .get("response")
+                .unwrap_or(&gemini_resp)
+                .get("usageMetadata")
+            {
+                crate::proxy::monitor::record_upstream_usage(usage);
+            }
 
             // [FIX #1522] Inject Tool ID into Non-streaming Response
             crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(
@@ -1023,7 +1033,8 @@ pub async fn handle_generate(
         // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
         // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
         if status_code == 400 && error_text.contains("exceeds the maximum number of tokens") {
-            let generation = crate::proxy::common::session::bump_session(&account_id, &session_id);
+            let generation =
+                crate::proxy::common::session::bump_session(&account_id, &affinity_key);
             tracing::warn!(
                 "[Gemini] Upstream session token accumulation exceeded 1M on account {}. sessionId bumped to generation {}, retrying with a fresh upstream session.",
                 email, generation

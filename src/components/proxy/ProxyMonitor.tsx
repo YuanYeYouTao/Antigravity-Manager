@@ -33,6 +33,7 @@ interface ProxyRequestLog {
     input_tokens?: number;
     output_tokens?: number;
     cached_tokens?: number;
+    total_tokens?: number | null;
     account_email?: string;
     protocol?: string;  // "openai" | "anthropic" | "gemini"
 }
@@ -271,26 +272,24 @@ const LogTable: React.FC<LogTableProps> = ({
                             <td className="text-gray-700 dark:text-gray-300 truncate text-xs py-2 px-3" style={{ width: `${colWidths.path}px`, maxWidth: `${colWidths.path}px` }} title={log.url || ''}>{log.url}</td>
                             <td className="text-right text-xs py-2 px-3 whitespace-nowrap truncate" style={{ width: `${colWidths.usage}px`, maxWidth: `${colWidths.usage}px` }}>
                                 {log.input_tokens != null && (() => {
-                                    const totalIn = (log.cached_tokens && log.cached_tokens > log.input_tokens)
-                                        ? log.input_tokens + log.cached_tokens
-                                        : log.input_tokens;
-                                    const hitRate = (log.cached_tokens && totalIn > 0)
-                                        ? Math.min(100, Math.max(0, (log.cached_tokens / totalIn) * 100))
+                                    const totalIn = log.input_tokens;
+                                    const hitRate = (log.cached_tokens != null && totalIn > 0)
+                                        ? (log.cached_tokens / totalIn) * 100
                                         : 0;
-                                    const hitRateText = totalIn > 0 && log.cached_tokens
+                                    const hitRateText = totalIn > 0 && log.cached_tokens != null
                                         ? (hitRate >= 100 ? '100%' : (hitRate % 1 === 0 ? `${hitRate.toFixed(0)}%` : `${hitRate.toFixed(1)}%`))
                                         : '';
                                     return (
                                         <div>
                                             <div className="text-gray-700 dark:text-gray-200">{t('monitor.input')}: <span className="font-semibold">{formatCompactNumber(totalIn)}</span></div>
-                                            {log.cached_tokens ? (
+                                            {log.cached_tokens != null ? (
                                                 <div
                                                     className="text-emerald-600 dark:text-emerald-400 font-semibold text-[11px] leading-tight"
                                                     title={`${t('token_stats.cached', 'Cache')}: ${log.cached_tokens.toLocaleString()}${hitRateText ? ` (${hitRateText})` : ''}`}
                                                 >
                                                     ({t('monitor.cached', 'Cache')}: {formatCompactNumber(log.cached_tokens)}{hitRateText ? ` ${hitRateText}` : ''})
                                                 </div>
-                                            ) : null}
+                                            ) : <div className="text-gray-500 text-[11px]">{t('monitor.cache_unreported', '缓存未返回')}</div>}
                                         </div>
                                     );
                                 })()}
@@ -1599,22 +1598,18 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                             <span className="block text-gray-500 dark:text-gray-400 uppercase font-bold text-[10px] tracking-wider">{t('monitor.details.tokens')}</span>
                                             <div className="font-mono text-[11px] flex items-center gap-1.5 mt-0.5">
                                                 {(() => {
-                                                    const totalIn = (selectedLog.cached_tokens && selectedLog.cached_tokens > (selectedLog.input_tokens ?? 0))
-                                                        ? (selectedLog.input_tokens ?? 0) + selectedLog.cached_tokens
-                                                        : (selectedLog.input_tokens ?? 0);
+                                                    const totalIn = selectedLog.input_tokens;
                                                     return (
                                                         <span className="text-blue-700 dark:text-blue-300 bg-blue-100 dark:bg-blue-900/40 px-1.5 py-0.5 rounded font-bold" title={`Total Input Tokens: ${totalIn}`}>
-                                                            In: {formatCompactNumber(totalIn)}
+                                                            In: {totalIn != null ? formatCompactNumber(totalIn) : t('monitor.unreported', '未返回')}
                                                         </span>
                                                     );
                                                 })()}
-                                                <span className="text-emerald-700 dark:text-emerald-300 bg-emerald-100 dark:bg-emerald-900/40 px-1.5 py-0.5 rounded font-bold">Out: {formatCompactNumber(selectedLog.output_tokens ?? 0)}</span>
-                                                {selectedLog.cached_tokens != null && selectedLog.cached_tokens > 0 && (() => {
-                                                    const totalIn = (selectedLog.cached_tokens && selectedLog.cached_tokens > (selectedLog.input_tokens ?? 0))
-                                                        ? (selectedLog.input_tokens ?? 0) + selectedLog.cached_tokens
-                                                        : (selectedLog.input_tokens ?? 0);
-                                                    const hitRate = totalIn > 0 ? Math.min(100, Math.max(0, (selectedLog.cached_tokens / totalIn) * 100)) : 0;
-                                                    const hitRateText = totalIn > 0 ? (hitRate >= 100 ? '100%' : (hitRate % 1 === 0 ? `${hitRate.toFixed(0)}%` : `${hitRate.toFixed(1)}%`)) : '';
+                                                <span className="text-emerald-700 dark:text-emerald-300 bg-emerald-100 dark:bg-emerald-900/40 px-1.5 py-0.5 rounded font-bold">Out: {selectedLog.output_tokens != null ? formatCompactNumber(selectedLog.output_tokens) : t('monitor.unreported', '未返回')}</span>
+                                                {selectedLog.cached_tokens != null ? (() => {
+                                                    const totalIn = selectedLog.input_tokens;
+                                                    const hitRate = totalIn != null && totalIn > 0 ? (selectedLog.cached_tokens / totalIn) * 100 : null;
+                                                    const hitRateText = hitRate != null ? `${hitRate.toFixed(1)}%` : '';
                                                     return (
                                                         <span
                                                             className="text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-900/40 px-1.5 py-0.5 rounded font-bold"
@@ -1623,7 +1618,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                                             Cache: {formatCompactNumber(selectedLog.cached_tokens)}{hitRateText ? ` (${hitRateText})` : ''}
                                                         </span>
                                                     );
-                                                })()}
+                                                })() : <span>{t('monitor.cache_unreported', '缓存未返回')}</span>}
                                             </div>
                                         </div>
                                         <div>

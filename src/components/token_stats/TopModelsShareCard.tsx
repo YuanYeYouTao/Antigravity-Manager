@@ -9,7 +9,6 @@ export interface ModelShareItem {
     total_input_tokens: number;
     total_output_tokens: number;
     total_cached_tokens: number;
-    cost: number;
 }
 
 interface TopModelsShareCardProps {
@@ -76,7 +75,7 @@ export const TopModelsShareCard: React.FC<TopModelsShareCardProps> = ({
                             <div
                                 key={item.model}
                                 className="flex items-center justify-between gap-3 text-xs group"
-                                title={`${item.model}: ${formatNumber(item.total_tokens)} Tokens ($${item.cost.toFixed(2)})`}
+                                title={`${item.model}: ${formatNumber(item.total_tokens)} Tokens`}
                             >
                                 {/* 模型名 */}
                                 <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -106,9 +105,6 @@ export const TopModelsShareCard: React.FC<TopModelsShareCardProps> = ({
                                     <div className="flex flex-col items-end">
                                         <span className="text-gray-800 dark:text-white/80 font-medium leading-none">
                                             {formatNumber(item.total_tokens)}
-                                        </span>
-                                        <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium mt-0.5 leading-none">
-                                            ${item.cost.toFixed(2)}
                                         </span>
                                     </div>
                                     <span className="text-[10px] text-gray-400 dark:text-white/40 min-w-[28px] text-right">

@@ -311,45 +311,53 @@ fn record_user_token_usage(
 }
 
 fn extract_cached_tokens(usage: &Value) -> Option<u32> {
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    if c.cached_tokens > 0 {
-        Some(c.cached_tokens)
-    } else {
-        None
-    }
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).cached_tokens
 }
 
 fn extract_input_tokens(usage: &Value) -> Option<u32> {
-    let has_field = usage.get("prompt_tokens").is_some()
-        || usage.get("input_tokens").is_some()
-        || usage.get("total_input_tokens").is_some()
-        || usage.get("promptTokenCount").is_some();
-    if !has_field {
-        return None;
-    }
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    Some(c.total_input_tokens)
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).total_input_tokens
 }
 
 fn extract_reasoning_tokens(usage: &Value) -> Option<u32> {
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    if c.reasoning_tokens > 0 {
-        Some(c.reasoning_tokens)
-    } else {
-        None
-    }
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).reasoning_tokens
 }
 
 fn extract_output_tokens(usage: &Value) -> Option<u32> {
-    let has_field = usage.get("completion_tokens").is_some()
-        || usage.get("output_tokens").is_some()
-        || usage.get("total_output_tokens").is_some()
-        || usage.get("candidatesTokenCount").is_some();
-    if !has_field {
-        return None;
+    crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).output_tokens
+}
+
+fn merge_reported_usage(
+    log: &mut ProxyRequestLog,
+    current: &mut serde_json::Map<String, Value>,
+    usage: &Value,
+) {
+    if let Some(reported) = usage.as_object() {
+        current.extend(reported.clone());
     }
-    let c = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage);
-    Some(c.output_tokens)
+    log.input_tokens = extract_input_tokens(usage).or(log.input_tokens);
+    log.output_tokens = extract_output_tokens(usage).or(log.output_tokens);
+    log.cached_tokens = extract_cached_tokens(usage).or(log.cached_tokens);
+    log.reasoning_tokens = extract_reasoning_tokens(usage).or(log.reasoning_tokens);
+    log.total_tokens = crate::proxy::pipeline::CanonicalUsage::from_gemini(usage)
+        .total_tokens
+        .or(log.total_tokens);
+}
+
+fn apply_captured_usage(
+    log: &mut ProxyRequestLog,
+    usage: &mut serde_json::Map<String, Value>,
+    captured: Option<&serde_json::Map<String, Value>>,
+) {
+    if let Some(captured) = captured {
+        *usage = captured.clone();
+        let actual =
+            crate::proxy::pipeline::CanonicalUsage::from_gemini(&Value::Object(captured.clone()));
+        log.input_tokens = actual.total_input_tokens;
+        log.output_tokens = actual.output_tokens;
+        log.cached_tokens = actual.cached_tokens;
+        log.reasoning_tokens = actual.reasoning_tokens;
+        log.total_tokens = actual.total_tokens;
+    }
 }
 
 fn build_canonical_consolidated_response(
@@ -362,7 +370,7 @@ fn build_canonical_consolidated_response(
     timing_obj: serde_json::Map<String, Value>,
     usage_obj: Option<serde_json::Map<String, Value>>,
 ) -> Value {
-    // 权威网关签名回填：若当前签名为空，尝试通过工具调用ID或会话ID从网关状态机(内存 L1 / SQLite L2 DB 思考持久化)恢复
+    // 只采用本响应签名或原工具 ID 对应的签名；会话最新值不证明当前响应来源。
     if thinking_signature.is_empty() {
         for tc in &tool_calls {
             if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
@@ -372,33 +380,6 @@ fn build_canonical_consolidated_response(
                     }) {
                         thinking_signature = sig;
                         break;
-                    }
-                }
-            }
-        }
-        if thinking_signature.is_empty() {
-            // 1. 优先按当前轮次的思考文本片段精准直捞专属签名
-            if !thinking_content.is_empty() {
-                let trimmed = thinking_content.trim();
-                let snippet = crate::proxy::mappers::common_utils::safe_truncate_str(trimmed, 32);
-                if let Some(sig) =
-                    crate::modules::proxy_db::lookup_signature_by_thought_snippet(snippet)
-                {
-                    thinking_signature = sig;
-                }
-            }
-
-            // 2. 兜底按会话状态机与会话数据库查找最新签名
-            if thinking_signature.is_empty() {
-                if let Some(sid) = session_id {
-                    if let Some(sig) =
-                        crate::proxy::SignatureCache::global().get_session_signature(sid)
-                    {
-                        thinking_signature = sig;
-                    } else if let Some(sig) =
-                        crate::modules::proxy_db::lookup_latest_thinking_signature(sid)
-                    {
-                        thinking_signature = sig;
                     }
                 }
             }
@@ -455,6 +436,7 @@ fn consolidate_non_streaming_response(
     raw_json: &Value,
     log: &ProxyRequestLog,
     headers_map: &serde_json::Map<String, Value>,
+    captured_usage: Option<&serde_json::Map<String, Value>>,
 ) -> Option<Value> {
     // 若本就已是统一的 consolidated 格式 (例如带有顶层 thinking/tool_calls 且无 choices/candidates)，直接返回 None
     if (raw_json.get("thinking").is_some()
@@ -662,40 +644,45 @@ fn consolidate_non_streaming_response(
     }
 
     // 提取 Token 用量与缓存命中率
-    let usage_source = raw_json
-        .get("usage")
-        .or_else(|| raw_json.get("usageMetadata"));
-    let mut usage_obj = serde_json::Map::new();
+    let captured_value = captured_usage.map(|usage| Value::Object(usage.clone()));
+    let usage_source = captured_value.as_ref().or_else(|| {
+        raw_json
+            .get("usage")
+            .or_else(|| raw_json.get("usageMetadata"))
+    });
+    let mut usage_obj = usage_source
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let input_toks = log
         .input_tokens
-        .or_else(|| usage_source.and_then(extract_input_tokens))
-        .unwrap_or(0);
+        .or_else(|| usage_source.and_then(extract_input_tokens));
     let output_toks = log
         .output_tokens
-        .or_else(|| usage_source.and_then(extract_output_tokens))
-        .unwrap_or(0);
+        .or_else(|| usage_source.and_then(extract_output_tokens));
     let cached_toks = log
         .cached_tokens
-        .or_else(|| usage_source.and_then(extract_cached_tokens))
-        .unwrap_or(0);
+        .or_else(|| usage_source.and_then(extract_cached_tokens));
     let reasoning_toks = usage_source.and_then(extract_reasoning_tokens).unwrap_or(0);
 
-    let total_in = if cached_toks > input_toks {
-        input_toks + cached_toks
-    } else {
-        input_toks
-    };
-    let total_toks = total_in + output_toks;
+    let total_in = input_toks;
+    let total_toks = log.total_tokens.or_else(|| {
+        usage_source.and_then(|usage| {
+            crate::proxy::pipeline::CanonicalUsage::from_gemini(usage).total_tokens
+        })
+    });
 
-    usage_obj.insert("input_tokens".to_string(), serde_json::json!(total_in));
-    usage_obj.insert("output_tokens".to_string(), serde_json::json!(output_toks));
+    usage_obj
+        .entry("input_tokens".to_string())
+        .or_insert(serde_json::json!(total_in));
+    usage_obj
+        .entry("output_tokens".to_string())
+        .or_insert(serde_json::json!(output_toks));
     usage_obj.insert("total_tokens".to_string(), serde_json::json!(total_toks));
-    if cached_toks > 0 {
-        usage_obj.insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
-        if total_in > 0 {
-            let hit_rate = (cached_toks as f64 / total_in as f64 * 100.0)
-                .min(100.0)
-                .max(0.0);
+    usage_obj.insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
+    if let Some((cached, input)) = cached_toks.zip(total_in) {
+        if input > 0 {
+            let hit_rate = cached as f64 / input as f64 * 100.0;
             usage_obj.insert(
                 "cache_hit_rate".to_string(),
                 serde_json::json!(format!("{:.1}%", hit_rate)),
@@ -726,8 +713,14 @@ pub async fn monitor_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    let _logging_enabled = state.monitor.is_enabled();
+    monitor_request(state.monitor, request, next).await
+}
 
+async fn monitor_request(
+    monitor: std::sync::Arc<crate::proxy::monitor::ProxyMonitor>,
+    request: Request,
+    next: Next,
+) -> Response {
     let method = request.method().to_string();
     let uri = request.uri().to_string();
 
@@ -867,8 +860,7 @@ pub async fn monitor_middleware(
     // 过滤噪音请求，避免客户端探针刷屏淹没真实业务日志 (Issue #3498 + `/v1/models` 轮询刷屏)
     // 胶囊开关关闭时（默认）：所有 GET 成功请求不记录、不落库；失败请求与非 GET 业务请求始终记录。
     // 详见 `should_skip_request_log` 的行为边界说明。
-    let capture_health_enabled =
-        state.monitor.is_capture_health_logs() || should_log_health_checks();
+    let capture_health_enabled = monitor.is_capture_health_logs() || should_log_health_checks();
     if should_skip_request_log(&method, response.status(), capture_health_enabled) {
         return response;
     }
@@ -923,7 +915,6 @@ pub async fn monitor_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let monitor = state.monitor.clone();
     let mut log = ProxyRequestLog {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().timestamp_millis(),
@@ -945,6 +936,8 @@ pub async fn monitor_middleware(
         input_tokens: None,
         output_tokens: None,
         cached_tokens: None,
+        total_tokens: None,
+        physical_requests: None,
         reasoning_tokens: None,
         protocol,
         username,
@@ -957,23 +950,14 @@ pub async fn monitor_middleware(
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let start_instant = start;
 
-        tokio::spawn(async move {
+        tokio::spawn(crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.scope(upstream_holder.clone(), async move {
             let stream_start = std::time::Instant::now();
             let mut all_stream_data = Vec::new();
-            let mut last_few_bytes = Vec::new();
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
                     all_stream_data.extend_from_slice(&chunk);
 
-                    if chunk.len() > 8192 {
-                        last_few_bytes = chunk.slice(chunk.len() - 8192..).to_vec();
-                    } else {
-                        last_few_bytes.extend_from_slice(&chunk);
-                        if last_few_bytes.len() > 8192 {
-                            last_few_bytes.drain(0..last_few_bytes.len() - 8192);
-                        }
-                    }
                     if tx.send(Ok::<_, axum::Error>(chunk)).await.is_err() {
                         break;
                     }
@@ -984,6 +968,10 @@ pub async fn monitor_middleware(
                 }
             }
             drop(stream);
+            log.physical_requests = upstream_holder.physical_requests();
+            log.upstream_request_body = upstream_holder.take().or(log.upstream_request_body);
+            log.upstream_request_headers = upstream_holder.take_headers().or(log.upstream_request_headers);
+            let captured_usage = upstream_holder.usage();
 
             let stream_ms = stream_start.elapsed().as_micros() as f64 / 1000.0;
             let total_ms = start_instant.elapsed().as_micros() as f64 / 1000.0;
@@ -1011,8 +999,7 @@ pub async fn monitor_middleware(
                 let mut response_content = String::new();
                 let mut thinking_signature = String::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
-                let mut cached_tokens: Option<u32> = None;
-                let mut reasoning_tokens: Option<u32> = None;
+                let mut usage_obj = serde_json::Map::new();
 
                 for line in full_response.lines() {
                     if !line.starts_with("data: ") {
@@ -1259,17 +1246,6 @@ pub async fn monitor_middleware(
                                     }
                                 }
                             }
-                            Some("message_delta") => {
-                                if let Some(delta) = json.get("delta") {
-                                    if let Some(usage) = delta.get("usage") {
-                                        if let Some(output_tokens) =
-                                            usage.get("output_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            log.output_tokens = Some(output_tokens as u32);
-                                        }
-                                    }
-                                }
-                            }
                             Some("response.output_text.delta") => {
                                 if let Some(text) = json.get("delta").and_then(|v| v.as_str()) {
                                     response_content.push_str(text);
@@ -1338,22 +1314,10 @@ pub async fn monitor_middleware(
                             .or(json.get("usageMetadata"))
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
+                            .or(json.get("message").and_then(|message| message.get("usage")))
+                            .or(json.get("delta").and_then(|delta| delta.get("usage")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                            reasoning_tokens =
-                                reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
-                            log.reasoning_tokens = log.reasoning_tokens.or(reasoning_tokens);
-
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage
-                                    .get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
+                            merge_reported_usage(&mut log, &mut usage_obj, usage);
                         }
                     }
                 }
@@ -1392,67 +1356,35 @@ pub async fn monitor_middleware(
                 );
                 timing_obj.insert("total_s".to_string(), serde_json::json!(total_ms / 1000.0));
 
-                // 优先从 tail 兜底提取 token（若当前尚无 token 数据）
-                if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                    if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
-                        for line in full_tail.lines().rev() {
-                            if line.starts_with("data: ")
-                                && (line.contains("\"usage\"")
-                                    || line.contains("\"usageMetadata\""))
-                            {
-                                let json_str = line.trim_start_matches("data: ").trim();
-                                if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                    if let Some(usage) = json
-                                        .get("usage")
-                                        .or(json.get("usageMetadata"))
-                                        .or(json.get("response").and_then(|r| r.get("usage")))
-                                        .or(json
-                                            .get("response")
-                                            .and_then(|r| r.get("usageMetadata")))
-                                    {
-                                        log.input_tokens = extract_input_tokens(usage);
-                                        log.output_tokens = extract_output_tokens(usage);
-                                        cached_tokens =
-                                            cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                        log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                                        reasoning_tokens = reasoning_tokens
-                                            .or_else(|| extract_reasoning_tokens(usage));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
+                apply_captured_usage(&mut log, &mut usage_obj, captured_usage.as_ref());
                 let has_actual_content = !response_content.is_empty()
                     || !tool_calls.is_empty()
                     || !thinking_content.is_empty();
 
-                let mut usage_obj = serde_json::Map::new();
-                if has_actual_content || log.input_tokens.is_some() || log.output_tokens.is_some() {
-                    let input_toks = log.input_tokens.unwrap_or(0);
-                    let output_toks = log.output_tokens.unwrap_or(0);
-                    let cached_toks = cached_tokens.or(log.cached_tokens).unwrap_or(0);
-                    let reasoning_toks = reasoning_tokens.unwrap_or(0);
+                if has_actual_content
+                    || log.input_tokens.is_some()
+                    || log.output_tokens.is_some()
+                    || !usage_obj.is_empty()
+                {
+                    let input_toks = log.input_tokens;
+                    let output_toks = log.output_tokens;
+                    let cached_toks = log.cached_tokens;
+                    let reasoning_toks = log.reasoning_tokens.unwrap_or(0);
 
-                    let total_in = if cached_toks > input_toks {
-                        input_toks + cached_toks
-                    } else {
-                        input_toks
-                    };
-                    let total_toks = total_in + output_toks;
+                    let total_in = input_toks;
+                    let total_toks = log.total_tokens;
 
-                    usage_obj.insert("input_tokens".to_string(), serde_json::json!(total_in));
-                    usage_obj.insert("output_tokens".to_string(), serde_json::json!(output_toks));
+                    usage_obj
+                        .entry("input_tokens".to_string())
+                        .or_insert(serde_json::json!(total_in));
+                    usage_obj
+                        .entry("output_tokens".to_string())
+                        .or_insert(serde_json::json!(output_toks));
                     usage_obj.insert("total_tokens".to_string(), serde_json::json!(total_toks));
-                    if cached_toks > 0 {
-                        usage_obj
-                            .insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
-                        if total_in > 0 {
-                            let hit_rate = (cached_toks as f64 / total_in as f64 * 100.0)
-                                .min(100.0)
-                                .max(0.0);
+                    usage_obj.insert("cached_tokens".to_string(), serde_json::json!(cached_toks));
+                    if let Some((cached, input)) = cached_toks.zip(total_in) {
+                        if input > 0 {
+                            let hit_rate = cached as f64 / input as f64 * 100.0;
                             usage_obj.insert(
                                 "cache_hit_rate".to_string(),
                                 serde_json::json!(format!("{:.1}%", hit_rate)),
@@ -1503,59 +1435,15 @@ pub async fn monitor_middleware(
                 ));
             }
 
-            // Fallback token extraction from tail if not already extracted
-            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
-                    for line in full_tail.lines().rev() {
-                        if line.starts_with("data: ")
-                            && (line.contains("\"usage\"") || line.contains("\"usageMetadata\""))
-                        {
-                            let json_str = line.trim_start_matches("data: ").trim();
-                            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
-                                if let Some(usage) = json
-                                    .get("usage")
-                                    .or(json.get("usageMetadata"))
-                                    .or(json.get("response").and_then(|r| r.get("usage")))
-                                    .or(json.get("response").and_then(|r| r.get("usageMetadata")))
-                                {
-                                    log.input_tokens = extract_input_tokens(usage);
-                                    log.output_tokens = extract_output_tokens(usage);
-                                    log.cached_tokens =
-                                        log.cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             if log.status >= 400 {
                 log.error = Some("Stream Error or Failed".to_string());
-            }
-
-            // Fallback input token estimation prefers the transit (upstream) body
-            if log.input_tokens.is_none() {
-                let estimated = log
-                    .upstream_request_body
-                    .as_ref()
-                    .or(log.request_body.as_ref())
-                    .map(|body| {
-                        crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(
-                            body,
-                        )
-                    })
-                    .unwrap_or(0);
-                if estimated > 0 {
-                    log.input_tokens = Some(estimated);
-                }
             }
 
             // Record User Token Usage
             record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
             monitor.log_request(log).await;
-        });
+        }));
 
         Response::from_parts(
             parts,
@@ -1578,8 +1466,20 @@ pub async fn monitor_middleware(
         log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
         let (parts, body) = response.into_parts();
-        match axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE).await {
+        match crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+            .scope(
+                upstream_holder.clone(),
+                axum::body::to_bytes(body, MAX_RESPONSE_LOG_SIZE),
+            )
+            .await
+        {
             Ok(bytes) => {
+                log.physical_requests = upstream_holder.physical_requests();
+                log.upstream_request_body = upstream_holder.take().or(log.upstream_request_body);
+                log.upstream_request_headers = upstream_holder
+                    .take_headers()
+                    .or(log.upstream_request_headers);
+                let captured_usage = upstream_holder.usage();
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
@@ -1596,16 +1496,16 @@ pub async fn monitor_middleware(
                             log.reasoning_tokens = log
                                 .reasoning_tokens
                                 .or_else(|| extract_reasoning_tokens(usage));
-
-                            if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                                log.output_tokens = usage
-                                    .get("total_tokens")
-                                    .or(usage.get("totalTokenCount"))
-                                    .and_then(|v| v.as_u64())
-                                    .map(|v| v as u32);
-                            }
+                            log.total_tokens =
+                                crate::proxy::pipeline::CanonicalUsage::from_gemini(usage)
+                                    .total_tokens;
                         }
                     }
+                    apply_captured_usage(
+                        &mut log,
+                        &mut serde_json::Map::new(),
+                        captured_usage.as_ref(),
+                    );
                     if is_image_route {
                         log.response_body = serde_json::from_str::<Value>(&s)
                             .ok()
@@ -1613,9 +1513,12 @@ pub async fn monitor_middleware(
                             .or_else(|| Some(s.to_string()));
                     } else if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         // 🌟 非流式响应入库统一转换为满血简要版 (包含网关权威签名回填与防雪崩确定性 Tool ID)
-                        if let Some(canonical) =
-                            consolidate_non_streaming_response(&json, &log, &headers_map)
-                        {
+                        if let Some(canonical) = consolidate_non_streaming_response(
+                            &json,
+                            &log,
+                            &headers_map,
+                            captured_usage.as_ref(),
+                        ) {
                             log.response_body = serde_json::to_string_pretty(&canonical)
                                 .ok()
                                 .or_else(|| Some(s.to_string()));
@@ -1635,21 +1538,6 @@ pub async fn monitor_middleware(
                     log.error = log.response_body.clone();
                 }
 
-                // Fallback input token estimation prefers the transit (upstream) body
-                if log.input_tokens.is_none() {
-                    let estimated = log
-                        .upstream_request_body
-                        .as_ref()
-                        .or(log.request_body.as_ref())
-                        .map(|body| {
-                            crate::proxy::mappers::context_manager::estimate_raw_tokens_from_payload(body)
-                        })
-                        .unwrap_or(0);
-                    if estimated > 0 {
-                        log.input_tokens = Some(estimated);
-                    }
-                }
-
                 // Record User Token Usage
                 record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
@@ -1657,6 +1545,12 @@ pub async fn monitor_middleware(
                 Response::from_parts(parts, Body::from(bytes))
             }
             Err(_) => {
+                log.physical_requests = upstream_holder.physical_requests();
+                apply_captured_usage(
+                    &mut log,
+                    &mut serde_json::Map::new(),
+                    upstream_holder.usage().as_ref(),
+                );
                 log.response_body = Some("[Response too large (>100MB)]".to_string());
 
                 // Record User Token Usage (even if too large)
@@ -1667,6 +1561,12 @@ pub async fn monitor_middleware(
             }
         }
     } else {
+        log.physical_requests = upstream_holder.physical_requests();
+        apply_captured_usage(
+            &mut log,
+            &mut serde_json::Map::new(),
+            upstream_holder.usage().as_ref(),
+        );
         log.response_body = Some(format!("[{}]", content_type));
 
         // Record User Token Usage
@@ -1679,6 +1579,534 @@ pub async fn monitor_middleware(
 
 #[cfg(test)]
 mod tests {
+    async fn wait_for_persisted_requests(count: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let stats = crate::modules::token_stats::get_summary_stats(0).unwrap();
+                let logs = crate::modules::proxy_db::get_logs_summary(count as usize, 0).unwrap();
+                if stats.total_requests == count && logs.len() == count as usize {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actual_mappers_monitor_and_stats_keep_partial_raw_usage_and_totals() {
+        use crate::proxy::mappers::{claude, gemini, openai};
+        use crate::proxy::monitor::{prompt_log_tests, CURRENT_UPSTREAM_CAPTURE};
+        use axum::response::IntoResponse;
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use tower::ServiceExt;
+
+        let _data = prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        crate::modules::token_stats::init_db().unwrap();
+        let monitor = std::sync::Arc::new(prompt_log_tests::test_monitor());
+        let cases = [
+            (None, None, None, None, None),
+            (
+                Some(
+                    json!({"promptTokenCount":0,"candidatesTokenCount":0,"cachedContentTokenCount":0,"totalTokenCount":0}),
+                ),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+            ),
+            (
+                Some(json!({"promptTokenCount":100,"cachedContentTokenCount":80})),
+                Some(100),
+                None,
+                Some(80),
+                None,
+            ),
+            (
+                Some(json!({"candidatesTokenCount":2})),
+                None,
+                Some(2),
+                None,
+                None,
+            ),
+            (
+                Some(json!({"totalTokenCount":123})),
+                None,
+                None,
+                None,
+                Some(123),
+            ),
+            (
+                Some(
+                    json!({"promptTokenCount":100,"candidatesTokenCount":20,"thoughtsTokenCount":3,"cachedContentTokenCount":0,"totalTokenCount":123}),
+                ),
+                Some(100),
+                Some(23),
+                Some(0),
+                Some(123),
+            ),
+            (
+                Some(json!({"cachedContentTokenCount":80})),
+                None,
+                None,
+                Some(80),
+                None,
+            ),
+            (
+                Some(
+                    json!({"promptTokenCount":524288,"candidatesTokenCount":20,"thoughtsTokenCount":3,"cachedContentTokenCount":419430,"totalTokenCount":524311}),
+                ),
+                Some(524288),
+                Some(23),
+                Some(419430),
+                Some(524311),
+            ),
+        ];
+        let mut expected = Vec::new();
+        for protocol in ["gemini", "chat", "responses", "claude"] {
+            for (index, (usage, input, output, cached, total)) in cases.iter().enumerate() {
+                let model = format!("{protocol}-usage-{index}");
+                let path = if protocol == "gemini" {
+                    format!("/v1beta/models/{model}:generateContent")
+                } else {
+                    match protocol {
+                        "chat" => "/v1/chat/completions",
+                        "responses" => "/v1/responses",
+                        _ => "/v1/messages",
+                    }
+                    .to_string()
+                };
+                let mut native = json!({"responseId":"usage-fixture","modelVersion":"gemini-fixture","candidates":[{"content":{"role":"model","parts":[{"text":"Fixture answer"}]},"finishReason":"STOP"}]});
+                if let Some(usage) = usage {
+                    native["usageMetadata"] = usage.clone();
+                }
+                let middleware_monitor = monitor.clone();
+                let app = Router::new().route(&path, post(move || {
+                    let native = native.clone();
+                    async move {
+                        CURRENT_UPSTREAM_CAPTURE.with(|capture| capture.record_dispatch());
+                        if let Some(usage) = native.get("usageMetadata") { crate::proxy::monitor::record_upstream_usage(usage); }
+                        let response = match protocol {
+                            "gemini" => gemini::unwrap_response(&native),
+                            "chat" => serde_json::to_value(openai::transform_openai_response(&native, None, 0, None)).unwrap(),
+                            "responses" => {
+                                let mapped = openai::transform_openai_response(&native, None, 0, None);
+                                json!({"output":[], "usage":mapped.usage.map(|usage| usage.to_responses_usage_value())})
+                            },
+                            _ => {
+                                let native = serde_json::from_value::<claude::GeminiResponse>(native).unwrap();
+                                serde_json::to_value(claude::transform_response(&native, true, 1_048_576, None, "gemini-fixture".into(), 0, Vec::new()).unwrap()).unwrap()
+                            },
+                        };
+                        ([ ("X-Account-Email", "usage@test") ], Json(response)).into_response()
+                    }
+                })).layer(axum::middleware::from_fn(move |request, next| super::monitor_request(middleware_monitor.clone(), request, next)));
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri(&path)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(json!({"model":model}).to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let client: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if protocol == "claude" && [5, 7].contains(&index) {
+                    assert_eq!(client["usage"]["output_tokens"], 23);
+                    assert_eq!(
+                        client["usage"]["output_tokens_details"]["thinking_tokens"],
+                        3
+                    );
+                }
+                if protocol == "claude" && index == 7 {
+                    assert_ne!(
+                        client["usage"]["input_tokens"].as_u64().unwrap()
+                            + client["usage"]["cache_read_input_tokens"].as_u64().unwrap(),
+                        524288
+                    );
+                }
+                expected.push((model, *input, *output, *cached, *total));
+            }
+        }
+        wait_for_persisted_requests(expected.len() as u64).await;
+        let conn = rusqlite::Connection::open(crate::modules::token_stats::get_db_path().unwrap())
+            .unwrap();
+        for (model, input, output, cached, total) in expected {
+            let recorded: (Option<u32>, Option<u32>, Option<u32>, Option<u32>) = conn.query_row("SELECT input_tokens, output_tokens, cached_tokens, reported_total_tokens FROM token_usage WHERE model = ?1", [&model], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+            assert_eq!(recorded, (input, output, cached, total), "{model}");
+            let log = crate::modules::proxy_db::get_logs_summary(100, 0)
+                .unwrap()
+                .into_iter()
+                .find(|log| log.model.as_deref() == Some(model.as_str()))
+                .unwrap();
+            let detail = crate::modules::proxy_db::get_log_detail(&log.id).unwrap();
+            assert_eq!(
+                (
+                    detail.input_tokens,
+                    detail.output_tokens,
+                    detail.cached_tokens,
+                    detail.total_tokens
+                ),
+                recorded,
+                "{model}"
+            );
+            assert_eq!(detail.physical_requests, Some(1));
+        }
+        let stats = crate::modules::token_stats::get_summary_stats(0).unwrap();
+        assert_eq!(stats.total_requests, 32);
+        assert_eq!(stats.cache_reported_requests, 16);
+        assert_eq!(stats.cache_reported_input_tokens, 2_097_952);
+        assert_eq!(stats.cache_reported_tokens, 1_678_040);
+        assert_eq!(stats.total_tokens, 2_098_228);
+        assert_eq!(stats.total_reported_requests, 16);
+        assert_eq!(stats.output_reported_requests, 16);
+        assert_eq!(stats.input_reported_requests, 16);
+        for aggregate in [
+            crate::modules::token_stats::get_hourly_stats(0).unwrap(),
+            crate::modules::token_stats::get_daily_stats(0).unwrap(),
+            crate::modules::token_stats::get_weekly_stats(0).unwrap(),
+        ] {
+            assert_eq!(
+                aggregate.iter().map(|row| row.request_count).sum::<u64>(),
+                32
+            );
+            assert_eq!(
+                aggregate.iter().map(|row| row.total_tokens).sum::<u64>(),
+                stats.total_tokens
+            );
+        }
+        assert_eq!(
+            crate::modules::token_stats::get_model_stats(0)
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(
+            crate::modules::token_stats::get_account_stats(0).unwrap()[0].total_tokens,
+            stats.total_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn lazy_body_dispatch_uses_the_same_capture_and_keeps_only_its_own_usage() {
+        use crate::proxy::monitor::{prompt_log_tests, CURRENT_UPSTREAM_CAPTURE};
+        use axum::{routing::post, Router};
+        use serde_json::json;
+        use tower::ServiceExt;
+
+        for protocol in ["chat", "claude"] {
+            let _data = prompt_log_tests::TestDataDir::new();
+            crate::modules::proxy_db::init_db().unwrap();
+            crate::modules::token_stats::init_db().unwrap();
+            let monitor = std::sync::Arc::new(prompt_log_tests::test_monitor());
+            let path = if protocol == "chat" {
+                "/v1/chat/completions"
+            } else {
+                "/v1/messages"
+            };
+            let app = Router::new().route(path, post(move || async move {
+                CURRENT_UPSTREAM_CAPTURE.with(|capture| capture.record_dispatch());
+                let native = async_stream::stream! {
+                    let first = json!({"candidates":[{"content":{"parts":[{"text":"First thinking", "thought":true}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":80}});
+                    yield Ok::<_, String>(bytes::Bytes::from(format!("data: {first}\n\n")));
+                    CURRENT_UPSTREAM_CAPTURE.with(|capture| {
+                        capture.record_dispatch();
+                        capture.set_value(&json!({"requestId":"second-physical-request"}));
+                    });
+                    let second = json!({"candidates":[{"content":{"parts":[{"text":"Second response"}]},"finishReason":"STOP"}],"usageMetadata":{"candidatesTokenCount":2}});
+                    yield Ok::<_, String>(bytes::Bytes::from(format!("data: {second}\n\n")));
+                };
+                let mapped = if protocol == "chat" {
+                    crate::proxy::mappers::openai::streaming::create_openai_sse_stream(Box::pin(native), "gemini-fixture".into(), String::new(), 0, None, true)
+                } else {
+                    crate::proxy::mappers::claude::create_claude_sse_stream(Box::pin(native), "usage-fixture".into(), "usage@test".into(), None, false, 1_048_576, None, 0, None, Vec::new())
+                };
+                axum::response::Response::builder().header("content-type", "text/event-stream").header("X-Account-Email", "usage@test").body(axum::body::Body::from_stream(mapped)).unwrap()
+            })).layer(axum::middleware::from_fn(move |request, next| super::monitor_request(monitor.clone(), request, next)));
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(axum::body::Body::from("{\"model\":\"gemini-fixture\"}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            wait_for_persisted_requests(1).await;
+            let log = crate::modules::proxy_db::get_logs_summary(1, 0)
+                .unwrap()
+                .remove(0);
+            assert_eq!(log.physical_requests, Some(2), "{protocol}");
+            assert_eq!(log.input_tokens, None, "{protocol}");
+            assert_eq!(log.cached_tokens, None, "{protocol}");
+            assert_eq!(log.output_tokens, Some(2), "{protocol}");
+            assert_eq!(log.total_tokens, None, "{protocol}");
+            let detail = crate::modules::proxy_db::get_log_detail(&log.id).unwrap();
+            assert!(detail
+                .upstream_request_body
+                .unwrap()
+                .contains("second-physical-request"));
+            let stats = crate::modules::token_stats::get_summary_stats(0).unwrap();
+            assert_eq!(stats.total_requests, 1);
+            assert_eq!(stats.cache_reported_requests, 0);
+            assert_eq!(stats.output_reported_requests, 1);
+            assert_eq!(stats.input_reported_requests, 0);
+            assert_eq!(stats.total_reported_requests, 0);
+        }
+    }
+
+    #[test]
+    fn actual_protocol_converters_preserve_unknown_input_output_and_explicit_zero() {
+        use crate::proxy::mappers::{claude, openai};
+        use serde_json::json;
+
+        for (reported, input, output, cached, total) in [
+            (
+                json!({"totalTokenCount":123,"cachedContentTokenCount":80}),
+                None,
+                None,
+                Some(80),
+                Some(123),
+            ),
+            (
+                json!({"promptTokenCount":0,"candidatesTokenCount":0,"cachedContentTokenCount":0,"totalTokenCount":0}),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+            ),
+            (
+                json!({"promptTokenCount":100,"cachedContentTokenCount":80}),
+                Some(100),
+                None,
+                Some(80),
+                None,
+            ),
+            (json!({"candidatesTokenCount":2}), None, Some(2), None, None),
+            (json!({"promptTokenCount":0}), Some(0), None, None, None),
+            (
+                json!({"promptTokenCount":100,"candidatesTokenCount":2,"cachedContentTokenCount":80,"totalTokenCount":123}),
+                Some(100),
+                Some(2),
+                Some(80),
+                Some(123),
+            ),
+        ] {
+            let raw = json!({
+                "responseId":"usage-fact-fixture","modelVersion":"gemini-fixture",
+                "candidates":[{"content":{"role":"model","parts":[{"text":"Known fixture answer"}]},"finishReason":"STOP"}],
+                "usageMetadata":reported
+            });
+            let chat = openai::transform_openai_response(&raw, None, 0, None);
+            let chat_usage = chat.usage.unwrap();
+            assert_eq!(chat_usage.total_tokens, total);
+            let responses = chat_usage.to_responses_usage_value();
+            assert_eq!(responses["total_tokens"], json!(total));
+            let native = serde_json::from_value::<claude::GeminiResponse>(raw).unwrap();
+            let claude = claude::transform_response(
+                &native,
+                false,
+                1_000_000,
+                None,
+                "gemini-fixture".into(),
+                0,
+                Vec::new(),
+            )
+            .unwrap();
+            for mapped in [
+                reported,
+                serde_json::to_value(chat_usage).unwrap(),
+                responses,
+                serde_json::to_value(claude.usage).unwrap(),
+            ] {
+                let mut log =
+                    crate::proxy::monitor::prompt_log_tests::sample_log("protocol-usage", 0);
+                super::merge_reported_usage(&mut log, &mut serde_json::Map::new(), &mapped);
+                assert_eq!(log.input_tokens, input, "mapped usage: {mapped}");
+                assert_eq!(log.output_tokens, output, "mapped usage: {mapped}");
+                assert_eq!(log.cached_tokens, cached, "mapped usage: {mapped}");
+                assert_eq!(log.input_tokens.zip(log.output_tokens), input.zip(output));
+            }
+        }
+    }
+
+    #[test]
+    fn null_alias_does_not_hide_reported_input_output_or_explicit_cache_zero() {
+        let mut log = crate::proxy::monitor::prompt_log_tests::sample_log("numeric-alias", 0);
+        let mut usage = serde_json::Map::new();
+        super::merge_reported_usage(
+            &mut log,
+            &mut usage,
+            &serde_json::json!({
+                "promptTokenCount": null, "input_tokens": null, "prompt_tokens": 100,
+                "total_output_tokens": null, "output_tokens": 2,
+                "cache_read_input_tokens": null, "cachedContentTokenCount": 0
+            }),
+        );
+        assert_eq!(log.input_tokens, Some(100));
+        assert_eq!(log.output_tokens, Some(2));
+        assert_eq!(log.cached_tokens, Some(0));
+        assert!(usage["input_tokens"].is_null());
+        assert_eq!(usage["prompt_tokens"], 100);
+    }
+
+    #[test]
+    fn claude_partial_usage_keeps_reported_input_when_only_output_arrives() {
+        let mut log = crate::proxy::monitor::prompt_log_tests::sample_log("partial-usage", 0);
+        let mut usage = serde_json::Map::new();
+        super::merge_reported_usage(
+            &mut log,
+            &mut usage,
+            &serde_json::json!({
+                "input_tokens": 20, "output_tokens": 0,
+                "cache_read_input_tokens": 80, "cache_creation_input_tokens": 0
+            }),
+        );
+        super::merge_reported_usage(
+            &mut log,
+            &mut usage,
+            &serde_json::json!({"output_tokens": 2, "input_tokens": null}),
+        );
+        assert_eq!(log.input_tokens, Some(100));
+        assert_eq!(log.output_tokens, Some(2));
+        assert_eq!(log.cached_tokens, Some(80));
+        assert!(usage["input_tokens"].is_null());
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+        assert_eq!(usage["output_tokens"], 2);
+        super::merge_reported_usage(
+            &mut log,
+            &mut usage,
+            &serde_json::json!({"cachedContentTokenCount": 0, "promptTokenCount": 100}),
+        );
+        assert_eq!(log.cached_tokens, Some(0));
+        assert_eq!(log.output_tokens, Some(2));
+    }
+
+    #[test]
+    fn consolidated_claude_usage_keeps_native_uncached_input_and_real_cache() {
+        let log = crate::proxy::monitor::prompt_log_tests::sample_log("native-usage", 0);
+        let raw = serde_json::json!({
+            "content":[{"type":"text","text":"Known fixture answer"}],
+            "usage":{"input_tokens":20,"cache_read_input_tokens":80,"output_tokens":2}
+        });
+        let response =
+            super::consolidate_non_streaming_response(&raw, &log, &serde_json::Map::new(), None)
+                .unwrap();
+        assert_eq!(response["usage"]["input_tokens"], 20);
+        assert_eq!(response["usage"]["cache_read_input_tokens"], 80);
+        assert_eq!(super::extract_input_tokens(&response["usage"]), Some(100));
+    }
+
+    #[test]
+    fn consolidated_gemini_usage_preserves_arrays_and_total_without_inventing_components() {
+        use serde_json::Value;
+
+        let log = crate::proxy::monitor::prompt_log_tests::sample_log("raw-usage", 0);
+        for only_total in [true, false] {
+            let mut actual = serde_json::json!({
+                "total_tokens": null,
+                "totalTokenCount": 123,
+                "cacheTokensDetails": [{"modality":"TEXT", "tokenCount":0}],
+                "promptTokensDetails": [{"modality":"TEXT", "tokenCount":100}],
+                "thoughtsTokenCount": 3
+            });
+            if !only_total {
+                actual["promptTokenCount"] = serde_json::json!(100);
+                actual["candidatesTokenCount"] = serde_json::json!(20);
+                actual["cachedContentTokenCount"] = serde_json::json!(0);
+            }
+            let raw = serde_json::json!({
+                "candidates":[{"content":{"parts":[{"text":"Current answer"}]}}],
+                "usageMetadata": actual
+            });
+            let response = super::consolidate_non_streaming_response(
+                &raw,
+                &log,
+                &serde_json::Map::new(),
+                None,
+            )
+            .unwrap();
+            let saved = &response["usage"];
+            assert_eq!(saved["total_tokens"], 123);
+            assert_eq!(saved["totalTokenCount"], 123);
+            assert_eq!(saved["cacheTokensDetails"], actual["cacheTokensDetails"]);
+            assert_eq!(saved["promptTokensDetails"], actual["promptTokensDetails"]);
+            assert_eq!(saved["thoughtsTokenCount"], 3);
+            assert_eq!(
+                saved["input_tokens"],
+                if only_total {
+                    Value::Null
+                } else {
+                    serde_json::json!(100)
+                }
+            );
+            assert_eq!(
+                saved["output_tokens"],
+                if only_total {
+                    Value::Null
+                } else {
+                    serde_json::json!(23)
+                }
+            );
+            assert_eq!(
+                saved["cached_tokens"],
+                if only_total {
+                    Value::Null
+                } else {
+                    serde_json::json!(0)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn consolidated_response_keeps_current_signature_without_borrowing_session_latest() {
+        let session = format!("t:monitor-current-signature:{}", uuid::Uuid::new_v4());
+        crate::proxy::SignatureCache::global().cache_session_signature(
+            &session,
+            "other-response".into(),
+            0,
+        );
+        for current in ["", "this-response"] {
+            let response = super::build_canonical_consolidated_response(
+                "Current thinking without an original matching signature".into(),
+                current.into(),
+                "Current answer".into(),
+                Vec::new(),
+                Some(&session),
+                "monitor-fixture",
+                serde_json::Map::new(),
+                None,
+            );
+            assert_eq!(
+                response
+                    .get("thinking_signature")
+                    .and_then(serde_json::Value::as_str),
+                if current.is_empty() {
+                    None
+                } else {
+                    Some(current)
+                },
+            );
+        }
+        crate::proxy::SignatureCache::global().delete_session_signature(&session);
+    }
+
     #[test]
     fn non_stream_timing_uses_handler_header_names() {
         let mut log = crate::proxy::monitor::prompt_log_tests::sample_log("timing-fixture", 0);
@@ -1698,6 +2126,7 @@ mod tests {
             &response,
             &log,
             headers.as_object().unwrap(),
+            None,
         )
         .expect("non-stream content is consolidated");
         assert_eq!(consolidated["content"], "Fixture output");
@@ -1708,9 +2137,13 @@ mod tests {
                 "ttft_s": 1.5, "stream_s": 2.0, "total_s": 3.5
             })
         );
-        let fallback =
-            super::consolidate_non_streaming_response(&response, &log, &serde_json::Map::new())
-                .unwrap();
+        let fallback = super::consolidate_non_streaming_response(
+            &response,
+            &log,
+            &serde_json::Map::new(),
+            None,
+        )
+        .unwrap();
         assert_eq!(fallback["_timing"]["total_s"], 9.999);
         assert!(fallback["_timing"].get("ttft_s").is_none());
     }

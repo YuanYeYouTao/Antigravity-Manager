@@ -47,10 +47,24 @@ where
         if actual_data.get("error").is_some() {
             return Some(actual_data);
         }
+        if let Some(usage) = actual_data.get("usageMetadata") {
+            crate::proxy::monitor::record_upstream_usage(usage);
+        }
 
         if let Some(fields) = actual_data.as_object() {
             for (key, value) in fields {
                 if key != "candidates" {
+                    if key == "usageMetadata" {
+                        if let (Some(current), Some(reported)) = (
+                            collected_response
+                                .get_mut(key)
+                                .and_then(Value::as_object_mut),
+                            value.as_object(),
+                        ) {
+                            current.extend(reported.clone());
+                            continue;
+                        }
+                    }
                     collected_response[key] = value.clone();
                 }
             }

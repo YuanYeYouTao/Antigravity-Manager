@@ -271,16 +271,37 @@ pub struct ClaudeResponse {
 }
 
 /// Usage
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<serde_json::Value>,
+}
+
+impl Usage {
+    pub fn merge(&mut self, reported: Self) {
+        self.input_tokens = reported.input_tokens.or(self.input_tokens);
+        self.output_tokens = reported.output_tokens.or(self.output_tokens);
+        self.output_tokens_details = reported
+            .output_tokens_details
+            .or(self.output_tokens_details.take());
+        self.cache_read_input_tokens = reported
+            .cache_read_input_tokens
+            .or(self.cache_read_input_tokens);
+        self.cache_creation_input_tokens = reported
+            .cache_creation_input_tokens
+            .or(self.cache_creation_input_tokens);
+        self.server_tool_use = reported.server_tool_use.or(self.server_tool_use.take());
+    }
 }
 
 // ========== Gemini 数据模型 ==========
@@ -375,6 +396,8 @@ pub struct Candidate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageMetadata {
+    #[serde(rename = "thoughtsTokenCount", skip_serializing_if = "Option::is_none")]
+    pub thoughts_token_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "promptTokenCount")]
     pub prompt_token_count: Option<u32>,
@@ -387,6 +410,20 @@ pub struct UsageMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "cachedContentTokenCount")]
     pub cached_content_token_count: Option<u32>,
+}
+
+impl UsageMetadata {
+    pub fn merge(&mut self, reported: Self) {
+        self.thoughts_token_count = reported.thoughts_token_count.or(self.thoughts_token_count);
+        self.prompt_token_count = reported.prompt_token_count.or(self.prompt_token_count);
+        self.candidates_token_count = reported
+            .candidates_token_count
+            .or(self.candidates_token_count);
+        self.total_token_count = reported.total_token_count.or(self.total_token_count);
+        self.cached_content_token_count = reported
+            .cached_content_token_count
+            .or(self.cached_content_token_count);
+    }
 }
 
 // ========== Grounding Metadata (for googleSearch results) ==========

@@ -228,8 +228,7 @@ export const PricingModal: React.FC<PricingModalProps> = ({
                                         />
                                     </div>
                                     <div className="col-span-1 flex justify-center">
-                                        {mName !== 'default' ? (
-                                            <button
+                                        <button
                                                 onClick={() => {
                                                     const next = { ...tempPricing };
                                                     delete next[mName];
@@ -239,10 +238,7 @@ export const PricingModal: React.FC<PricingModalProps> = ({
                                                 title={t('token_stats.delete', '删除')}
                                             >
                                                 <Trash2 className="w-3.5 h-3.5" />
-                                            </button>
-                                        ) : (
-                                            <span className="text-[10px] text-gray-400 select-none">默认</span>
-                                        )}
+                                        </button>
                                     </div>
                                 </div>
                             );

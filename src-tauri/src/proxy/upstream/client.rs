@@ -480,6 +480,16 @@ impl UpstreamClient {
                     req_builder = req_builder.body(body_bytes.clone());
                 }
 
+                let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|capture| {
+                    capture.set_value(&body);
+                    let pairs = headers.iter().filter_map(|(key, value)| {
+                        value.to_str().ok().map(|value| (key.as_str(), value))
+                    });
+                    capture.set_headers_json(
+                        crate::proxy::payload_audit::header_pairs_to_redacted_json(pairs),
+                    );
+                    capture.record_dispatch();
+                });
                 let response = req_builder.send().await;
 
                 match response {
@@ -664,6 +674,8 @@ impl UpstreamClient {
         for base_url in V1_INTERNAL_BASE_URL_FALLBACKS.iter() {
             let url = Self::build_url(base_url, method, None);
 
+            let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+                .try_with(|capture| capture.record_dispatch());
             let response = match client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", access_token))

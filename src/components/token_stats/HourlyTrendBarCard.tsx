@@ -1,8 +1,9 @@
 import React, { useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Sparkles } from 'lucide-react';
+import type { CacheReportedStats } from './usageMetrics';
 
-export interface HourlyUsagePoint {
+export interface HourlyUsagePoint extends CacheReportedStats {
     hour: string; // "YYYY-MM-DD HH:00" or "HH:00"
     total_tokens: number;
     input_tokens: number;
@@ -13,13 +14,11 @@ export interface HourlyUsagePoint {
 
 interface HourlyTrendBarCardProps {
     hourlyData: HourlyUsagePoint[];
-    totalEstimatedCost?: number;
     formatNumber: (n: number) => string;
 }
 
 export const HourlyTrendBarCard: React.FC<HourlyTrendBarCardProps> = ({
     hourlyData,
-    totalEstimatedCost,
     formatNumber,
 }) => {
     const { t } = useTranslation();
@@ -59,6 +58,9 @@ export const HourlyTrendBarCard: React.FC<HourlyTrendBarCardProps> = ({
                 output_tokens: 0,
                 cached_tokens: 0,
                 request_count: 0,
+                cache_reported_requests: 0,
+                cache_reported_input_tokens: 0,
+                cache_reported_tokens: 0,
             };
 
             total += point.total_tokens;
@@ -103,11 +105,6 @@ export const HourlyTrendBarCard: React.FC<HourlyTrendBarCardProps> = ({
                     ) : (
                         <span>
                             24h · {formatNumber(past24hTotalTokens)}
-                            {totalEstimatedCost !== undefined && totalEstimatedCost > 0 ? (
-                                <span className="text-emerald-600 dark:text-emerald-400 ml-1 font-semibold">
-                                    (~${totalEstimatedCost.toFixed(2)})
-                                </span>
-                            ) : null}
                         </span>
                     )}
                 </div>

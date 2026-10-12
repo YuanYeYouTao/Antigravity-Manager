@@ -2345,6 +2345,9 @@ pub async fn handle_messages(
 
                 // 解包 response 字段（v1internal 格式）
                 let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
+                if let Some(usage) = raw.get("usageMetadata") {
+                    crate::proxy::monitor::record_upstream_usage(usage);
+                }
 
                 // 转换为 Gemini Response 结构
                 let gemini_response: crate::proxy::mappers::claude::models::GeminiResponse =
@@ -2403,7 +2406,7 @@ pub async fn handle_messages(
                 };
 
                 tracing::info!(
-                    "[{}] Request finished. Model: {}, Tokens: In {}, Out {}{}",
+                    "[{}] Request finished. Model: {}, Tokens: In {:?}, Out {:?}{}",
                     trace_id,
                     request_with_mapped.model,
                     claude_response.usage.input_tokens,
@@ -2667,7 +2670,8 @@ pub async fn handle_messages(
         // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
         // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
         if status_code == 400 && error_text.contains("exceeds the maximum number of tokens") {
-            let generation = crate::proxy::common::session::bump_session(&account_id, &store_key);
+            let generation =
+                crate::proxy::common::session::bump_session(&account_id, &affinity_key);
             tracing::warn!(
                 "[Claude] Upstream session token accumulation exceeded 1M on account {}. sessionId bumped to generation {}, retrying with a fresh upstream session.",
                 email, generation

@@ -1270,7 +1270,7 @@ pub fn transform_openai_request_with_session(
         crate::proxy::common::session::apply_upstream_session(
             &mut inner_request,
             &t.account_id,
-            &thinking_store_key,
+            routing_session_id,
         );
     }
 

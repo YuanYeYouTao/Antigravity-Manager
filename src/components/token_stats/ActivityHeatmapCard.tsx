@@ -1,8 +1,9 @@
 import React, { useState, useMemo } from 'react';
 import { Flame } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import type { CacheReportedStats } from './usageMetrics';
 
-export interface DayUsagePoint {
+export interface DayUsagePoint extends CacheReportedStats {
     date: string; // YYYY-MM-DD
     total_tokens: number;
     request_count: number;
@@ -13,13 +14,11 @@ export interface DayUsagePoint {
 
 interface ActivityHeatmapCardProps {
     dailyData: DayUsagePoint[];
-    totalEstimatedCost?: number;
     formatNumber: (n: number) => string;
 }
 
 export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
     dailyData,
-    totalEstimatedCost,
     formatNumber,
 }) => {
     const { t } = useTranslation();
@@ -51,6 +50,9 @@ export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
                     total_input_tokens: 0,
                     total_output_tokens: 0,
                     total_cached_tokens: 0,
+                    cache_reported_requests: 0,
+                    cache_reported_input_tokens: 0,
+                    cache_reported_tokens: 0,
                 }
             );
         }
@@ -203,11 +205,6 @@ export const ActivityHeatmapCard: React.FC<ActivityHeatmapCardProps> = ({
                                 {t('token_stats.weeks_count', { count: 13, defaultValue: '13 周' })}
                             </span>
                         </div>
-                        {totalEstimatedCost !== undefined && totalEstimatedCost > 0 && (
-                            <div className="text-xs font-mono font-medium text-emerald-600 dark:text-emerald-400 mt-0.5">
-                                ~${totalEstimatedCost.toFixed(2)}
-                            </div>
-                        )}
                     </div>
 
                     <div className="mt-3 space-y-1.5 text-xs">

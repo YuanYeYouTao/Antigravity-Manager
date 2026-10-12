@@ -121,13 +121,7 @@ where
         content: Vec::new(),
         stop_reason: "end_turn".to_string(),
         stop_sequence: None,
-        usage: Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_input_tokens: None,
-            cache_creation_input_tokens: None,
-            server_tool_use: None,
-        },
+        usage: Usage::default(),
     };
 
     // 用于累积内容块
@@ -150,7 +144,7 @@ where
                     }
                     if let Some(usage) = message.get("usage") {
                         if let Ok(u) = serde_json::from_value::<Usage>(usage.clone()) {
-                            response.usage = u;
+                            response.usage.merge(u);
                         }
                     }
                 }
@@ -268,7 +262,7 @@ where
                 }
                 if let Some(usage) = event.data.get("usage") {
                     if let Ok(u) = serde_json::from_value::<Usage>(usage.clone()) {
-                        response.usage = u;
+                        response.usage.merge(u);
                     }
                 }
             }
@@ -335,6 +329,8 @@ mod tests {
         assert_eq!(response.id, "msg_123");
         assert_eq!(response.model, "claude-3-5-sonnet");
         assert_eq!(response.content.len(), 1);
+        assert_eq!(response.usage.input_tokens, Some(10));
+        assert_eq!(response.usage.output_tokens, Some(5));
 
         if let ContentBlock::Text { text } = &response.content[0] {
             assert_eq!(text, "Hello World");
