@@ -33,6 +33,7 @@ pub struct ProxyRequestLog {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
     pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
     #[serde(default)]
@@ -159,6 +160,7 @@ impl ProxyRequestLog {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cached_tokens: self.cached_tokens,
+            reasoning_tokens: self.reasoning_tokens,
             protocol: self.protocol.clone(),
             username: self.username.clone(),
             session_id: self.session_id.clone(),
@@ -402,9 +404,10 @@ impl ProxyMonitor {
             let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
             let account = account.clone();
             let cached = log.cached_tokens.unwrap_or(0);
+            let reasoning = log.reasoning_tokens.unwrap_or(0);
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::modules::token_stats::record_usage(
-                    &account, &model, input, output, cached,
+                    &account, &model, input, output, cached, reasoning,
                 ) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }

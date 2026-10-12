@@ -230,6 +230,10 @@ impl SystemIntegration for DesktopIntegration {
 
         if target_ide == Some("agy") {
             write_to_system_keyring(account)?;
+            // A successful write (or a file fallback) is not proof that the CLI
+            // will read this account from the system credential store.
+            let stored = read_from_system_keyring_only()?;
+            verify_agy_credentials(&account.token.refresh_token, &stored.refresh_token)?;
 
             if let Ok(storage_path) = device::get_storage_path(target_ide) {
                 if let Some(ref profile) = account.device_profile {
@@ -240,12 +244,12 @@ impl SystemIntegration for DesktopIntegration {
             let is_running = process::is_process_running_by_name("agy");
             let msg = if is_running {
                 format!(
-                    "Account {} activated. Agy is running, token will be picked up automatically.",
+                    "Credentials for {} saved and verified. Running agy sessions may still use and write back their previous credentials.",
                     account.email
                 )
             } else {
                 format!(
-                    "Account {} activated. Token is ready for your next CLI command.",
+                    "Credentials for {} saved and verified for the next CLI command.",
                     account.email
                 )
             };
@@ -287,20 +291,20 @@ impl SystemIntegration for DesktopIntegration {
 
         // 2. 决定切换模式（热切号 / 完整重启）并处理进程与凭据
         //
-        //    · 热切号 —— 仅 IDE 目标（issue #3503 方案 A）：只终止 language_server 子进程、保留主窗口，
-        //      IDE 内置 supervisor 会在约 2 秒内原地重建子进程并重载 Webview，从而保住用户的
-        //      未保存缓冲区 / 终端任务 / 断点 / 文件树。顺序是**先写凭据 → 再杀子进程 →（best-effort）再补写一次**：
-        //      supervisor 重启有约 2s 退避窗口，而写入只需毫秒级，"写在前"保证重新拉起的子进程
-        //      必然读到新凭据，不存在"子进程先起来、加载旧账号"的竞态；杀完再补写一次是为了覆盖
-        //      "写 → 杀"这几十毫秒窗口内旧语言服务把旧 token 回写进数据库的极端情况。
-        //      另外写入失败会在杀进程之前返回错误，IDE 保持原样不受影响。
-        //    · 完整重启 —— 经典原生版（或未定位到语言服务子进程）：沿用原顺序「先杀 → 再写 → 再启动」，
-        //      因为旧架构下运行中的应用会在退出时刷盘覆盖刚写入的 Token。
+        //    · 热切号 —— 仅限原生经典版（Standalone >= 2.0.0，issue #3503 / issue #3637）：
+        //      经典款主窗口进程与后台 language_server 解耦，只终止子进程并更新 Keyring 后，
+        //      宿主内置 supervisor 会在约 2 秒内原地重建子进程重载新凭据，保留主窗口和未保存内容。
+        //      顺序是**先写凭据 → 再杀子进程 →（best-effort）再补写一次**。
+        //    · 完整重启 —— IDE 款（is_ide）、客户端未运行、未定位到语言服务子进程或杀死失败：
+        //      IDE 款深度依赖 Extension Host 内存上下文与 SQLite (state.vscdb) 单写者锁，单杀子进程
+        //      无法使 IDE 窗口界面与主会话感知新账号，且容易导致并发写冲突与回写覆盖；故 IDE 款坚决
+        //      保持「先杀主进程 → 干净写入 SQLite → 重新启动客户端」的权威原子流程。
         let running = process::is_antigravity_running(effective_target);
         let mut hot_switch = false;
         let mut credentials_applied = false;
 
-        if is_ide && running {
+        // 仅原生经典版（!is_ide）且运行中时尝试热切号
+        if !is_ide && running {
             apply_account_credentials(
                 account,
                 effective_target,
@@ -320,7 +324,7 @@ impl SystemIntegration for DesktopIntegration {
 
                     // 补写一次凭据（best-effort）：子进程已被终止，此时数据库不存在竞争写者，
                     // 这次写入即为权威值 —— 用于覆盖"写凭据 → 杀子进程"这几十毫秒窗口内
-                    // 旧语言服务可能把旧 token 回写进 state.vscdb 的情况，
+                    // 旧语言服务可能把旧 token 回写进 Keyring 的情况，
                     // 确保 supervisor 约 2s 后重新拉起的子进程读到的一定是新凭据。
                     // 失败只告警，不使整个切号失败：第一次写入已经就位。
                     if let Err(e) = apply_account_credentials(
@@ -664,7 +668,10 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
         };
 
         // 1. 优先尝试写入 'login' 集合（agy CLI 所需）
-        let login_res = store_to_collection(Some("login"), payload_json.as_bytes());
+        let login_res = store_to_collection(
+            Some("/org/freedesktop/secrets/collection/login"),
+            payload_json.as_bytes(),
+        );
 
         // 2. 同时写入默认集合（保证其他依赖 default collection 的系统工具也能读取）
         let default_res = store_to_collection(None, payload_json.as_bytes());
@@ -908,6 +915,28 @@ fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAu
 
 /// 辅助方法：从宿主操作系统的 Keychain/Credentials Manager 读取 Token
 pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedOAuthState, String> {
+    read_system_credentials(true)
+}
+
+/// Read only the system store: stale fallback files must not confirm an agy switch.
+pub(crate) fn read_from_system_keyring_only(
+) -> Result<crate::modules::migration::ImportedOAuthState, String> {
+    read_system_credentials(false)
+}
+
+fn verify_agy_credentials(expected: &str, stored: &str) -> Result<(), String> {
+    if expected.is_empty() || expected != stored {
+        return Err(
+            "Stored agy credentials do not match the selected account; the switch was not confirmed."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn read_system_credentials(
+    allow_file_fallback: bool,
+) -> Result<crate::modules::migration::ImportedOAuthState, String> {
     #[cfg(target_os = "macos")]
     {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -924,8 +953,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
             .map_err(|e| format!("Failed to execute security command: {}", e))?;
 
         if !output.status.success() {
-            if let Ok(file_state) = read_from_file_credentials() {
-                return Ok(file_state);
+            if allow_file_fallback {
+                if let Ok(file_state) = read_from_file_credentials() {
+                    return Ok(file_state);
+                }
             }
             return Err("No credential found in macOS Keychain".to_string());
         }
@@ -992,8 +1023,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         unsafe {
             let res = CredReadW(target_wide.as_ptr(), 1, 0, &mut cred_ptr);
             if res == 0 || cred_ptr.is_null() {
-                if let Ok(file_state) = read_from_file_credentials() {
-                    return Ok(file_state);
+                if allow_file_fallback {
+                    if let Ok(file_state) = read_from_file_credentials() {
+                        return Ok(file_state);
+                    }
                 }
                 return Err("No credential found in Windows Credential Manager".to_string());
             }
@@ -1018,8 +1051,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         {
             Ok(out) => out,
             Err(e) => {
-                if let Ok(file_state) = read_from_file_credentials() {
-                    return Ok(file_state);
+                if allow_file_fallback {
+                    if let Ok(file_state) = read_from_file_credentials() {
+                        return Ok(file_state);
+                    }
                 }
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(
@@ -1036,8 +1071,10 @@ pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedO
         };
 
         if !output.status.success() {
-            if let Ok(file_state) = read_from_file_credentials() {
-                return Ok(file_state);
+            if allow_file_fallback {
+                if let Ok(file_state) = read_from_file_credentials() {
+                    return Ok(file_state);
+                }
             }
             return Err("No credential found in Linux secret-tool".to_string());
         }
@@ -1191,6 +1228,15 @@ impl SystemIntegration for SystemManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_credentials_require_an_exact_nonempty_readback() {
+        assert!(verify_agy_credentials("selected-token", "selected-token").is_ok());
+        assert!(verify_agy_credentials("", "").is_err());
+        let error = verify_agy_credentials("selected-token", "other-token").unwrap_err();
+        assert!(!error.contains("selected-token"));
+        assert!(!error.contains("other-token"));
+    }
 
     #[test]
     fn test_parse_keyring_payload_nested_token() {

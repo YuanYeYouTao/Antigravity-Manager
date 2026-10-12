@@ -75,9 +75,17 @@ fn should_enable_tray() -> bool {
     true
 }
 
-/// Login-item launches pass `--minimized`. Quiet startup applies only to that launch.
+/// Login-item launches or shortcut flags pass `--minimized`, `--silent`, `--hidden`, or `-s`.
+/// Quiet startup applies only to that launch.
 fn apply_login_launch_policy(app: &tauri::App) {
-    let launched_by_login = std::env::args().any(|arg| arg == "--minimized");
+    let launched_by_login = std::env::args().any(|arg| {
+        let lower = arg.to_lowercase();
+        lower == "--minimized"
+            || lower == "--silent"
+            || lower == "--hidden"
+            || lower == "-s"
+            || lower == "/minimized"
+    });
     if !launched_by_login {
         return;
     }
@@ -133,7 +141,7 @@ fn nvidia_proprietary_loaded() -> bool {
 #[cfg(target_os = "linux")]
 fn configure_linux_graphics() {
     use linux_graphics::{
-        desktop_is_kde, desktop_is_wlroots_family, should_disable_webkit_dmabuf,
+        desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, should_disable_webkit_dmabuf,
         should_force_x11_backend,
     };
 
@@ -162,10 +170,12 @@ fn configure_linux_graphics() {
         );
     } else if is_wayland
         && !gdk_already_set
-        && (desktop_is_wlroots_family(&desktop) || desktop_is_kde(&desktop))
+        && (desktop_is_wlroots_family(&desktop)
+            || desktop_is_kde(&desktop)
+            || desktop_is_gnome(&desktop))
     {
         info!(
-            "Keeping native Wayland GDK backend on {} (avoiding Xwayland WebKitGTK frame freeze / black window).",
+            "Keeping native Wayland GDK backend on {} (avoiding Xwayland WebKitGTK frame freeze).",
             desktop
         );
     }
@@ -517,29 +527,6 @@ pub fn run() {
                 });
             }
 
-            // Linux: Workaround for transparent window crash/freeze
-            // The transparent window feature is unstable on Linux with WebKitGTK
-            // We disable the visual alpha channel to prevent softbuffer-related crashes
-            #[cfg(target_os = "linux")]
-            {
-                use tauri::Manager;
-                if is_wayland_session() {
-                    info!("Linux Wayland session detected; skipping transparent window workaround");
-                } else if let Some(window) = app.get_webview_window("main") {
-                    // Access GTK window and disable transparency at the GTK level
-                    if let Ok(gtk_window) = window.gtk_window() {
-                        use gtk::prelude::WidgetExt;
-                        // Remove the visual's alpha channel to disable transparency
-                        if let Some(screen) = gtk_window.screen() {
-                            // Use non-composited visual if available
-                            if let Some(visual) = screen.system_visual() {
-                                gtk_window.set_visual(Some(&visual));
-                            }
-                            info!("Linux: Applied transparent window workaround");
-                        }
-                    }
-                }
-            }
 
             let runtime_flags = app.state::<AppRuntimeFlags>();
             if runtime_flags.tray_enabled {
@@ -840,6 +827,9 @@ pub fn run() {
             commands::check_claude_cowork_patch,
             commands::apply_claude_cowork_patch,
             commands::revert_claude_cowork_patch,
+            commands::is_claude_desktop_running,
+            commands::close_claude_desktop,
+            commands::launch_claude_desktop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

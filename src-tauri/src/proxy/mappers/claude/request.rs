@@ -1815,8 +1815,7 @@ fn build_generation_config(
         .output_config
         .as_ref()
         .and_then(|c| c.effort.as_ref())
-        .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()))
-        .or_else(|| tb_config.effort.as_ref());
+        .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()));
 
     let client_effort = effort.map(|s| s.as_str());
     let client_budget = claude_req
@@ -1880,8 +1879,13 @@ fn build_generation_config(
     }
 
     if let Some(val) = final_max_tokens {
-        // [FIX] Cap maxOutputTokens to safe upper limit (65535 for Pro, 65536 for Flash) to avoid INVALID_ARGUMENT (Cherry Studio sends 128000)
-        let safe_limit = if mapped_model.to_lowercase().contains("pro") {
+        // [FIX] Cap maxOutputTokens to safe upper limit (128000 for Claude 5.5, 65535 for Pro, 65536 for Flash, 64000 for Claude 4.6)
+        let mapped_lower = mapped_model.to_lowercase();
+        let safe_limit = if mapped_lower.contains("5-5") || mapped_lower.contains("5.5") {
+            128000
+        } else if mapped_lower.contains("claude") {
+            64000
+        } else if mapped_lower.contains("pro") {
             65535
         } else {
             65536
@@ -2905,8 +2909,11 @@ mod tests {
         // Set global config to Adaptive + High effort
         let config = ThinkingBudgetConfig {
             mode: crate::proxy::config::ThinkingBudgetMode::Adaptive,
+            claude_mode: crate::proxy::config::ThinkingBudgetMode::Custom,
             custom_value: 0,
             effort: Some("high".to_string()),
+            claude_budget: 16384,
+            claude_high: 16384,
             ..Default::default()
         };
         crate::proxy::config::update_thinking_budget_config(config);
@@ -3195,7 +3202,7 @@ mod tests {
             panic!("Expected array content");
         }
 
-        // 2. transform_claude_request_in 针对 Claude 模型应保留未带签名的纯思考块
+        // 2. transform_claude_request_in 针对 Claude 模型，无有效签名时为防上游 400 应降级为 <think> 文本保留语义
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages,
@@ -3227,16 +3234,10 @@ mod tests {
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
         assert_eq!(assistant_parts.len(), 2);
-        assert_eq!(assistant_parts[0]["thought"], true);
-        assert!(
-            assistant_parts[0].get("thoughtSignature").is_none()
-                || assistant_parts[0]["thoughtSignature"].is_null(),
-            "Sentinel elimination: thoughtSignature must be absent when unsigned"
-        );
-        assert_eq!(
-            assistant_parts[0]["text"],
-            "Considering the question deeply..."
-        );
+        assert!(assistant_parts[0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Considering the question deeply..."));
         assert_eq!(assistant_parts[1]["text"], "Here is my answer");
     }
 

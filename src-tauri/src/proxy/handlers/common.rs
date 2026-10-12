@@ -153,6 +153,39 @@ pub fn calculate_max_retry_attempts(pool_size: usize) -> usize {
     }
 }
 
+/// 单次客户端请求在网关内部允许消耗的最大全局时间预算（秒，默认 240s）
+/// Claude Code 客户端原生设置了 300 秒（5分钟）的首包超时看门狗 (firstWindowMs = 300_000)。
+/// 网关内部在尝试跨账号轮换时，总耗时必须严格控制在 240 秒以内，确保在看门狗触发前向客户端返回
+/// 结构化规范化错误（504 Gateway Timeout 或 429/503），避免客户端弹出未响应警告框。
+pub const MAX_GATEWAY_REQUEST_BUDGET_SECS: u64 = 240;
+
+/// [Issue #3634] 统一自适应计算流预读（Peek）阶段的超时时间。
+/// - Compaction 摘要请求：大 Prompt 处理，默认 180s；
+/// - 图像生成请求：图像生成耗时较长，默认 60s；
+/// - 正常会话请求：根据估算 Token 数量动态自适应，避免大上下文 Prompt 预热（TTFT）超过 30s 被过早误杀导致全池轮换雪崩；
+///   * > 100k tokens: 120s
+///   * > 50k tokens: 90s
+///   * > 20k tokens: 60s
+///   * 默认: 30s
+pub fn calculate_adaptive_peek_timeout(
+    is_compaction: bool,
+    is_image_gen: bool,
+    estimated_tokens: Option<u32>,
+) -> u64 {
+    if is_compaction {
+        180
+    } else if is_image_gen {
+        60
+    } else {
+        match estimated_tokens {
+            Some(tokens) if tokens >= 100_000 => 120,
+            Some(tokens) if tokens >= 50_000 => 90,
+            Some(tokens) if tokens >= 20_000 => 60,
+            _ => 30,
+        }
+    }
+}
+
 /// 根据错误状态码和错误信息确定重试策略
 pub fn determine_retry_strategy(
     status_code: u16,
@@ -250,29 +283,51 @@ pub fn determine_retry_strategy_adaptive(
 
             // 3. 多账号模式 (pool_size > 1)：
             // 账号级硬配额枯竭检测：仅当没有提供重试延迟且包含确定性枯竭关键字时判定
-            // 正确包含 Google RPC 标准状态字与经典配额耗尽提示：
-            // RESOURCE_EXHAUSTED / Resource has been exhausted / Quota exceeded / quota_exhausted 等
+            // 包含明确的账号额度/周期枯竭字样（如 exceeded your current quota / insufficient_quota / weekly quota / credits 等）
+            // 注意：Google 标准通用 429 的 "resource has been exhausted (e.g. check quota)" 属于无明确延迟的通用流控/TPM拒绝，
+            // 严禁归入硬配额，否则将导致全池快速轮换遍历并引发全池 30 秒级联锁定 (#3506)。
             let is_hard_quota_exhausted = parsed_delay.is_none()
-                && (lower.contains("quota_exhausted")
-                    || lower.contains("exceeded your current quota")
+                && (lower.contains("exceeded your current quota")
                     || lower.contains("insufficient_quota")
                     || lower.contains("credits")
                     || lower.contains("zero_quota")
                     || lower.contains("weekly quota")
-                    || lower.contains("resource has been exhausted")
-                    || lower.contains("resource_exhausted")
-                    || lower.contains("quota exceeded"));
+                    || lower.contains("daily quota")
+                    || lower.contains("per day")
+                    || (lower.contains("quota_exhausted")
+                        && !lower.contains("resource has been exhausted")));
 
             // 请求级 429 防穿透保护 (无明确重置时间且非账号硬配额耗尽)：
-            // [FIX #3506] 若在完整尝试完全池所有账号 (attempt >= pool_size) 后依然遭遇请求级 429，
-            // 判定为该请求特定 Payload / IP 流控导致，立即终止进一步轮换，防止第二轮继续打穿全池导致全池锁定
+            // [FIX #3506] 若遭遇无明确重置时间的请求级 429，最多允许尝试 2 个账号快切逃逸（min(pool_size, 2)）。
+            // 连续 2 个账号失败说明该请求为恶性 Payload、超大 Token 或 IP/提供商级流控，
+            // 必须立即终止进一步轮换，严禁打穿全池导致全池健康账号被锁入 RateLimitExceeded。
             let is_request_level_429 = parsed_delay.is_none() && !is_hard_quota_exhausted;
-            if is_request_level_429 && attempt >= pool_size {
+            let request_level_429_max_attempts = pool_size.min(2);
+            if is_request_level_429 && attempt >= request_level_429_max_attempts {
                 tracing::warn!(
-                    "[Retry] Request-level 429 persisted across all {} accounts in pool without explicit delay; aborting further rotation to protect account pool.",
-                    pool_size
+                    "[Retry] Request-level 429 persisted across {} attempts without explicit delay; aborting further rotation to protect remaining {} accounts.",
+                    attempt,
+                    pool_size.saturating_sub(attempt)
                 );
                 return RetryStrategy::NoRetry;
+            }
+
+            // [FIX #3329, #3409] 关键防线：微间隙优先原地 GraceRetry (Micro-gap Grace Retry First)
+            // 若上游返回了明确且极短的重置延迟 (<= 2500ms，例如 Google 图像生成典型的 1.17s quotaResetDelay)
+            // 且该账号本轮尚未执行过 GraceRetry：
+            // 绝不能在第 1 轮就无脑 50ms 闪电切号！
+            // 因为 50ms 闪电切号会在 300ms 内把全池所有账号全部轮询打一遍，并将它们全部作为 RateLimitExceeded 封锁进入 RateLimitTracker，
+            // 导致所有账号在第 2 轮全部处于限流冷却中并抛出 503 "All accounts limited"（生图成功率骤降至 13% 的根因）。
+            // 优先在当前账号原地等待 actual_ms (如 1.37s) 并在上游配额刚恢复的瞬间重试，即可原地满血复活，完全避免全池被连坐封死！
+            if let Some(delay) = parsed_delay {
+                let actual_ms = delay.actual_wait_ms();
+                if actual_ms <= 2500 && allow_grace_retry {
+                    tracing::info!(
+                        "[Retry] Multi-account 429 micro-gap ({}ms <= 2500ms): applying GraceRetry on current account instead of fast-rotating to protect pool",
+                        actual_ms
+                    );
+                    return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
+                }
             }
 
             let is_first_round = attempt < pool_size;
@@ -330,18 +385,18 @@ pub fn determine_retry_strategy_adaptive(
                 );
                 RetryStrategy::FixedDelay(Duration::from_millis(50))
             } else {
-                // 单账号或已遍历全池: 指数退避 (起始 5s，上限 30s)
+                // 单账号或已遍历全池: 适度温和退避 (起始 1s，上限 4s，杜绝单次重试死等 30s 阻塞网关)
                 RetryStrategy::ExponentialBackoff {
-                    base_ms: 5000,
-                    max_ms: 30000,
+                    base_ms: 1000,
+                    max_ms: 4000,
                 }
             }
         }
 
         // 500 服务器内部错误
         500 => {
-            // 线性退避：起始 3s
-            RetryStrategy::LinearBackoff { base_ms: 3000 }
+            // 线性退避：起始 1s，上限 3s
+            RetryStrategy::LinearBackoff { base_ms: 1000 }
         }
 
         // 401/403 认证/权限错误：切换账号前给予极短缓冲
@@ -558,8 +613,22 @@ pub fn extract_retry_after_seconds(error_text: &str) -> Option<u64> {
     None
 }
 
-/// [Issue #3414] 统一构造带有 X-Mapped-Model、可选 X-Account-Email 以及 Retry-After 的 HeaderMap
-pub fn build_token_error_headers<'a>(
+/// [Issue #3634] 为 Claude 协议收敛 Retry-After 秒数。
+/// Claude Code 客户端对 Retry-After 设置了严格的 20,000ms (20s) 门禁：
+/// 1. 若 Retry-After >= 20s 或缺失 (null)，立即触发 10~30 分钟 (1,800,000ms) 的过载/限流冷冻与 fastMode 熔断；
+/// 2. 若 Retry-After < 20s (且非 null)，客户端执行快速原位重试循环 (Math.min(U$(...), 20000))。
+///
+/// 因此网关为 Claude 协议返回的 Retry-After 必须稳定收敛至 safe 范围 (默认 12s，兜底 8s)。
+pub fn clamp_retry_after_for_claude(sec: Option<u64>) -> u64 {
+    match sec {
+        Some(s) if s > 0 => s.clamp(1, 12),
+        _ => 8,
+    }
+}
+
+/// [Issue #3414 / #3634] 统一构造带有 X-Mapped-Model、可选 X-Account-Email 以及针对协议感知的 Retry-After HeaderMap
+pub fn build_token_error_headers_for_protocol<'a>(
+    protocol: &str,
     mapped_model: Option<&'a str>,
     account_email: Option<&'a str>,
     error_text: &str,
@@ -577,12 +646,29 @@ pub fn build_token_error_headers<'a>(
             headers.insert(HeaderName::from_static("x-account-email"), val);
         }
     }
-    if let Some(sec) = extract_retry_after_seconds(error_text) {
-        if let Ok(val) = HeaderValue::from_str(&sec.to_string()) {
+
+    let raw_sec = extract_retry_after_seconds(error_text);
+    let sec = if protocol == "claude" {
+        Some(clamp_retry_after_for_claude(raw_sec))
+    } else {
+        raw_sec
+    };
+
+    if let Some(s) = sec {
+        if let Ok(val) = HeaderValue::from_str(&s.to_string()) {
             headers.insert(axum::http::header::RETRY_AFTER, val);
         }
     }
     headers
+}
+
+/// [Issue #3414] 统一构造带有 X-Mapped-Model、可选 X-Account-Email 以及 Retry-After 的 HeaderMap (通用协议兼容)
+pub fn build_token_error_headers<'a>(
+    mapped_model: Option<&'a str>,
+    account_email: Option<&'a str>,
+    error_text: &str,
+) -> axum::http::HeaderMap {
+    build_token_error_headers_for_protocol("common", mapped_model, account_email, error_text)
 }
 
 /// 判定是否属于偶发性/瞬态 Token 获取错误（例如超时、锁争抢、系统繁忙）
@@ -891,6 +977,147 @@ mod retry_after_tests {
             extract_retry_after_seconds("All accounts failed or unhealthy."),
             None
         );
+    }
+
+    #[test]
+    fn test_clamp_retry_after_for_claude() {
+        assert_eq!(clamp_retry_after_for_claude(Some(45)), 12);
+        assert_eq!(clamp_retry_after_for_claude(Some(29)), 12);
+        assert_eq!(clamp_retry_after_for_claude(Some(1800)), 12);
+        assert_eq!(clamp_retry_after_for_claude(Some(5)), 5);
+        assert_eq!(clamp_retry_after_for_claude(Some(0)), 8);
+        assert_eq!(clamp_retry_after_for_claude(None), 8);
+    }
+
+    #[test]
+    fn test_calculate_adaptive_peek_timeout() {
+        // 1. 压缩摘要请求优先给予最宽限额 (180s)
+        assert_eq!(calculate_adaptive_peek_timeout(true, false, None), 180);
+        assert_eq!(
+            calculate_adaptive_peek_timeout(true, false, Some(10_000)),
+            180
+        );
+
+        // 2. 图像生成请求给予 60s
+        assert_eq!(calculate_adaptive_peek_timeout(false, true, None), 60);
+
+        // 3. 正常会话根据 token 规模自适应阶梯分配
+        assert_eq!(
+            calculate_adaptive_peek_timeout(false, false, Some(120_000)),
+            120
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout(false, false, Some(100_000)),
+            120
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout(false, false, Some(75_000)),
+            90
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout(false, false, Some(50_000)),
+            90
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout(false, false, Some(35_000)),
+            60
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout(false, false, Some(20_000)),
+            60
+        );
+        assert_eq!(
+            calculate_adaptive_peek_timeout(false, false, Some(10_000)),
+            30
+        );
+        assert_eq!(calculate_adaptive_peek_timeout(false, false, None), 30);
+    }
+
+    #[test]
+    fn test_503_529_backoff_is_tightly_bounded() {
+        // 多账号第一轮 (attempt < pool_size): 快速轮换 (50ms)
+        let s1 = determine_retry_strategy_adaptive(
+            529,
+            "The model is overloaded.",
+            None,
+            false,
+            true,
+            0,
+            3,
+        );
+        assert_eq!(s1, RetryStrategy::FixedDelay(Duration::from_millis(50)));
+
+        // 多账号第二轮 (attempt >= pool_size): 指数退避必须严格限制在 1s~4s 内，绝不死等 30s 阻塞客户端
+        let s2 = determine_retry_strategy_adaptive(
+            529,
+            "The model is overloaded.",
+            None,
+            false,
+            true,
+            3,
+            3,
+        );
+        match s2 {
+            RetryStrategy::ExponentialBackoff { base_ms, max_ms } => {
+                assert_eq!(base_ms, 1000);
+                assert_eq!(max_ms, 4000);
+            }
+            other => panic!("Expected ExponentialBackoff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_token_error_headers_for_protocol_claude() {
+        let headers_clamped = build_token_error_headers_for_protocol(
+            "claude",
+            Some("claude-3-7-sonnet"),
+            Some("test@example.com"),
+            "All accounts limited. Wait 45s.",
+        );
+        assert_eq!(
+            headers_clamped
+                .get("retry-after")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "12"
+        );
+
+        let headers_fallback = build_token_error_headers_for_protocol(
+            "claude",
+            Some("claude-3-7-sonnet"),
+            None,
+            "All accounts failed or unhealthy.",
+        );
+        // Claude 协议绝对不能缺少 retry-after，必须兜底下发 safe 范围秒数 (8s)
+        assert_eq!(
+            headers_fallback
+                .get("retry-after")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "8"
+        );
+
+        let headers_gemini = build_token_error_headers_for_protocol(
+            "gemini",
+            Some("gemini-2.5-pro"),
+            None,
+            "All accounts limited. Wait 45s.",
+        );
+        // Gemini / 通用协议如实下发原始提取值
+        assert_eq!(
+            headers_gemini.get("retry-after").unwrap().to_str().unwrap(),
+            "45"
+        );
+
+        let headers_gemini_no_wait = build_token_error_headers_for_protocol(
+            "gemini",
+            Some("gemini-2.5-pro"),
+            None,
+            "All accounts failed or unhealthy.",
+        );
+        assert!(headers_gemini_no_wait.get("retry-after").is_none());
     }
 
     #[test]

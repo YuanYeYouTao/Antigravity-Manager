@@ -998,7 +998,10 @@ pub fn transform_openai_request_with_session(
 
     // [FIX] Cap maxOutputTokens to prevent 400 Invalid Argument
     if let Some(val) = gen_config["maxOutputTokens"].as_i64() {
-        let safe_limit = if mapped_model_lower.contains("claude") {
+        let safe_limit = if mapped_model_lower.contains("5-5") || mapped_model_lower.contains("5.5")
+        {
+            128000
+        } else if mapped_model_lower.contains("claude") {
             64000
         } else if mapped_model_lower.contains("pro") {
             65535

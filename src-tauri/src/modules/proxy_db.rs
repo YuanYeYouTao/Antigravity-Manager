@@ -392,6 +392,10 @@ pub fn init_db() -> Result<(), String> {
         "ALTER TABLE request_logs ADD COLUMN cached_tokens INTEGER",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN account_email TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN mapped_model TEXT", []);
     let _ = conn.execute("ALTER TABLE request_logs ADD COLUMN protocol TEXT", []);
@@ -509,15 +513,16 @@ fn map_request_log_row(row: &rusqlite::Row) -> rusqlite::Result<ProxyRequestLog>
         input_tokens: row.get(11).unwrap_or(None),
         output_tokens: row.get(12).unwrap_or(None),
         cached_tokens: row.get(13).unwrap_or(None),
-        account_email: row.get(14).unwrap_or(None),
-        mapped_model: row.get(15).unwrap_or(None),
-        protocol: row.get(16).unwrap_or(None),
-        client_ip: row.get(17).unwrap_or(None),
-        username: row.get(18).unwrap_or(None),
-        request_headers: row.get(19).unwrap_or(None),
-        upstream_request_headers: row.get(20).unwrap_or(None),
-        response_headers: row.get(21).unwrap_or(None),
-        session_id: row.get(22).unwrap_or(None),
+        reasoning_tokens: row.get(14).unwrap_or(None),
+        account_email: row.get(15).unwrap_or(None),
+        mapped_model: row.get(16).unwrap_or(None),
+        protocol: row.get(17).unwrap_or(None),
+        client_ip: row.get(18).unwrap_or(None),
+        username: row.get(19).unwrap_or(None),
+        request_headers: row.get(20).unwrap_or(None),
+        upstream_request_headers: row.get(21).unwrap_or(None),
+        response_headers: row.get(22).unwrap_or(None),
+        session_id: row.get(23).unwrap_or(None),
     })
 }
 
@@ -1256,15 +1261,35 @@ pub fn delete_thinking_records_except_fingerprints(
     .map_err(|e| e.to_string())
 }
 
+pub fn delete_tool_signatures_for_session(session_key: &str) -> Result<usize, String> {
+    let clean_key = session_key.trim();
+    if clean_key.is_empty() {
+        return Ok(0);
+    }
+    let conn = connect_db()?;
+    let p1 = format!("{clean_key}\u{1f}%");
+    let p2 = format!("%:{clean_key}\u{1f}%");
+    conn.execute(
+        "DELETE FROM tool_signatures WHERE tool_id LIKE ?1 OR tool_id LIKE ?2",
+        params![p1, p2],
+    )
+    .map_err(|e| e.to_string())
+}
+
 pub fn delete_thinking_records_for_session(session_key: &str) -> Result<usize, String> {
+    let clean = session_key.trim();
+    if clean.is_empty() {
+        return Ok(0);
+    }
     let conn = thinking_db()?;
+    let suffix = format!("%:{}", clean);
     let _ = conn.execute(
-        "DELETE FROM thinking_sessions WHERE session_key = ?1",
-        params![session_key],
+        "DELETE FROM thinking_sessions WHERE session_key = ?1 OR session_key LIKE ?2",
+        params![clean, suffix],
     );
     conn.execute(
-        "DELETE FROM thinking_records WHERE session_key = ?1",
-        params![session_key],
+        "DELETE FROM thinking_records WHERE session_key = ?1 OR session_key LIKE ?2",
+        params![clean, suffix],
     )
     .map_err(|e| e.to_string())
 }
@@ -1699,8 +1724,8 @@ fn save_log_with_connection(
     make_room(conn, budget, log_bytes)?;
 
     conn.execute(
-        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, upstream_request_body, response_body, input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username, request_headers, upstream_request_headers, response_headers, session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+        "INSERT INTO request_logs (id, timestamp, method, url, status, duration, model, error, request_body, upstream_request_body, response_body, input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username, request_headers, upstream_request_headers, response_headers, session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
         params![
             log.id,
             log.timestamp,
@@ -1716,6 +1741,7 @@ fn save_log_with_connection(
             log.input_tokens,
             log.output_tokens,
             log.cached_tokens,
+            log.reasoning_tokens,
             log.account_email,
             log.mapped_model,
             log.protocol,
@@ -1739,7 +1765,7 @@ pub fn get_logs_summary(limit: usize, offset: usize) -> Result<Vec<ProxyRequestL
         .prepare(
             "SELECT id, timestamp, method, url, status, duration, model, substr(error, 1, 1024),
                 NULL as request_body, NULL as upstream_request_body, NULL as response_body,
-                input_tokens, output_tokens, cached_tokens, account_email, mapped_model, protocol, client_ip, username,
+                input_tokens, output_tokens, cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 NULL as request_headers, NULL as upstream_request_headers, NULL as response_headers,
                 session_id
          FROM request_logs 
@@ -1796,7 +1822,7 @@ pub fn get_log_detail(log_id: &str) -> Result<ProxyRequestLog, String> {
         .prepare(
             "SELECT id, timestamp, method, url, status, duration, model, error,
                 request_body, upstream_request_body, response_body, input_tokens, output_tokens,
-                cached_tokens, account_email, mapped_model, protocol, client_ip, username,
+                cached_tokens, reasoning_tokens, account_email, mapped_model, protocol, client_ip, username,
                 request_headers, upstream_request_headers, response_headers,
                 session_id
          FROM request_logs
@@ -2215,6 +2241,92 @@ mod thinking_sqlite_tests {
             )
             .unwrap();
         assert_eq!(sig_in_db, expected_base64);
+    }
+
+    #[test]
+    fn test_delete_session_signatures_and_thinking_records_multi_tenant() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+
+        let sig = "EiYKJGUyNDgzMGE3LTVjZDYtNDJmZS05OThiLWVlNTM5ZTcyYjljMw==";
+
+        // 1. 准备多租户会话的思考记录
+        save_thinking_record(
+            "tenant_a:sess-compact",
+            "fp_1",
+            "thought 1",
+            Some(sig),
+            &[],
+            &[],
+            "vis 1",
+        )
+        .unwrap();
+        save_thinking_record(
+            "sess-compact",
+            "fp_2",
+            "thought 2",
+            Some(sig),
+            &[],
+            &[],
+            "vis 2",
+        )
+        .unwrap();
+        save_thinking_record(
+            "tenant_b:sess-other",
+            "fp_3",
+            "thought 3",
+            Some(sig),
+            &[],
+            &[],
+            "vis 3",
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_thinking_records("tenant_a:sess-compact")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(load_thinking_records("sess-compact").unwrap().len(), 1);
+        assert_eq!(
+            load_thinking_records("tenant_b:sess-other").unwrap().len(),
+            1
+        );
+
+        // 2. 准备会话作用域 tool_signatures
+        let scoped_key1 = format!("sess-compact\u{1f}call_1");
+        let scoped_key2 = format!("tenant_a:sess-compact\u{1f}call_2");
+        let scoped_key3 = format!("sess-other\u{1f}call_3");
+        save_tool_signature(&scoped_key1, sig).unwrap();
+        save_tool_signature(&scoped_key2, sig).unwrap();
+        save_tool_signature(&scoped_key3, sig).unwrap();
+
+        assert!(load_tool_signature(&scoped_key1).unwrap().is_some());
+        assert!(load_tool_signature(&scoped_key2).unwrap().is_some());
+        assert!(load_tool_signature(&scoped_key3).unwrap().is_some());
+
+        // 3. 执行 delete_tool_signatures_for_session("sess-compact")
+        let deleted_tools = delete_tool_signatures_for_session("sess-compact").unwrap();
+        assert_eq!(deleted_tools, 2);
+        assert!(load_tool_signature(&scoped_key1).unwrap().is_none());
+        assert!(load_tool_signature(&scoped_key2).unwrap().is_none());
+        assert!(load_tool_signature(&scoped_key3).unwrap().is_some());
+
+        // 4. 执行 delete_thinking_records_for_session("sess-compact") 支持租户前缀匹配
+        let deleted_records = delete_thinking_records_for_session("sess-compact").unwrap();
+        assert_eq!(deleted_records, 2);
+        assert_eq!(
+            load_thinking_records("tenant_a:sess-compact")
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(load_thinking_records("sess-compact").unwrap().len(), 0);
+        assert_eq!(
+            load_thinking_records("tenant_b:sess-other").unwrap().len(),
+            1
+        );
     }
 }
 

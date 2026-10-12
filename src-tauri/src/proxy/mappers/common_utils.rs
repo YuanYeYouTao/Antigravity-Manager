@@ -1930,18 +1930,14 @@ pub fn wrap_in_system_reminder(content: &str) -> String {
     )
 }
 
-/// [DEFENSE] 报文结构保底文本。只补一个中性短句，不引导模型进入分析或改代码。
-pub const TRANSIT_DEFENSE_FALLBACK_TEXT: &str = "ok go on";
+/// [DEFENSE] 报文结构保底文本。只补一个惰性标点，不引导模型进入分析或改代码，防止破坏 AI Agent 确认状态机 (Fixes #3629)。
+pub const TRANSIT_DEFENSE_FALLBACK_TEXT: &str = ".";
 
-/// [DEFENSE] 通用中转报文保底防御节点（协议无关性）
-/// 确保发给 Google Gemini 的报文末尾轮次严格符合规范：
+/// 补齐空 Gemini parts，不添加模型尾轮之后的合成用户消息。
 /// 1. 自动兼容平铺 payload 或包含 "request" 包装的 payload；
 /// 2. 若 contents 为空，追加 {"role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]}；
-/// 3. 若末尾轮次为 "model"（缺失用户轮次），追加 {"role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]}；
-///    例外：末尾 model 轮若携带 functionCall / functionResponse（模型主动发起的工具轮），
-///    视为合法中间态，不注入（否则会与 normalize_function_response_roles 的 fr@model 对齐
-///    打架，把官方合法报文误判为缺用户轮，注入中性占位造成工具死循环）；
-/// 4. 若末尾轮次为 "user" 且其 parts 为空、或仅含有空文本 / "(no content)" / "·" 且无工具/图片，规范化填充为 [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]；
+/// 3. model/assistant 尾轮原样保留；
+/// 4. 末尾用户轮次只补空内容，保留所有非空文本；
 /// 5. 修复中间轮次中 parts 为空的情况，防止 Google 返回 400 "parts must not be empty"。
 pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
     let contents = if let Some(contents) = body
@@ -1987,16 +1983,9 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
         }
     }
 
-    // 防御 3: 检查末尾轮次。
-    // Google Gemini 严格禁止请求以 model/assistant 轮次结尾（上游抛出 400 "Requests ending with a model turn are not supported"）。
-    // 进站流水线 normalize_function_response_roles 在 Gemini 目标下会将工具回执对齐为 role=model，
-    // 若客户端（如 Claude Code CLI）在工具执行完后发送的消息列表以回执收尾（或尾部空 system-reminder 被剥离），
-    // 必须在此处为末尾 model 轮（无论含有文本、functionCall 还是 functionResponse）追加中性合规的 user 兜底轮，彻底杜绝 400 校验终止。
-    let need_append_user = if let Some(last_turn) = contents.last_mut() {
+    if let Some(last_turn) = contents.last_mut() {
         let role = last_turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        if role == "model" || role == "assistant" {
-            true
-        } else {
+        if role != "model" && role != "assistant" {
             if let Some(parts) = last_turn.get_mut("parts").and_then(|p| p.as_array_mut()) {
                 let has_substantive_part = parts.iter().any(|part| {
                     if part.get("functionCall").is_some()
@@ -2008,7 +1997,7 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
                     }
                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                         let t = text.trim();
-                        !t.is_empty() && t != "(no content)" && t != "·"
+                        !t.is_empty()
                     } else {
                         false
                     }
@@ -2023,22 +2012,7 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
                     modified = true;
                 }
             }
-            false
         }
-    } else {
-        false
-    };
-
-    if need_append_user {
-        tracing::warn!(
-            "[Defense] Gemini payload ended with model turn, appending user turn with '{}'",
-            TRANSIT_DEFENSE_FALLBACK_TEXT
-        );
-        contents.push(json!({
-            "role": "user",
-            "parts": [{ "text": TRANSIT_DEFENSE_FALLBACK_TEXT }]
-        }));
-        modified = true;
     }
 
     modified
@@ -2087,6 +2061,7 @@ mod defense_tests {
 
     #[test]
     fn test_ensure_gemini_payload_ends_with_user_model_ending() {
+        // [谷歌新规则报文变动，暂时废弃] 允许末尾为 model 轮次，不再追加 user 垫片
         let mut payload = json!({
             "request": {
                 "contents": [
@@ -2095,30 +2070,22 @@ mod defense_tests {
                 ]
             }
         });
-        assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+        assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
         let contents = payload["request"]["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 3);
-        assert_eq!(contents[2]["role"], "user");
-        assert_eq!(
-            contents[2]["parts"][0]["text"],
-            TRANSIT_DEFENSE_FALLBACK_TEXT
-        );
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[1]["role"], "model");
     }
 
     #[test]
     fn test_ensure_gemini_payload_ends_with_user_no_content() {
-        let mut payload = json!({
-            "contents": [
-                { "role": "user", "parts": [{ "text": "(no content)" }] }
-            ]
-        });
-        assert!(ensure_gemini_payload_ends_with_user(&mut payload));
-        let contents = payload["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 1);
-        assert_eq!(
-            contents[0]["parts"][0]["text"],
-            TRANSIT_DEFENSE_FALLBACK_TEXT
-        );
+        for text in ["(no content)", "·"] {
+            let mut payload = json!({
+                "contents": [{ "role": "user", "parts": [{ "text": text }] }]
+            });
+            let original = payload.clone();
+            assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+            assert_eq!(payload, original);
+        }
     }
 
     #[test]
@@ -2135,8 +2102,7 @@ mod defense_tests {
 
     #[test]
     fn test_ensure_gemini_payload_ends_with_user_tool_turn_injected() {
-        // 末尾 model 轮无论是工具轮（functionCall / functionResponse）还是纯正文，
-        // 均注入中性合规 user 引导轮，防御 Google Gemini 400 'Requests ending with a model turn are not supported'。
+        // [谷歌新规则报文变动，暂时废弃] 末尾 model 轮（含工具轮与纯正文）均允许保留，不再注入假用户轮
         let mut payload = json!({
             "contents": [
                 { "role": "user", "parts": [{ "text": "run the tool" }] },
@@ -2156,26 +2122,22 @@ mod defense_tests {
                 }
             ]
         });
-        assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+        assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
         let contents = payload["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 3);
-        assert_eq!(contents[2]["role"], "user");
-        assert_eq!(
-            contents[2]["parts"][0]["text"],
-            TRANSIT_DEFENSE_FALLBACK_TEXT
-        );
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[1]["role"], "model");
 
-        // 末尾 model 轮为纯正文（非工具轮）→ 同样注入
+        // 末尾 model 轮为纯正文（非工具轮）→ 同样允许保留
         let mut payload2 = json!({
             "contents": [
                 { "role": "user", "parts": [{ "text": "hello" }] },
                 { "role": "model", "parts": [{ "text": "hi there" }] }
             ]
         });
-        assert!(ensure_gemini_payload_ends_with_user(&mut payload2));
+        assert!(!ensure_gemini_payload_ends_with_user(&mut payload2));
         let contents2 = payload2["contents"].as_array().unwrap();
-        assert_eq!(contents2.len(), 3);
-        assert_eq!(contents2[2]["role"], "user");
+        assert_eq!(contents2.len(), 2);
+        assert_eq!(contents2[1]["role"], "model");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 target/
 node_modules/
 .git/
+.cache/
 src-tauri/target/
 src-tauri/bin/
 *.deb

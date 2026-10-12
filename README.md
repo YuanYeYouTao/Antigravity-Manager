@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v4.9.1)
+> Professional Account Management & Protocol Proxy System for AI Services (v4.9.4)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.9.1-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.9.4-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -301,11 +301,17 @@ env WEBKIT_DISABLE_DMABUF_RENDERER=1 ANTIGRAVITY_FORCE_WAYLAND=1 antigravity-too
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
 export ANTHROPIC_API_KEY="sk-antigravity"
-jeikcode --model claude-sonnet-4-6-thinking
+jeikcode --model claude-sonnet-4-6
 ```
 > For complete manual configuration and tuning, see the [JeikCode Integration Guide](./docs/jeikcode_integration.md).
 
 ### How to use with Claude Code CLI?
+> **Recommended Client Versions**:
+> - **Stable Production Recommendation**: `Claude Code v2.1.28x` (more permissive stream termination verification, highest resilience under network jitter);
+> - **Latest Versions Support**: `Claude Code v2.1.293 ~ v2.1.295` (requires deploying the gateway version with stream hang prevention and keepalive optimizations, see [Diagnosis Guide](./docs/CLAUDE_CODE_STREAM_DIAGNOSIS.md)).
+> 
+> Install recommended stable version: `npm install -g @anthropic-ai/claude-code@2.1.284`
+
 1. Start Antigravity service in the "API Proxy" tab.
 2. In your terminal:
 ```bash
@@ -487,7 +493,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v4.9.1** (2026-10-02): Fixed `gemini-3.1-flash-lite` misrouting to the retired 2.5 family to restore healthy 200 OK passthrough, revived Layer-3 background compression, purged dead 2.5 models from advertised catalogs while routing legacy requests to `gemini-3.6-flash-medium` (Fixes #3577, thanks to @Xyloz3n); tightened downstream SSE thinking heartbeats to 3s to prevent client disconnects during deep reasoning (PR #3578, thanks to @EricZhou05).
+> Latest version **v4.9.4** (2026-10-04): Introduced an adaptive thinking budget negotiation state machine with user-intent recognition, eliminating early return bypasses to fundamentally resolve Google 400 violations caused by `maxOutputTokens <= thinkingBudget`; pioneered 6x ratio fast & concise intent recognition (automatically compressing thinking budget when `t >= 6 * m` to avoid lengthy reasoning on quick queries), while intelligently expanding output budgets during deep reasoning when official capacities allow to preserve model IQ, and clamping to 1024 output tokens as an ultimate physical ceiling fallback (PR #3599, thanks to @cubelikeplayDaniel); inherits 4.9.3's robust HTTP/2 architecture and native Chrome 123 baseline to end long-task dropouts.
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

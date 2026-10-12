@@ -36,6 +36,7 @@ mod tests {
             protected_models: protected_models.iter().map(|s| s.to_string()).collect(),
             health_score: 1.0,
             reset_time: None,
+            weekly_reset_time: None,
             validation_blocked: false,
             validation_blocked_until: 0,
             validation_url: None,
@@ -1104,11 +1105,33 @@ mod tests {
             protected_models: protected_models.iter().map(|s| s.to_string()).collect(),
             health_score: 1.0,
             reset_time: None,
+            weekly_reset_time: None,
             validation_blocked: false,
             validation_blocked_until: 0,
             validation_url: None,
             model_quotas: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
         }
+    }
+
+    #[test]
+    fn test_issue_3506_claude_v5_and_legacy_normalize_to_claude() {
+        // 验证 Claude 5.x 以及全部子系列均归一化为统一的 claude 保护组
+        assert_eq!(
+            normalize_to_standard_id("claude-opus-5-5-medium"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            normalize_to_standard_id("claude-sonnet-5-5-high"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            normalize_to_standard_id("claude-haiku-4-5"),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            normalize_to_standard_id("claude-fable-5"),
+            Some("claude".to_string())
+        );
     }
 }

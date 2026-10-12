@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.9.1)
+> 专业级 AI 账号管理与协议代理系统 (v4.9.4)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.9.1-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.9.4-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -302,11 +302,17 @@ env WEBKIT_DISABLE_DMABUF_RENDERER=1 ANTIGRAVITY_FORCE_WAYLAND=1 antigravity-too
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
 export ANTHROPIC_API_KEY="sk-antigravity"
-jeikcode --model claude-sonnet-4-6-thinking
+jeikcode --model claude-sonnet-4-6
 ```
 > 更多高级配置与排查指南参见：[JeikCode 接入 Antigravity-Manager 指南](./docs/jeikcode_integration.md)
 
 ### 如何接入 Claude Code CLI?
+> **客户端推荐版本说明**：
+> - **稳定生产推荐**：`Claude Code v2.1.28x`（流完成校验相对宽松，网络抖动下鲁棒性最高）；
+> - **最新版本支持**：`Claude Code v2.1.293 ~ v2.1.295`（须配合部署包含断流防挂起与保活优化的网关版本，详见 [排查诊断文档](./docs/CLAUDE_CODE_STREAM_DIAGNOSIS.md)）。
+> 
+> 安装指定稳定版本示例：`npm install -g @anthropic-ai/claude-code@2.1.284`
+
 1.  启动 Antigravity，并在“API 反代”页面开启服务。
 2.  在终端执行：
 ```bash
@@ -488,7 +494,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v4.9.1**（2026-10-02）：修复 `gemini-3.1-flash-lite` 误重定向至已故 2.5 系列导致 503 报错的严重问题并恢复健康直传，将后台摘要压缩任务重定向至存活轻量模型，从公开目录清理 2.5 全系列并平滑重定向至 `gemini-3.6-flash-medium`（Fixes #3577，感谢 @Xyloz3n）；收紧下游 SSE 流式思考心跳至 3 秒防止长推理提前断开连接（PR #3578，感谢 @EricZhou05）。
+> 最新版本 **v4.9.4**（2026-10-04）：引入自适应思考预算协商状态机与意图识别架构，废除过早 return 旁路，从协议根源上彻底解决 `maxOutputTokens <= thinkingBudget` 引发的 Google 400 违背报错；首创 6 倍反差极速意图识别（当思考预算 `t >= 6 * m` 时自动压缩预算秒回，杜绝轻量问答被深度思考拖慢），常规深度推理在官方容量足够时优先智能扩充总输出预算以保全用户思考智商，超大预算触顶时收敛留出 1024 正文空间兜底（PR #3599，感谢 @cubelikeplayDaniel）；全面继承 4.9.3 底层 HTTP/2 稳态重构与 Chrome 123 基线回归，终结长任务自杀断流。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

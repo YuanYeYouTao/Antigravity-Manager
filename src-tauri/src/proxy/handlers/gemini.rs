@@ -490,6 +490,8 @@ pub async fn handle_generate(
 
         if status.is_success() {
             token_manager.commit_session(&affinity_key, &account_id);
+            // [智能限流] 请求成功，重置该账号的连续失败计数
+            token_manager.mark_account_success(&account_id);
             // 6. 响应处理
             if is_stream {
                 use axum::body::Body;
@@ -680,9 +682,9 @@ pub async fn handle_generate(
                         buffer.extend_from_slice(&bytes);
                         while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
                             let line_raw = buffer.split_to(pos + 1);
-                            if let Ok(line_str) = std::str::from_utf8(&line_raw) {
-                                let line = line_str.trim();
-                                if line.is_empty() { continue; }
+                            let line_str = String::from_utf8_lossy(&line_raw);
+                            let line = line_str.trim();
+                            if line.is_empty() { continue; }
 
                                 if line.starts_with("data: ") {
                                     let json_part = line.trim_start_matches("data: ").trim();
@@ -763,11 +765,6 @@ pub async fn handle_generate(
                                     // Non-data lines (comments, etc.)
                                     yield Ok::<Bytes, String>(Bytes::from(format!("{}\n\n", line)));
                                 }
-                            } else {
-                                // Non-UTF8 data? Just pass it through or skip
-                                debug!("[Gemini-SSE] Non-UTF8 line encountered");
-                                yield Ok::<Bytes, String>(line_raw.freeze());
-                            }
                         }
                     }
 
@@ -817,11 +814,39 @@ pub async fn handle_generate(
                     .await
                     {
                         Ok(gemini_resp) => {
+                            let unwrapped = unwrap_response(&gemini_resp);
+                            if let Some(error_obj) = unwrapped.get("error") {
+                                let code = error_obj
+                                    .get("code")
+                                    .and_then(|c| c.as_u64())
+                                    .unwrap_or(500)
+                                    as u16;
+                                let status_code = StatusCode::from_u16(code)
+                                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                                warn!(
+                                    "[{}] Stream collection received error in stream (status {}): {:?}",
+                                    session_id, status_code, error_obj
+                                );
+                                return Ok(Response::builder()
+                                    .status(status_code)
+                                    .header("Content-Type", "application/json")
+                                    .header("X-Account-Email", &email)
+                                    .header("X-Mapped-Model", &mapped_model)
+                                    .header("X-Session-Id", &client_session_id)
+                                    .header("X-Antigravity-Session-Id", &client_session_id)
+                                    .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                    .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                    .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                    .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                    .body(Body::from(serde_json::to_string(&unwrapped).unwrap()))
+                                    .unwrap()
+                                    .into_response());
+                            }
+
                             info!(
                                 "[{}] ✓ Stream collected and converted to JSON (Gemini)",
                                 session_id
                             );
-                            let unwrapped = unwrap_response(&gemini_resp);
                             return Ok(Response::builder()
                                 .status(StatusCode::OK)
                                 .header("Content-Type", "application/json")
@@ -839,10 +864,22 @@ pub async fn handle_generate(
                         }
                         Err(e) => {
                             error!("Stream collection error: {}", e);
-                            return Ok((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
+                            let error_json = serde_json::json!({
+                                "error": {
+                                    "code": 500,
+                                    "message": format!("Stream collection error: {}", e),
+                                    "status": "INTERNAL"
+                                }
+                            });
+                            return Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .header("Content-Type", "application/json")
+                                .header("X-Account-Email", &email)
+                                .header("X-Mapped-Model", &mapped_model)
+                                .header("X-Session-Id", &client_session_id)
+                                .header("X-Antigravity-Session-Id", &client_session_id)
+                                .body(Body::from(serde_json::to_string(&error_json).unwrap()))
+                                .unwrap()
                                 .into_response());
                         }
                     }
@@ -1030,8 +1067,21 @@ pub async fn handle_generate(
         }
 
         if classification.is_model_not_found() {
+            // [NEW] 针对特定账号记录单模型临时熔断（例如该 PRO 账号未开通 Claude 5.5），绝不连坐其他模型
+            token_manager.mark_model_unsupported(&account_id, &mapped_model, Some(900));
+
+            // 如果账号池中还有其他未尝试的候选账号，则顺畅换号重试，而不是直接放弃报错
+            if attempt < pool_size {
+                tracing::warn!(
+                    "[Gemini] 上游报错模型不可用 (HTTP {})，已标记账号 {} 对模型 [{}] 临时熔断，继续换号重试 ({}/{})...",
+                    status_code, email, mapped_model, attempt, pool_size
+                );
+                force_rotate = true;
+                continue;
+            }
+
             tracing::warn!(
-                "[Gemini] Target model [{}] not found on upstream (HTTP {}). Terminating retry loop without account lockout.",
+                "[Gemini] Target model [{}] not found on upstream (HTTP {}). Pool exhausted without account-level lockout.",
                 mapped_model, status_code
             );
             let dual_err = crate::proxy::handlers::common::build_dual_track_error(
