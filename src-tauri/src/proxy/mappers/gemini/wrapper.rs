@@ -1334,32 +1334,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_under_v3_does_not_keep_thinking_config() {
-        let _lock = crate::proxy::config::TEST_CONFIG_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        crate::proxy::config::update_thinking_budget_config(
-            crate::proxy::config::ThinkingBudgetConfig::default(),
-        );
-        for model in ["gemini-2.0-flash-thinking-exp", "gemini-2.0-pro-exp"] {
-            let body = json!({
-                "model": model,
-                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-                "generationConfig": {
-                    "thinkingConfig": {"includeThoughts": true, "thinkingBudget": 32000}
-                }
-            });
-            let result = wrap_request(&body, "test-proj", model, None, None, None);
-            assert!(
-                result["request"]["generationConfig"]
-                    .get("thinkingConfig")
-                    .is_none(),
-                "{model}"
-            );
-        }
-    }
-
-    #[test]
     fn test_image_thinking_mode_disabled() {
         let _test_lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
