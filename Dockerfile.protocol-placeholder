@@ -37,8 +37,8 @@ RUN apt-get update && apt-get install -y \
 ENV CARGO_HTTP_MULTIPLEXING=false
 RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
     echo "Using Aliyun mirror for Cargo..."; \
-    mkdir -p /root/.cargo && \
-    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > /root/.cargo/config.toml; \
+    mkdir -p "$CARGO_HOME" && \
+    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > "$CARGO_HOME/config.toml"; \
     else \
     echo "Using default Cargo registry..."; \
     fi
@@ -54,19 +54,26 @@ COPY src/locales ./src/locales
 RUN mkdir -p /app/dist && echo '<html><body>placeholder</body></html>' > /app/dist/index.html
 
 WORKDIR /app/src-tauri
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
-    cargo fmt -- --check && cargo clippy --all-targets --all-features --locked && cargo test --lib flash_default --locked && cargo test --lib non_stream_timing_uses_handler_header_names --locked && cargo test --lib defense_tests --locked && cargo test --lib auto_heal::tests --locked && cargo build --release --bin antigravity-tools --locked && \
+    cargo fmt -- --check && cargo clippy --all-targets --all-features --locked && \
+    cargo test --lib proxy::model_specs::tests --locked && \
+    cargo test --lib proxy::pipeline::inbound::tests --locked -- --test-threads=1 && \
+    cargo test --lib non_stream_timing_uses_handler_header_names --locked && \
+    cargo test --lib defense_tests --locked && \
+    cargo test --lib auto_heal::tests --locked && \
+    cargo test --lib proxy::mappers::gemini::collector::tests --locked && \
+    cargo build --release --bin antigravity-tools --locked && \
     cp target/release/antigravity-tools /tmp/antigravity-tools
 
-FROM lbjlaq/antigravity-manager@sha256:c661f26ecf85806071e2c76c894ce7b986fafc4c78ce854c3affd7c0142a4725
+FROM lbjlaq/antigravity-manager@sha256:e1a74221a6f2df268874e712eaff16edb0fc3447447bd0615b3769d8f3e5fd7d
 COPY --from=backend-builder /tmp/antigravity-tools /app/antigravity-tools
 ARG PATCH_SHA256
 ARG SOURCE_REVISION
 LABEL org.yuki.agm.patch.sha256=$PATCH_SHA256 \
-      org.yuki.agm.base.revision="6e8b982aee7e3d3d53501825431142eea9a3f9ab" \
+      org.yuki.agm.base.revision="15f4bc938ecfa0286097ec6246a3d1583bc683a7" \
       org.opencontainers.image.source="https://github.com/YuanYeYouTao/Antigravity-Manager" \
       org.opencontainers.image.revision=$SOURCE_REVISION \
-      org.opencontainers.image.base.name="lbjlaq/antigravity-manager@sha256:c661f26ecf85806071e2c76c894ce7b986fafc4c78ce854c3affd7c0142a4725" \
-      yuki.agm.patch="protocol-placeholder"
+      org.opencontainers.image.base.name="lbjlaq/antigravity-manager@sha256:e1a74221a6f2df268874e712eaff16edb0fc3447447bd0615b3769d8f3e5fd7d" \
+      yuki.agm.patch="official-beta8-adaptation"

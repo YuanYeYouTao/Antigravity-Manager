@@ -19,6 +19,8 @@ interface ThinkingBudgetProps {
     onThinkingMaxMemoryTurnsChange?: (turns: number) => void;
     thinkingRetentionDays?: number;
     onThinkingRetentionDaysChange?: (days: number) => void;
+    globalCompactionStripEnabled?: boolean;
+    onGlobalCompactionStripChange?: (enabled: boolean) => void;
 }
 
 interface ConcurrencyGuidePreset {
@@ -76,26 +78,26 @@ const CONCURRENCY_GUIDE_PRESETS: ConcurrencyGuidePreset[] = [
 const DEFAULT_CONFIG: ThinkingBudgetConfig = {
     control_source: "gateway",
     flash_mode: "custom",
-    flash_low: 1024,
-    flash_medium: 4096,
+    flash_low: -1,
+    flash_medium: -1,
     flash_high: -1,
     flash_tiered: -1,
 
     pro_mode: "custom",
-    pro_low: 1001,
-    pro_high: 10001,
+    pro_low: -1,
+    pro_high: -1,
 
     claude_mode: "custom",
-    claude_budget: 16384,
-    claude_low: 1024,
-    claude_medium: 4096,
-    claude_high: 16384,
+    claude_budget: -1,
+    claude_low: -1,
+    claude_medium: -1,
+    claude_high: -1,
 
     mode: "custom",
-    custom_value: 24576,
-    custom_low: 1024,
-    custom_medium: 4096,
-    custom_high: 16384,
+    custom_value: -1,
+    custom_low: -1,
+    custom_medium: -1,
+    custom_high: -1,
     custom_tiered: -1,
 };
 
@@ -112,16 +114,16 @@ type BudgetFieldKey =
     | "claude_high";
 
 const BUDGET_DEFAULTS: Record<BudgetFieldKey, number> = {
-    flash_low: 1024,
-    flash_medium: 4096,
+    flash_low: -1,
+    flash_medium: -1,
     flash_high: -1,
     flash_tiered: -1,
-    pro_low: 1001,
-    pro_high: 10001,
-    claude_budget: 16384,
-    claude_low: 1024,
-    claude_medium: 4096,
-    claude_high: 16384,
+    pro_low: -1,
+    pro_high: -1,
+    claude_budget: -1,
+    claude_low: -1,
+    claude_medium: -1,
+    claude_high: -1,
 };
 
 export default function ThinkingBudget({
@@ -134,6 +136,8 @@ export default function ThinkingBudget({
     onThinkingMaxMemoryTurnsChange,
     thinkingRetentionDays = 15,
     onThinkingRetentionDaysChange,
+    globalCompactionStripEnabled = false,
+    onGlobalCompactionStripChange,
 }: ThinkingBudgetProps) {
     const { t } = useTranslation();
     const [isSaving, setIsSaving] = useState(false);
@@ -227,12 +231,6 @@ export default function ThinkingBudget({
         onChange({
             ...currentConfig,
             flash_mode: mode,
-        });
-    };
-
-    const handleProModeChange = (mode: ThinkingBudgetMode) => {
-        onChange({
-            ...currentConfig,
             pro_mode: mode,
         });
     };
@@ -259,10 +257,16 @@ export default function ThinkingBudget({
         if (trimmed !== "" && trimmed !== "-") {
             const parsed = parseInt(trimmed, 10);
             if (!isNaN(parsed)) {
-                onChange({
+                const nextConfig = {
                     ...currentConfig,
                     [field]: parsed,
-                });
+                };
+                if (field === "flash_low") {
+                    nextConfig.pro_low = parsed;
+                } else if (field === "flash_high") {
+                    nextConfig.pro_high = parsed;
+                }
+                onChange(nextConfig);
             }
         }
     };
@@ -385,7 +389,13 @@ export default function ThinkingBudget({
                         title={getPresetTooltip(val)}
                         onClick={() => {
                             setInputValues((prev) => ({ ...prev, [field]: String(val) }));
-                            onChange({ ...currentConfig, [field]: val });
+                            const nextConfig = { ...currentConfig, [field]: val };
+                            if (field === "flash_low") {
+                                nextConfig.pro_low = val;
+                            } else if (field === "flash_high") {
+                                nextConfig.pro_high = val;
+                            }
+                            onChange(nextConfig);
                         }}
                         className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold transition-all cursor-pointer ${
                             currentVal === val
@@ -461,6 +471,36 @@ export default function ThinkingBudget({
                         className="toggle toggle-sm toggle-primary shrink-0"
                         checked={thinkingStoreEnabled}
                         onChange={(e) => onThinkingStoreChange(e.target.checked)}
+                    />
+                </div>
+            )}
+
+            {/* 0.1 全局压缩剥离签名 (Global Compaction Signature Stripping) */}
+            {onGlobalCompactionStripChange && (
+                <div className="p-3.5 bg-amber-50/70 dark:bg-amber-900/20 border border-amber-200/80 dark:border-amber-800/40 rounded-xl flex items-center justify-between gap-4 shadow-2xs">
+                    <div className="space-y-0.5">
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs font-bold text-gray-900 dark:text-white">
+                                {t("proxy.config.thinking_budget.global_compaction_strip", { defaultValue: "全局压缩剥离签名" })}
+                            </span>
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800/60">
+                                {t("proxy.config.thinking_budget.experimental_tag", { defaultValue: "试验性" })}
+                            </span>
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 border border-gray-200 dark:border-gray-700">
+                                {t("proxy.config.thinking_budget.default_off_tag", { defaultValue: "默认关闭" })}
+                            </span>
+                        </div>
+                        <p className="text-xs text-gray-600 dark:text-gray-300 max-w-xl leading-relaxed">
+                            {t("proxy.config.thinking_budget.global_compaction_strip_desc", {
+                                defaultValue: "默认情况下保持关闭，仅对 Claude Code CLI 与 Desktop (Cowork) 的特定压缩特征触发签名剥离。开启后全局生效（协议无关、客户端无关），自动识别会话上下文回落与就地折叠，隔离失效签名并以官方哨兵锁定。"
+                            })}
+                        </p>
+                    </div>
+                    <input
+                        type="checkbox"
+                        className="toggle toggle-sm toggle-warning shrink-0"
+                        checked={globalCompactionStripEnabled}
+                        onChange={(e) => onGlobalCompactionStripChange(e.target.checked)}
                     />
                 </div>
             )}
@@ -786,13 +826,13 @@ export default function ThinkingBudget({
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 dark:border-base-200 pb-2.5">
                             <div>
                                 <span className="text-xs font-bold text-gray-900 dark:text-white">
-                                    {t("proxy.config.thinking_budget.flash_family_title", {
-                                        defaultValue: "Gemini Flash ≥ 3.0 系列 (如 3-flash, 3.7-flash, 3.8-flash, tiered 等)",
+                                    {t("proxy.config.thinking_budget.gemini_family_title", {
+                                        defaultValue: "Gemini 系列 (如 Flash, Pro, Tiered 等)",
                                     })}
                                 </span>
                                 <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                                    {t("proxy.config.thinking_budget.flash_family_desc", {
-                                        defaultValue: "控制 Gemini ≥ 3.0 的 Flash 思考模型四大档位预算（< 3.0 如 2.5-flash 为传统非思考模型，网关自动剥离思考）",
+                                    {t("proxy.config.thinking_budget.gemini_family_desc", {
+                                        defaultValue: "控制 Gemini 思考模型的四大档位预算（填 -1 则走官方默认/自适应预算）",
                                     })}
                                 </p>
                             </div>
@@ -836,7 +876,7 @@ export default function ThinkingBudget({
                                         <input
                                             type="text"
                                             inputMode="numeric"
-                                            placeholder="1024"
+                                            placeholder="-1"
                                             value={inputValues.flash_low ?? ""}
                                             onChange={(e) =>
                                                 handleInputChange("flash_low", e.target.value)
@@ -846,7 +886,7 @@ export default function ThinkingBudget({
                                         {renderPresetButtons("flash_low", [1024, 2048])}
                                         <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
                                             {t("proxy.config.thinking_budget.flash_low_hint", {
-                                                defaultValue: "极低推理 (默认 1024)",
+                                                defaultValue: "极低推理 (默认 -1 走官方默认)",
                                             })}
                                         </p>
                                     </div>
@@ -859,7 +899,7 @@ export default function ThinkingBudget({
                                         <input
                                             type="text"
                                             inputMode="numeric"
-                                            placeholder="4096"
+                                            placeholder="-1"
                                             value={inputValues.flash_medium ?? ""}
                                             onChange={(e) =>
                                                 handleInputChange("flash_medium", e.target.value)
@@ -869,7 +909,7 @@ export default function ThinkingBudget({
                                         {renderPresetButtons("flash_medium", [4096, 8192])}
                                         <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
                                             {t("proxy.config.thinking_budget.flash_medium_hint", {
-                                                defaultValue: "标准平衡档 (默认 4096)",
+                                                defaultValue: "标准平衡档 (默认 -1 走官方默认)",
                                             })}
                                         </p>
                                     </div>
@@ -892,7 +932,7 @@ export default function ThinkingBudget({
                                         {renderPresetButtons("flash_high", [-1, 16384, 32768])}
                                         <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
                                             {t("proxy.config.thinking_budget.flash_high_hint", {
-                                                defaultValue: "深度推理档 (默认 -1，走官方自适应)",
+                                                defaultValue: "深度推理档 (默认 -1 走官方自适应)",
                                             })}
                                         </p>
                                     </div>
@@ -915,7 +955,7 @@ export default function ThinkingBudget({
                                         {renderPresetButtons("flash_tiered", [-1, 2048, 8192, 32768])}
                                         <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
                                             {t("proxy.config.thinking_budget.flash_tiered_hint", {
-                                                defaultValue: "自适应/自由强度 (默认 -1)",
+                                                defaultValue: "自适应/自由强度 (默认 -1 走官方自适应)",
                                             })}
                                         </p>
                                     </div>
@@ -924,6 +964,12 @@ export default function ThinkingBudget({
                                     {t("proxy.config.thinking_budget.tiered_desc", {
                                         defaultValue:
                                             "💡 Tiered 自由模型说明：该模型专为谷歌动态自适应打造。设置为 -1 时，模型根据问题难度自动分配思考量；若指定具体数值（如 30000+），可突破 High 档位解锁 Max 极限思考。",
+                                    })}
+                                </div>
+                                <div className="p-3 bg-amber-50/70 dark:bg-amber-900/20 border border-amber-200/80 dark:border-amber-800/40 rounded-xl text-xs text-amber-800 dark:text-amber-200 leading-relaxed">
+                                    {t("proxy.config.thinking_budget.gemini_soft_budget_note", {
+                                        defaultValue:
+                                            "⚠️ 思考预算特性说明：Google Gemini 上游将 thinkingBudget 视为启发式偏好（Soft Target）。面对超长 Prompt、复杂代码推演或 Agent 任务时，上游推理引擎会自动深入展开思考链，可能突破所设数值；设置为 0 则彻底关闭思考。",
                                     })}
                                 </div>
                             </div>
@@ -937,110 +983,7 @@ export default function ThinkingBudget({
                         )}
                     </div>
 
-                    {/* 2. Gemini Pro 系列 */}
-                    <div className="border border-gray-200 dark:border-base-200 rounded-xl p-4 bg-white dark:bg-base-100 space-y-3.5 shadow-2xs">
-                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 dark:border-base-200 pb-2.5">
-                            <div>
-                                <span className="text-xs font-bold text-gray-900 dark:text-white">
-                                    {t("proxy.config.thinking_budget.pro_family_title", {
-                                        defaultValue: "Gemini Pro ≥ 3.0 系列 (如 3-pro, 3.1-pro 等)",
-                                    })}
-                                </span>
-                                <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                                    {t("proxy.config.thinking_budget.pro_family_desc", {
-                                        defaultValue:
-                                            "Google 官方 Gemini ≥ 3.0 Pro 体系仅提供 Low 与 High 两个档位。未指定 effort 或 medium 将自动走 High 保证 Pro 深度思考。",
-                                    })}
-                                </p>
-                            </div>
-                            <div className="flex items-center gap-3">
-                                <label className="inline-flex items-center gap-1.5 cursor-pointer text-xs font-medium text-gray-700 dark:text-gray-300">
-                                    <input
-                                        type="radio"
-                                        name="pro_mode"
-                                        checked={currentConfig.pro_mode === "default"}
-                                        onChange={() => handleProModeChange("default")}
-                                        className="text-blue-600 focus:ring-blue-500"
-                                    />
-                                    {t("proxy.config.thinking_budget.mode_default", {
-                                        defaultValue: "默认模式 (官方自适应)",
-                                    })}
-                                </label>
-                                <label className="inline-flex items-center gap-1.5 cursor-pointer text-xs font-medium text-gray-700 dark:text-gray-300">
-                                    <input
-                                        type="radio"
-                                        name="pro_mode"
-                                        checked={currentConfig.pro_mode !== "default"}
-                                        onChange={() => handleProModeChange("custom")}
-                                        className="text-blue-600 focus:ring-blue-500"
-                                    />
-                                    {t("proxy.config.thinking_budget.mode_custom", {
-                                        defaultValue: "自定义思考预算模式 (推荐)",
-                                    })}
-                                </label>
-                            </div>
-                        </div>
-
-                        {currentConfig.pro_mode !== "default" ? (
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                                <div>
-                                    <label className="block text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1">
-                                        {t("proxy.config.thinking_budget.tier_low", {
-                                            defaultValue: "Low 档位",
-                                        })}
-                                    </label>
-                                    <input
-                                        type="text"
-                                        inputMode="numeric"
-                                        placeholder="1001"
-                                        value={inputValues.pro_low ?? ""}
-                                        onChange={(e) =>
-                                            handleInputChange("pro_low", e.target.value)
-                                        }
-                                        className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
-                                    />
-                                    {renderPresetButtons("pro_low", [1001, 1024, 2048, 4096])}
-                                    <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
-                                        {t("proxy.config.thinking_budget.pro_low_hint", {
-                                            defaultValue: "低思考档位 (默认 1001，填 -1 则走官方自适应)",
-                                        })}
-                                    </p>
-                                </div>
-                                <div>
-                                    <label className="block text-xs font-semibold text-gray-700 dark:text-gray-300 mb-1">
-                                        {t("proxy.config.thinking_budget.tier_pro_high", {
-                                            defaultValue: "High 档位 (默认/主力档位)",
-                                        })}
-                                    </label>
-                                    <input
-                                        type="text"
-                                        inputMode="numeric"
-                                        placeholder="10001"
-                                        value={inputValues.pro_high ?? ""}
-                                        onChange={(e) =>
-                                            handleInputChange("pro_high", e.target.value)
-                                        }
-                                        className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-blue-500/30 focus:border-blue-500"
-                                    />
-                                    {renderPresetButtons("pro_high", [10001, 16384, 32768])}
-                                    <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
-                                        {t("proxy.config.thinking_budget.pro_high_hint", {
-                                            defaultValue: "深度思考档位 (默认 10001，填 -1 则走官方自适应)",
-                                        })}
-                                    </p>
-                                </div>
-                            </div>
-                        ) : (
-                            <p className="text-xs text-gray-500 dark:text-gray-400 italic">
-                                {t("proxy.config.thinking_budget.pro_default_hint", {
-                                    defaultValue:
-                                        "已启用官方默认模式：Gemini Pro 系列将由 Google 官方动态确定思考强度。",
-                                })}
-                            </p>
-                        )}
-                    </div>
-
-                    {/* 3. Claude 系列 */}
+                    {/* 2. Claude 系列 */}
                     <div className="border border-gray-200 dark:border-base-200 rounded-xl p-4 bg-white dark:bg-base-100 space-y-3.5 shadow-2xs">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-gray-100 dark:border-base-200 pb-2.5">
                             <div>
@@ -1132,7 +1075,7 @@ export default function ThinkingBudget({
                                         <input
                                             type="text"
                                             inputMode="numeric"
-                                            placeholder="16384"
+                                            placeholder="-1"
                                             value={inputValues.claude_budget ?? ""}
                                             onChange={(e) =>
                                                 handleInputChange("claude_budget", e.target.value)
@@ -1141,7 +1084,7 @@ export default function ThinkingBudget({
                                         />
                                         <span className="text-xs font-medium text-gray-600 dark:text-gray-300">
                                             {t("proxy.config.thinking_budget.claude_budget_current", {
-                                                defaultValue: "推荐默认值: 16,384 Tokens (兼顾思考深度与响应速率)",
+                                                defaultValue: "推荐默认值: -1 (填 -1 则走官方默认/自适应)",
                                             })}
                                         </span>
                                     </div>
@@ -1177,14 +1120,14 @@ export default function ThinkingBudget({
                                                     <input
                                                         type="text"
                                                         inputMode="numeric"
-                                                        placeholder="1024"
+                                                        placeholder="-1"
                                                         value={inputValues.claude_low ?? ""}
                                                         onChange={(e) => handleInputChange("claude_low", e.target.value)}
                                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500/30 focus:border-purple-500"
                                                     />
                                                     {renderPresetButtons("claude_low", [1024, 2048], "purple")}
                                                     <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
-                                                        {t("proxy.config.thinking_budget.claude_low_hint", { defaultValue: "轻量思考 (默认 1024)" })}
+                                                        {t("proxy.config.thinking_budget.claude_low_hint", { defaultValue: "轻量思考 (默认 -1 走官方默认)" })}
                                                     </p>
                                                 </div>
                                                 <div>
@@ -1194,14 +1137,14 @@ export default function ThinkingBudget({
                                                     <input
                                                         type="text"
                                                         inputMode="numeric"
-                                                        placeholder="4096"
+                                                        placeholder="-1"
                                                         value={inputValues.claude_medium ?? ""}
                                                         onChange={(e) => handleInputChange("claude_medium", e.target.value)}
                                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500/30 focus:border-purple-500"
                                                     />
                                                     {renderPresetButtons("claude_medium", [4096, 8192], "purple")}
                                                     <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
-                                                        {t("proxy.config.thinking_budget.claude_medium_hint", { defaultValue: "日常平衡档 (默认 4096)" })}
+                                                        {t("proxy.config.thinking_budget.claude_medium_hint", { defaultValue: "日常平衡档 (默认 -1 走官方默认)" })}
                                                     </p>
                                                 </div>
                                                 <div>
@@ -1211,14 +1154,14 @@ export default function ThinkingBudget({
                                                     <input
                                                         type="text"
                                                         inputMode="numeric"
-                                                        placeholder="16384"
+                                                        placeholder="-1"
                                                         value={inputValues.claude_high ?? ""}
                                                         onChange={(e) => handleInputChange("claude_high", e.target.value)}
                                                         className="w-full px-3 py-1.5 border border-gray-300 dark:border-base-300 rounded-lg bg-white dark:bg-base-200 text-xs font-mono font-semibold text-gray-900 dark:text-white focus:ring-2 focus:ring-purple-500/30 focus:border-purple-500"
                                                     />
                                                     {renderPresetButtons("claude_high", [16384, 32768], "purple")}
                                                     <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-1">
-                                                        {t("proxy.config.thinking_budget.claude_high_hint", { defaultValue: "深度思考档 (默认 16384)" })}
+                                                        {t("proxy.config.thinking_budget.claude_high_hint", { defaultValue: "深度长链档 (默认 -1 走官方默认)" })}
                                                     </p>
                                                 </div>
                                             </div>

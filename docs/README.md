@@ -15,3 +15,7 @@ This folder contains developer-focused documentation (architecture, implementati
 
 ## Agent Integrations
 - [`docs/jeikcode_integration.md`](jeikcode_integration.md) — JeikCode integration guide, one-click synchronization, configuration options, and KV-cache optimization.
+
+## Operations
+
+- [`AGM official beta.8 adaptation`](operations/agm-official-beta8-adaptation-2026-10-12.md) — fork patch scope, runtime image provenance, helper migration, and current validation/deployment status.

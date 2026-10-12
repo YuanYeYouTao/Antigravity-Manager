@@ -6,10 +6,9 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::proxy::SignatureCache; // Assuming this is available at crate root or re-exported
+use crate::proxy::SignatureCache;
 
-/// Collects a Gemini SSE stream into a complete Gemini Response Value
-/// ALSO performs signature caching side-effect
+/// Collects a Gemini SSE stream into a complete Gemini Response Value.
 pub async fn collect_stream_to_json<S, E>(stream: S, session_id: &str) -> Result<Value, String>
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
@@ -27,23 +26,82 @@ where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
-    let mut collected_response = json!({
-        "candidates": [
-            {
-                "content": {
-                    "parts": [],
-                    "role": "model"
-                },
-                "finishReason": "STOP",
-                "index": 0
-            }
-        ]
-    });
+    let mut collected_response = json!({"candidates": [{"content": {"parts": []}}]});
+    let mut content_parts: Vec<Value> = Vec::new();
+    let mut line_buffer = bytes::BytesMut::new();
 
-    let mut content_parts: Vec<Value> = Vec::new(); // To accumulate parts
-    let mut usage_metadata: Option<Value> = None;
-    let mut finish_reason: Option<String> = None;
-    let mut grounding_metadata: Option<Value> = None;
+    // Complete lines and the final unterminated line share the same collection path.
+    let mut collect_line = |raw: &[u8]| -> Option<Value> {
+        let line_str = String::from_utf8_lossy(raw);
+        let line = line_str.trim();
+        let json_part = line.strip_prefix("data: ")?.trim();
+        if json_part == "[DONE]" {
+            return None;
+        }
+        let mut data = serde_json::from_str::<Value>(json_part).ok()?;
+        let actual_data = if let Some(inner) = data.get_mut("response") {
+            inner.take()
+        } else {
+            data
+        };
+        if actual_data.get("error").is_some() {
+            return Some(actual_data);
+        }
+
+        if let Some(fields) = actual_data.as_object() {
+            for (key, value) in fields {
+                if key != "candidates" {
+                    collected_response[key] = value.clone();
+                }
+            }
+        }
+
+        if let Some(candidate) = actual_data
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+        {
+            // Candidate metadata is a field snapshot. Replace each supplied value
+            // whole, including groundingMetadata and its chunk/support indices.
+            if let Some(fields) = candidate.as_object() {
+                for (key, value) in fields {
+                    if key != "content" {
+                        collected_response["candidates"][0][key] = value.clone();
+                    }
+                }
+            }
+            if let Some(content) = candidate.get("content").and_then(Value::as_object) {
+                for (key, value) in content {
+                    if key != "parts" {
+                        collected_response["candidates"][0]["content"][key] = value.clone();
+                    }
+                }
+                if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+                    for part in parts {
+                        // Only plain text chunks can be coalesced. Signed or
+                        // extended parts retain their original fields and order.
+                        if part.as_object().is_some_and(|obj| obj.len() == 1) {
+                            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                                if let Some(last) = content_parts.last_mut() {
+                                    if last.as_object().is_some_and(|obj| obj.len() == 1) {
+                                        if let Some(last_text) =
+                                            last.get("text").and_then(Value::as_str)
+                                        {
+                                            let merged = format!("{}{}", last_text, text);
+                                            last["text"] = json!(merged);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        content_parts.push(part.clone());
+                    }
+                }
+            }
+        }
+        None
+    };
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result.map_err(|e| {
@@ -55,127 +113,64 @@ where
             )
             .client_message()
         })?;
-        let text = std::str::from_utf8(&chunk).unwrap_or(""); // Ignore invalid utf8 for simplicity or handle better
-
-        for line in text.lines() {
-            let line = line.trim();
-            if line.starts_with("data: ") {
-                let json_part = line.trim_start_matches("data: ").trim();
-                if json_part == "[DONE]" {
-                    continue;
-                }
-
-                if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-                    // Unwrap v1internal response wrapper similar to handler
-                    let actual_data =
-                        if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
-                            inner
-                        } else {
-                            json
-                        };
-
-                    // 1. Capture Usage
-                    if let Some(usage) = actual_data.get("usageMetadata") {
-                        usage_metadata = Some(usage.clone());
-                    }
-
-                    // 2. Capture Content & Signature
-                    if let Some(candidates) =
-                        actual_data.get("candidates").and_then(|c| c.as_array())
-                    {
-                        if let Some(candidate) = candidates.first() {
-                            // Grounding can arrive without content. Each supplied metadata
-                            // object is a complete snapshot: preserve it verbatim, including
-                            // unknown fields, rather than concatenating chunks and invalidating
-                            // groundingSupports.groundingChunkIndices.
-                            if let Some(metadata) = candidate.get("groundingMetadata") {
-                                grounding_metadata = Some(metadata.clone());
-                            }
-                            // Update finish reason if present
-                            if let Some(fr) = candidate.get("finishReason").and_then(|v| v.as_str())
-                            {
-                                finish_reason = Some(fr.to_string());
-                            }
-
-                            if let Some(parts) = candidate
-                                .get("content")
-                                .and_then(|c| c.get("parts"))
-                                .and_then(|p| p.as_array())
-                            {
-                                for part in parts {
-                                    // Signature Caching
-                                    if let Some(sig) =
-                                        part.get("thoughtSignature").and_then(|s| s.as_str())
-                                    {
-                                        // Cache it!
-                                        SignatureCache::global().cache_session_signature(
-                                            session_id,
-                                            sig.to_string(),
-                                            1,
-                                        );
-                                        debug!("[Gemini-AutoConverter] Cached signature (len: {}) for session: {}", sig.len(), session_id);
-                                    }
-
-                                    // Collect part
-                                    // Simple aggregation: if text, append to last text part? Or just push all parts?
-                                    // Gemini stream sends separate parts. We can just accumulate them.
-                                    // Optimization: Merge adjacent text parts.
-
-                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                                        if let Some(last) = content_parts.last_mut() {
-                                            if last.get("text").is_some()
-                                                && part.get("thought").is_none()
-                                                && last.get("thought").is_none()
-                                            {
-                                                // Merge text
-                                                if let Some(last_text) =
-                                                    last.get_mut("text").and_then(|v| v.as_str())
-                                                {
-                                                    let new_text = format!("{}{}", last_text, text);
-                                                    *last = json!({"text": new_text});
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                        content_parts.push(part.clone());
-                                    } else {
-                                        // Other parts (images, thoughts, function calls), just push
-                                        content_parts.push(part.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        line_buffer.extend_from_slice(&chunk);
+        while let Some(pos) = line_buffer.iter().position(|&b| b == b'\n') {
+            let line = line_buffer.split_to(pos + 1);
+            if let Some(error) = collect_line(&line) {
+                return Ok(error);
             }
         }
     }
+    if !line_buffer.is_empty() {
+        if let Some(error) = collect_line(&line_buffer) {
+            return Ok(error);
+        }
+    }
 
-    let anchor_str = anchor.unwrap_or("root");
-    crate::proxy::thinking_store::capture_gemini_parts_with_anchor(
-        session_id,
-        &content_parts,
-        anchor_str,
-    );
+    if content_parts.is_empty()
+        && collected_response["candidates"][0]
+            .get("finishReason")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return Err(
+            crate::proxy::mappers::error_classifier::report_stream_error(
+                "gemini-collector",
+                "collect_stream_to_json_with_anchor",
+                &"stream terminated prematurely without content or finish reason",
+                format!("session={}", session_id),
+            )
+            .client_message(),
+        );
+    }
 
-    // Construct final response
+    // Failed streams return before updating either signature or thinking state.
+    if !content_parts.is_empty() {
+        for part in &content_parts {
+            if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
+                SignatureCache::global().cache_session_signature(session_id, sig.to_string(), 1);
+                debug!(
+                    "[Gemini-AutoConverter] Cached signature (len: {}) for session: {}",
+                    sig.len(),
+                    session_id
+                );
+            }
+        }
+        crate::proxy::thinking_store::capture_gemini_parts_with_anchor(
+            session_id,
+            &content_parts,
+            anchor.unwrap_or("root"),
+        );
+    }
     collected_response["candidates"][0]["content"]["parts"] = json!(content_parts);
-    if let Some(fr) = finish_reason {
-        collected_response["candidates"][0]["finishReason"] = json!(fr);
-    }
-    if let Some(usage) = usage_metadata {
-        collected_response["usageMetadata"] = usage;
-    }
-    if let Some(metadata) = grounding_metadata {
-        collected_response["candidates"][0]["groundingMetadata"] = metadata;
-    }
-
     Ok(collected_response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
+    use std::io;
 
     async fn replay(frames: &[Value]) -> Value {
         let chunks: Vec<Result<Bytes, String>> = frames
@@ -283,9 +278,208 @@ mod tests {
     async fn explicit_empty_grounding_snapshot_replaces_earlier_metadata() {
         let result = replay(&[
             json!({"candidates": [{"groundingMetadata": {"groundingChunks": [{"web": {"uri": "https://example.invalid/old"}}]}}]}),
-            json!({"candidates": [{"groundingMetadata": {}}]}),
+            json!({"candidates": [{"groundingMetadata": {}, "finishReason": "STOP"}]}),
         ])
         .await;
         assert_eq!(result["candidates"][0]["groundingMetadata"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_collect_simple_text_response() {
+        let sse_data = vec![
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"}],\"role\":\"model\"},\"index\":0}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\" world!\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"totalTokenCount\":10}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+
+        let byte_stream = stream::iter(
+            sse_data
+                .into_iter()
+                .map(|s| Ok::<Bytes, io::Error>(Bytes::from(s))),
+        );
+
+        let result = collect_stream_to_json(byte_stream, "test_session").await;
+        assert!(result.is_ok());
+
+        let resp = result.unwrap();
+        let parts = resp["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "Hello world!");
+        assert_eq!(resp["candidates"][0]["finishReason"], "STOP");
+        assert_eq!(resp["usageMetadata"]["totalTokenCount"], 10);
+    }
+
+    #[tokio::test]
+    async fn test_collect_error_payload_propagation_504() {
+        let sse_data = vec![
+            "data: {\"error\":{\"code\":504,\"message\":\"stream idle timeout\",\"status\":\"DEADLINE_EXCEEDED\"}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+
+        let byte_stream = stream::iter(
+            sse_data
+                .into_iter()
+                .map(|s| Ok::<Bytes, io::Error>(Bytes::from(s))),
+        );
+
+        let result = collect_stream_to_json(byte_stream, "test_session_504").await;
+        assert!(result.is_ok());
+
+        let resp = result.unwrap();
+        assert!(resp.get("error").is_some());
+        assert_eq!(resp["error"]["code"], 504);
+        assert_eq!(resp["error"]["status"], "DEADLINE_EXCEEDED");
+    }
+
+    #[tokio::test]
+    async fn test_collect_error_payload_with_v1internal_wrapper() {
+        let sse_data = vec![
+            "data: {\"response\":{\"error\":{\"code\":503,\"message\":\"model overloaded\",\"status\":\"UNAVAILABLE\"}}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+
+        let byte_stream = stream::iter(
+            sse_data
+                .into_iter()
+                .map(|s| Ok::<Bytes, io::Error>(Bytes::from(s))),
+        );
+
+        let result = collect_stream_to_json(byte_stream, "test_session_503").await;
+        assert!(result.is_ok());
+
+        let resp = result.unwrap();
+        assert!(resp.get("error").is_some());
+        assert_eq!(resp["error"]["code"], 503);
+        assert_eq!(resp["error"]["status"], "UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn test_collect_premature_empty_stream_fails() {
+        let sse_data = vec!["data: [DONE]\n\n"];
+
+        let byte_stream = stream::iter(
+            sse_data
+                .into_iter()
+                .map(|s| Ok::<Bytes, io::Error>(Bytes::from(s))),
+        );
+
+        let result = collect_stream_to_json(byte_stream, "test_session_empty").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("stream terminated prematurely"));
+    }
+
+    #[tokio::test]
+    async fn test_collect_multibyte_chunk_split() {
+        let cyrillic_word = "Привет, мир! 🚀";
+        let chunk_data = format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{}\"}}],\"role\":\"model\"}},\"finishReason\":\"STOP\",\"index\":0}}]}}\n\ndata: [DONE]\n\n",
+            cyrillic_word
+        );
+
+        let bytes = chunk_data.into_bytes();
+        let chunk_size = 13;
+        let mut chunks = Vec::new();
+        for chunk in bytes.chunks(chunk_size) {
+            chunks.push(Ok::<Bytes, io::Error>(Bytes::copy_from_slice(chunk)));
+        }
+
+        let byte_stream = stream::iter(chunks);
+        let result = collect_stream_to_json(byte_stream, "test_session_multibyte").await;
+        assert!(result.is_ok());
+
+        let resp = result.unwrap();
+        let parts = resp["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts[0]["text"], cyrillic_word);
+    }
+
+    #[tokio::test]
+    async fn unknown_response_candidate_and_content_fields_survive_collection() {
+        let result = replay(&[
+            json!({
+                "modelVersion": "synthetic-version",
+                "futureResponse": {"opaque": [1, 2]},
+                "candidates": [{
+                    "index": 4,
+                    "safetyRatings": [{"category": "synthetic", "probability": "LOW"}],
+                    "futureCandidate": {"opaque": true},
+                    "content": {
+                        "role": "model",
+                        "futureContent": {"flag": true},
+                        "parts": [{"text": "Result"}]
+                    }
+                }]
+            }),
+            json!({"candidates": [{"finishReason": "STOP", "finishMessage": "real upstream finish"}]}),
+        ]).await;
+        assert_eq!(result["modelVersion"], "synthetic-version");
+        assert_eq!(result["futureResponse"], json!({"opaque": [1, 2]}));
+        assert_eq!(result["candidates"][0]["index"], 4);
+        assert_eq!(
+            result["candidates"][0]["futureCandidate"],
+            json!({"opaque": true})
+        );
+        assert_eq!(
+            result["candidates"][0]["safetyRatings"],
+            json!([{"category": "synthetic", "probability": "LOW"}])
+        );
+        assert_eq!(result["candidates"][0]["content"]["role"], "model");
+        assert_eq!(
+            result["candidates"][0]["content"]["futureContent"],
+            json!({"flag": true})
+        );
+        assert_eq!(
+            result["candidates"][0]["finishMessage"],
+            "real upstream finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_coalescing_preserves_signed_and_extended_parts_without_inventing_finish() {
+        let parts = json!([
+            {"text": "signed", "thoughtSignature": "synthetic-signature"},
+            {"text": "extended", "futurePart": {"opaque": true}},
+            {"text": " plain"}
+        ]);
+        let result =
+            replay(&[json!({"candidates": [{"content": {"parts": parts.clone()}}]})]).await;
+        assert_eq!(result["candidates"][0]["content"]["parts"], parts);
+        assert!(result["candidates"][0].get("finishReason").is_none());
+    }
+
+    #[tokio::test]
+    async fn final_unterminated_line_preserves_metadata_and_error_fields() {
+        for frame in [
+            json!({"response": {
+                "candidates": [{
+                    "content": {"parts": [{"text": "尾帧"}]},
+                    "finishReason": "STOP",
+                    "groundingMetadata": {"futureMetadata": {"opaque": true}}
+                }]
+            }}),
+            json!({"response": {
+                "error": {"code": 503, "message": "upstream error", "status": "UNAVAILABLE"},
+                "futureErrorField": {"opaque": true}
+            }}),
+        ] {
+            let source = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(format!(
+                "data: {}",
+                frame
+            )))]);
+            let result = collect_stream_to_json(source, "unterminated-frame")
+                .await
+                .unwrap();
+            if frame["response"].get("error").is_some() {
+                assert_eq!(result, frame["response"]);
+                assert!(result.get("candidates").is_none());
+            } else {
+                assert_eq!(result["candidates"][0], frame["response"]["candidates"][0]);
+            }
+        }
     }
 }

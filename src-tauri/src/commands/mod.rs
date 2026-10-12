@@ -442,12 +442,14 @@ pub async fn save_config(
     crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
     crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
     crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
+    crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
     crate::proxy::config::update_global_audit_config(
         config.proxy.experimental.payload_storage_mode.clone(),
         config.proxy.experimental.log_retention_days,
         config.proxy.experimental.thinking_store_enabled,
         config.proxy.experimental.thinking_retention_days,
         Some(config.proxy.experimental.thinking_max_memory_turns),
+        Some(config.proxy.experimental.enable_global_compaction_strip),
     );
 
     // 同步健康检查日志捕获开关
@@ -492,12 +494,14 @@ pub async fn save_config(
         // [NEW] 更新全局图像思维模式配置
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
         crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
+        crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
         crate::proxy::config::update_global_audit_config(
             config.proxy.experimental.payload_storage_mode.clone(),
             config.proxy.experimental.log_retention_days,
             config.proxy.experimental.thinking_store_enabled,
             config.proxy.experimental.thinking_retention_days,
             Some(config.proxy.experimental.thinking_max_memory_turns),
+            Some(config.proxy.experimental.enable_global_compaction_strip),
         );
         // 更新代理池配置
         instance
@@ -510,6 +514,34 @@ pub async fn save_config(
             .update_circuit_breaker_config(config.circuit_breaker.clone())
             .await;
         tracing::debug!("已同步热更新反代服务配置");
+    }
+
+    // [FIX #3280, #3285] 同步热更新管理服务 (Admin Server)，确保在仅运行管理端或服务未手动启动时配置立即生效
+    let admin_lock = proxy_state.admin_server.read().await;
+    if let Some(admin) = admin_lock.as_ref() {
+        admin.axum_server.update_mapping(&config.proxy).await;
+        admin
+            .axum_server
+            .update_only_raw_quota_models(config.proxy.only_raw_quota_models)
+            .await;
+        admin
+            .axum_server
+            .update_proxy(config.proxy.upstream_proxy.clone())
+            .await;
+        admin.axum_server.update_security(&config.proxy).await;
+        admin.axum_server.update_experimental(&config.proxy).await;
+        admin.axum_server.update_debug_logging(&config.proxy).await;
+        admin.axum_server.update_user_agent(&config.proxy).await;
+        admin
+            .axum_server
+            .update_proxy_pool(config.proxy.proxy_pool.clone())
+            .await;
+        admin
+            .axum_server
+            .token_manager
+            .update_circuit_breaker_config(config.circuit_breaker.clone())
+            .await;
+        tracing::debug!("已同步热更新管理服务器 (Admin Server) 配置");
     }
 
     Ok(())
@@ -682,16 +714,19 @@ pub async fn sync_account_from_db(
     app: tauri::AppHandle,
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<Option<Account>, String> {
-    // Check if the current target is one we should not sync (like agy CLI)
+    // The CLI stores its login in the system keyring, not an IDE database.
     let index = modules::account::load_account_index()?;
     let current_target = index.current_target_ide.as_deref();
-    if current_target == Some("agy") {
-        modules::logger::log_info("Auto-sync skipped: current target is agy CLI");
-        return Ok(None);
-    }
+    let is_agy = current_target == Some("agy");
 
-    // 1. 获取 DB 中的 Refresh Token
-    let db_refresh_token = match modules::migration::get_refresh_token_from_db(current_target) {
+    // 1. Read the credential source used by the selected client. For agy, do
+    // not mistake an older file credential for the active keyring account.
+    let credential = if is_agy {
+        modules::integration::read_from_system_keyring_only().map(|state| state.refresh_token)
+    } else {
+        modules::migration::get_refresh_token_from_db(current_target)
+    };
+    let db_refresh_token = match credential {
         Ok(token) => token,
         Err(e) => {
             modules::logger::log_info(&format!("自动同步跳过: {}", e));
@@ -709,18 +744,20 @@ pub async fn sync_account_from_db(
             // 这里为了节省 API 流量，直接返回
             return Ok(None);
         }
-        modules::logger::log_info(&format!(
-            "检测到账号切换 ({} -> DB新账号)，正在同步...",
-            acc.email
-        ));
+        modules::logger::log_info(&format!("检测到登录凭据变化 ({})，正在同步...", acc.email));
     } else {
         modules::logger::log_info("检测到新登录账号，正在自动同步...");
     }
 
-    // 4. 执行完整导入
-    let mut account = modules::migration::import_from_db(current_target).await?;
+    // 4. For the CLI, reconcile only the matching managed account; importing
+    // all local sources could select an unrelated IDE account if refresh fails.
+    let mut account = if is_agy {
+        modules::account::find_agy_account(modules::account::list_accounts()?, &db_refresh_token)?
+    } else {
+        modules::migration::import_from_db(current_target).await?
+    };
 
-    // 既然是从数据库导入，自动将其设为 Manager 的当前账号并保留当前 target
+    // 更新 Manager 的当前账号并保留客户端目标，不写回客户端凭据。
     let account_id = account.id.clone();
     modules::account::set_current_account_id_with_target(&account_id, current_target)?;
 
@@ -1529,5 +1566,49 @@ pub async fn query_transit_info(url: String, key: String) -> Result<String, Stri
         Ok(text)
     } else {
         Err(format!("HTTP {}: {}", status, text))
+    }
+}
+
+#[cfg(test)]
+mod agy_account_sync_tests {
+    use crate::models::{Account, TokenData};
+    use crate::modules::account::find_agy_account;
+
+    fn account(id: &str, refresh_token: &str) -> Account {
+        Account::new(
+            id.into(),
+            format!("{id}@example.test"),
+            TokenData::new(
+                "access-token".into(),
+                refresh_token.into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ),
+        )
+    }
+
+    #[test]
+    fn selects_keyring_account_instead_of_first_managed_account() {
+        let selected = find_agy_account(
+            vec![
+                account("old", "old-token"),
+                account("active", "active-token"),
+            ],
+            "active-token",
+        )
+        .unwrap();
+        assert_eq!(selected.id, "active");
+    }
+
+    #[test]
+    fn rejects_unknown_or_empty_credentials_without_selecting_another_account() {
+        let error =
+            find_agy_account(vec![account("old", "old-token")], "unknown-token").unwrap_err();
+        assert!(!error.contains("unknown-token"));
+        assert!(find_agy_account(vec![account("empty", "")], "").is_err());
     }
 }

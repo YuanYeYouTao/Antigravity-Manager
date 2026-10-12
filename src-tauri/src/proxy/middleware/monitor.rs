@@ -945,6 +945,7 @@ pub async fn monitor_middleware(
         input_tokens: None,
         output_tokens: None,
         cached_tokens: None,
+        reasoning_tokens: None,
         protocol,
         username,
         session_id,
@@ -1344,6 +1345,7 @@ pub async fn monitor_middleware(
                             log.cached_tokens = log.cached_tokens.or(cached_tokens);
                             reasoning_tokens =
                                 reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
+                            log.reasoning_tokens = log.reasoning_tokens.or(reasoning_tokens);
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -1591,6 +1593,9 @@ pub async fn monitor_middleware(
                             log.output_tokens = extract_output_tokens(usage);
                             log.cached_tokens =
                                 log.cached_tokens.or_else(|| extract_cached_tokens(usage));
+                            log.reasoning_tokens = log
+                                .reasoning_tokens
+                                .or_else(|| extract_reasoning_tokens(usage));
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage

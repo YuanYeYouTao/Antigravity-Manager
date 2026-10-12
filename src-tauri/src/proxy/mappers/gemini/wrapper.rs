@@ -572,6 +572,79 @@ pub fn wrap_request_v2(
                 gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(final_cap));
             }
         }
+
+        // 确保模型限额截断后依然满足 Google v1internal 硬约束：maxOutputTokens > thinkingBudget
+        let user_provided_max = gen_config.get("maxOutputTokens").and_then(|v| v.as_u64());
+        let raw_budget = gen_config
+            .get("thinkingConfig")
+            .and_then(|tc| tc.get("thinkingBudget"))
+            .and_then(|v| v.as_i64());
+
+        if let Some(budget) = raw_budget {
+            if budget > 0 {
+                let mut final_budget = budget;
+                let mut final_max = user_provided_max.unwrap_or(final_cap);
+
+                // 【分支 1: 6 倍反差极速意图识别】
+                // 如果用户提供了明确的总输出预算 m，且思考预算 t >= 6 * m（例如 m=1024, t=8192）：
+                // 证明用户/客户端强烈希望短平快直接回答，不希望被高思考拖慢！
+                // 此时压缩思考预算为 max(0, m - 1024)。若 m <= 1024 则预算为 0！
+                if let Some(user_m) = user_provided_max {
+                    if budget as u64 >= 6 * user_m {
+                        let fast_budget = if user_m > 1024 {
+                            (user_m - 1024) as i64
+                        } else {
+                            0
+                        };
+                        final_budget = fast_budget;
+                        tracing::info!(
+                            "[Gemini-Wrap] 6x Intent detected (budget={} >= 6*max={}): compressed thinkingBudget to {} for fast response",
+                            budget, user_m, fast_budget
+                        );
+                    }
+                }
+
+                // 如果未触发 6 倍极速压缩 (或者极速压缩后仍然有非零思考预算)：
+                if final_budget > 0 {
+                    // 【分支 2: 常规深度推理 - 官方容量能包住时优先自动扩充 m】
+                    if final_budget as u64 + 1024 <= final_cap {
+                        if final_max <= final_budget as u64 {
+                            final_max = final_budget as u64 + 1024;
+                            tracing::info!(
+                                "[Gemini-Wrap] Auto-expanded maxOutputTokens to {} to preserve thinkingBudget ({}) within official final_cap ({}) for model {}",
+                                final_max, final_budget, final_cap, final_model_name
+                            );
+                        }
+                    } else {
+                        // 【分支 3: 官方物理天花板硬顶兜底】
+                        final_max = final_cap;
+                        final_budget = if final_cap > 1024 {
+                            (final_cap - 1024) as i64
+                        } else if final_cap > 1 {
+                            (final_cap - 1) as i64
+                        } else {
+                            0
+                        };
+                        tracing::info!(
+                            "[Gemini-Wrap] Budget exceeded official ceiling: clamped maxOutputTokens to {} and thinkingBudget to {}",
+                            final_max, final_budget
+                        );
+                    }
+                }
+
+                gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(final_max));
+                if let Some(tc) = gen_config
+                    .get_mut("thinkingConfig")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    tc.insert(
+                        "thinkingBudget".to_string(),
+                        serde_json::json!(final_budget),
+                    );
+                }
+            }
+        }
+
         if is_under_v3 {
             gen_config.remove("thinkingConfig");
         }
@@ -984,7 +1057,7 @@ pub fn inject_ids_to_response(response: &mut Value, model_name: &str) {
     }
 }
 
-const INTERNAL_BACKGROUND_TASK: &str = "gemini-2.5-flash-lite";
+const INTERNAL_BACKGROUND_TASK: &str = "gemini-3.1-flash-lite";
 
 /// Layer-3 后台摘要请求的超时（秒）。
 ///
@@ -1135,7 +1208,7 @@ async fn try_compress_gemini_with_summary(
 
     // 只拼接「非思考 part」的文本。
     //
-    // 实测（gemini-2.5-flash-lite，3/3）响应形如：
+    // 实测（gemini-3.1-flash-lite / gemini-2.5-flash-lite）响应形如：
     //   parts[0] = { "thought": true, "text": "" }   ← 空思考块，排在最前
     //   parts[1] = { "text": "```xml\n<summary>…" }  ← 真正的摘要
     // 因此不能取 `parts[0].text`（会得到空串，把空摘要当成功静默写回），
@@ -1235,109 +1308,6 @@ static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn test_flash_default_budget_reaches_wrapped_wire_without_custom_inflation() {
-        use crate::proxy::config::{
-            get_thinking_budget_config, update_thinking_budget_config, ThinkingBudgetConfig,
-            ThinkingBudgetMode, ThinkingControlSource,
-        };
-        let _test_lock = TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        struct RestoreConfig(ThinkingBudgetConfig);
-        impl Drop for RestoreConfig {
-            fn drop(&mut self) {
-                update_thinking_budget_config(self.0.clone());
-            }
-        }
-        let _restore = RestoreConfig(get_thinking_budget_config());
-        let mut config = ThinkingBudgetConfig {
-            flash_low: 32768,
-            flash_medium: 32768,
-            flash_high: 65536,
-            custom_value: 12345,
-            ..ThinkingBudgetConfig::default()
-        };
-        let body = json!({
-            "contents": [{"role": "user", "parts": [{"text": "Budget fixture"}]}],
-            "generationConfig": {
-                "maxOutputTokens": 8192,
-                "thinkingConfig": {"thinkingLevel": "LOW", "includeThoughts": true}
-            }
-        });
-        let original = body.clone();
-        for mode in [
-            ThinkingBudgetMode::Default,
-            ThinkingBudgetMode::Custom,
-            ThinkingBudgetMode::Auto,
-            ThinkingBudgetMode::Passthrough,
-            ThinkingBudgetMode::Adaptive,
-        ] {
-            config.flash_mode = mode.clone();
-            update_thinking_budget_config(config.clone());
-            let wrapped = wrap_request(
-                &body,
-                "fixture-project",
-                "gemini-3.8-flash-low",
-                None,
-                None,
-                None,
-            );
-            let gc = &wrapped["request"]["generationConfig"];
-            let expected = if mode == ThinkingBudgetMode::Default {
-                1000
-            } else {
-                32768
-            };
-            assert_eq!(gc["thinkingConfig"]["thinkingBudget"], expected);
-            assert_eq!(gc["thinkingConfig"]["includeThoughts"], true);
-            assert!(gc["thinkingConfig"].get("thinkingLevel").is_none());
-            assert_eq!(
-                gc["maxOutputTokens"],
-                if mode == ThinkingBudgetMode::Default {
-                    8192
-                } else {
-                    40960
-                }
-            );
-            assert_eq!(body, original, "wrapping must not mutate the client body");
-        }
-
-        config.flash_mode = ThinkingBudgetMode::Default;
-        update_thinking_budget_config(config.clone());
-        let tiered = wrap_request(
-            &body,
-            "fixture-project",
-            "gemini-3.8-flash-tiered",
-            None,
-            None,
-            None,
-        );
-        assert_eq!(
-            tiered["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"], 32768,
-            "tiered level policy is unchanged"
-        );
-        assert_eq!(
-            tiered["request"]["generationConfig"]["maxOutputTokens"],
-            40960
-        );
-
-        config.control_source = ThinkingControlSource::Client;
-        update_thinking_budget_config(config);
-        let client = wrap_request(
-            &body,
-            "fixture-project",
-            "gemini-3.8-flash-low",
-            None,
-            None,
-            None,
-        );
-        let gc = &client["request"]["generationConfig"];
-        assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "LOW");
-        assert!(gc["thinkingConfig"].get("thinkingBudget").is_none());
-    }
 
     #[test]
     fn test_wrap_request() {

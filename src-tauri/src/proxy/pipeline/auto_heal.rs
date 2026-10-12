@@ -12,7 +12,7 @@
 //! 3. 向客户端发射 SSE 心跳注释（`: auto-healing empty thinking\n\n`）保持连接存活；
 //! 4. 自动构造带原上下文的自愈请求，追加共享非指令协议占位（不代表新增用户输入），在相同账号上发起上游调用；
 //! 5. 将上游续跑流无缝缝合至当前下游客户端连接；
-//! 6. 严格实施单次自愈上限（`max_auto_heals = 1`）；自愈失败作为流错误传播，不伪造成功正文。
+//! 6. 最多补跑一次；HTTP 或网络失败作为流错误传播，不伪造成功正文。
 
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
@@ -108,117 +108,6 @@ fn inspect_gemini_candidate_parts(
     }
 }
 
-/// 自愈仍无正文或工具调用时，不能先向下游发布成功终止符。
-fn auto_heal_output_line(line: &str, saw_output: &mut bool) -> Option<Bytes> {
-    let line = line.trim();
-    if line.is_empty() {
-        return None;
-    }
-    if let Some(json_part) = line.strip_prefix("data: ") {
-        let json_part = json_part.trim();
-        if json_part == "[DONE]" {
-            return (*saw_output).then(|| Bytes::from("data: [DONE]\n\n"));
-        }
-        if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
-            let inner = if json.get("response").is_some() {
-                json.get_mut("response").unwrap()
-            } else {
-                &mut json
-            };
-            let mut has_parts = false;
-            let mut has_finish = false;
-            if let Some(candidates) = inner.get_mut("candidates").and_then(Value::as_array_mut) {
-                for candidate in candidates.iter_mut() {
-                    let mut thought = false;
-                    let mut content = false;
-                    let mut tool_call = false;
-                    inspect_gemini_candidate_parts(
-                        candidate,
-                        &mut thought,
-                        &mut content,
-                        &mut tool_call,
-                    );
-                    *saw_output |= content || tool_call;
-                    has_parts |= candidate
-                        .get("content")
-                        .and_then(|c| c.get("parts"))
-                        .and_then(Value::as_array)
-                        .is_some_and(|parts| !parts.is_empty());
-                    has_finish |= candidate.get("finishReason").is_some();
-                }
-                if !*saw_output && has_finish {
-                    if !has_parts {
-                        return None;
-                    }
-                    for candidate in candidates {
-                        if let Some(candidate) = candidate.as_object_mut() {
-                            candidate.remove("finishReason");
-                        }
-                    }
-                    if let Some(inner) = inner.as_object_mut() {
-                        inner.remove("usageMetadata");
-                    }
-                    return Some(Bytes::from(format!("data: {}\n\n", json)));
-                }
-            }
-        }
-    }
-    Some(Bytes::from(format!("{}\n\n", line)))
-}
-
-/// 检查唯一一次自愈的真实输出，并以无凭据错误报告失败。
-fn checked_auto_heal_stream<S, E>(
-    mut stream: Pin<Box<S>>,
-) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
-where
-    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-{
-    Box::pin(async_stream::stream! {
-        let mut buffer = BytesMut::new();
-        let mut saw_output = false;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(bytes) => {
-                    buffer.extend_from_slice(&bytes);
-                    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
-                        let raw = buffer.split_to(pos + 1);
-                        match std::str::from_utf8(&raw) {
-                            Ok(line) => {
-                                if let Some(bytes) = auto_heal_output_line(line, &mut saw_output) {
-                                    yield Ok(bytes);
-                                }
-                            }
-                            Err(_) => {
-                                yield Ok(raw.freeze());
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    yield Err("auto_heal_stream_read_failed".to_string());
-                    return;
-                }
-            }
-        }
-        if !buffer.is_empty() {
-            match std::str::from_utf8(&buffer) {
-                Ok(line) => {
-                    if let Some(bytes) = auto_heal_output_line(line, &mut saw_output) {
-                        yield Ok(bytes);
-                    }
-                }
-                Err(_) => {
-                    yield Ok(buffer.freeze());
-                }
-            }
-        }
-        if !saw_output {
-            yield Err("auto_heal_empty_response".to_string());
-        }
-    })
-}
-
 /// 统一纯思考空回复自愈流式包装器（Pipeline First）
 ///
 /// 对上游原始 Gemini SSE 流进行透明包装：
@@ -241,9 +130,11 @@ where
         let mut saw_tool_call = false;
         let mut saw_finish_reason = false;
         let mut finish_reason_val: Option<String> = None;
-        let mut auto_healed = false;
 
-        let mut stream1 = stream;
+        // EOF 尾帧也走同一解析路径，避免未换行终止帧绕过清洗。
+        let mut stream1 = Box::pin(stream.chain(futures::stream::once(async {
+            Ok::<_, E>(Bytes::from_static(b"\n"))
+        })));
         while let Some(item) = stream1.next().await {
             match item {
                 Ok(bytes) => {
@@ -346,24 +237,12 @@ where
             }
         }
 
-        // 冲刷残留缓冲区
-        if !buffer.is_empty() {
-            if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                let line = line_str.trim();
-                if !line.is_empty() {
-                    yield Ok(Bytes::from(format!("{}\n\n", line)));
-                }
-            }
-        }
-
         // 核心自愈判断条件：
         // 1. 存在思考块 (saw_thought)
         // 2. 无任何正文 (saw_content == false)
         // 3. 无任何工具调用 (saw_tool_call == false)
         // 4. 上游正常返回了结束符 (saw_finish_reason == true)
-        // 5. 尚未执行过自愈 (auto_healed == false，严格 1 次上限)
-        if saw_thought && !saw_content && !saw_tool_call && saw_finish_reason && !auto_healed {
-            auto_healed = true;
+        if saw_thought && !saw_content && !saw_tool_call && saw_finish_reason {
             tracing::warn!(
                 "[{}] [Stream-AutoHeal] 🚨 Detected empty thinking completion (thought present, 0 content, 0 tool_calls, finishReason={:?}). Triggering bounded auto-heal with protocol placeholder 1/1...",
                 ctx.trace_id, finish_reason_val
@@ -389,12 +268,14 @@ where
                         "[{}] [Stream-AutoHeal] ✓ Auto-heal request succeeded (HTTP 200), piping healed stream directly into client connection...",
                         ctx.trace_id
                     );
-                    let mut stream2 = checked_auto_heal_stream(Box::pin(call_success.response.bytes_stream()));
+                    let mut stream2 = call_success.response.bytes_stream();
                     while let Some(item) = stream2.next().await {
-                        let failed = item.is_err();
-                        yield item;
-                        if failed {
-                            return;
+                        match item {
+                            Ok(bytes) => yield Ok(bytes),
+                            Err(_) => {
+                                yield Err("auto_heal_stream_read_failed".to_string());
+                                return;
+                            }
                         }
                     }
                 }
@@ -443,6 +324,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_first_thought_terminal_without_newline_is_not_published_as_success() {
+        for wrapped in [false, true] {
+            let part = json!({
+                "thought": true,
+                "text": "Original thought.",
+                "thoughtSignature": "original-signature"
+            });
+            let inner = json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [part.clone()]},
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {"totalTokenCount": 17}
+            });
+            let value = if wrapped {
+                json!({"response": inner})
+            } else {
+                inner
+            };
+            let source = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+                format!("data: {}", value),
+            ))]);
+            let mut stream =
+                wrap_stream_with_empty_thinking_auto_heal(Box::pin(source), fixture_context());
+            // 只读取思考帧，随后丢弃流；不推进到上游补跑调用。
+            let frame = stream.next().await.unwrap().unwrap();
+            let text = std::str::from_utf8(&frame).unwrap();
+            let observed: Value =
+                serde_json::from_str(text.trim_start_matches("data: ").trim()).unwrap();
+            assert_eq!(
+                observed.get("response").unwrap_or(&observed),
+                &json!({"candidates": [{
+                    "content": {"role": "model", "parts": [part]}
+                }]})
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_first_stream_error_is_preserved_without_healing() {
         let source = futures::stream::iter(vec![Err::<Bytes, _>(std::io::Error::other(
             "original-stream-error",
@@ -484,115 +404,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_healed_stream_preserves_real_output_and_fragmented_terminal_frames() {
-        for part in [
-            json!({"text": "Original response."}),
-            json!({"functionCall": {"id": "call_1", "name": "send_message", "args": {}},
-                "thoughtSignature": "original-signature"}),
-            json!({"inlineData": {"mimeType": "image/png", "data": "fixture"}}),
-            json!({"fileData": {"mimeType": "image/png", "fileUri": "https://example.invalid/fixture.png"}}),
-        ] {
-            let frame = sse(&json!({"response": {"candidates": [{
-                "content": {"role": "model", "parts": [part]}, "finishReason": "STOP"
-            }], "usageMetadata": {"totalTokenCount": 17}}}));
-            let chunks = vec![
-                Ok::<_, std::io::Error>(frame.slice(..11)),
-                Ok(frame.slice(11..)),
-                Ok(Bytes::from("data: [DONE]")),
-            ];
-            let results = checked_auto_heal_stream(Box::pin(futures::stream::iter(chunks)))
-                .collect::<Vec<_>>()
-                .await;
-            assert_eq!(
-                results,
-                vec![Ok(frame), Ok(Bytes::from("data: [DONE]\n\n"))]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_empty_healed_stream_reports_error_without_publishing_success() {
-        for parts in [
-            json!([]),
-            json!([{"thought": true, "text": "Original thought."}]),
-        ] {
-            let frame = sse(&json!({"candidates": [{
-                "content": {"role": "model", "parts": parts}, "finishReason": "STOP"
-            }]}));
-            let source = futures::stream::iter(vec![
-                Ok::<_, std::io::Error>(frame),
-                Ok(Bytes::from("data: [DONE]\n\n")),
-            ]);
-            let results = checked_auto_heal_stream(Box::pin(source))
-                .collect::<Vec<_>>()
-                .await;
-            assert_eq!(
-                results.last(),
-                Some(&Err("auto_heal_empty_response".to_string()))
-            );
-            for bytes in results.iter().filter_map(|result| result.as_ref().ok()) {
-                let text = std::str::from_utf8(bytes).unwrap();
-                assert!(!text.contains("finishReason"));
-                assert!(!text.contains("[DONE]"));
-                assert!(!text.contains("task ready"));
-            }
-            let gemini = crate::proxy::mappers::gemini::collector::collect_stream_to_json(
-                futures::stream::iter(results),
-                "offline-auto-heal",
-            )
-            .await;
-            assert!(gemini.is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_healed_read_error_is_terminal_and_does_not_leak_transport_details() {
-        let frame =
-            sse(&json!({"candidates": [{"content": {"parts": [{"text": "Actual output."}]}}]}));
-        let source = futures::stream::iter(vec![
-            Ok(frame.clone()),
-            Err(std::io::Error::other(
-                "access_token=private-fixture https://private-endpoint.invalid",
-            )),
-            Ok(Bytes::from("data: [DONE]\n\n")),
-        ]);
-        let results = checked_auto_heal_stream(Box::pin(source))
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(
-            results,
-            vec![Ok(frame), Err("auto_heal_stream_read_failed".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_claude_collector_receives_empty_heal_error_before_message_stop() {
-        let frame = sse(&json!({"candidates": [{"finishReason": "STOP"}]}));
-        let source = futures::stream::iter(vec![
-            Ok::<_, std::io::Error>(frame),
-            Ok(Bytes::from("data: [DONE]\n\n")),
-        ]);
-        let checked = checked_auto_heal_stream(Box::pin(source));
-        let claude = crate::proxy::mappers::claude::create_claude_sse_stream(
-            checked,
-            "offline-auto-heal".to_string(),
-            "fixture@example.invalid".to_string(),
-            None,
-            false,
-            128_000,
-            None,
-            0,
-            None,
-            vec![],
-        );
-        let response = crate::proxy::mappers::claude::collector::collect_stream_to_json(
-            claude.map(|item| item.map_err(std::io::Error::other)),
-        )
-        .await;
-        assert!(response.is_err());
-    }
-
     #[test]
     fn test_create_auto_heal_continuation_body() {
         let original = json!({
@@ -628,7 +439,7 @@ mod tests {
             placeholder,
             json!({
                 "role": "user",
-                "parts": [{"text": "[Protocol placeholder: no additional user input.]"}]
+                "parts": [{"text": "."}]
             })
         );
         restored["requestId"] = original["requestId"].clone();

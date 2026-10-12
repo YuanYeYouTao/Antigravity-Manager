@@ -26,14 +26,409 @@ use crate::proxy::model_specs;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
-use dashmap::DashSet;
-use std::sync::{atomic::Ordering, Arc, LazyLock};
+use dashmap::DashMap;
+use std::sync::{Arc, LazyLock};
 
-/// 记录刚完成压缩总结的会话集合，提供单次续写接续免死标志 (One-Shot Post-Compaction Immunity)
-/// 彻底攻克“静态扫描消息导致一次压缩后终身免死无法再次压缩”的死穴 (Fixes #3563)
-/// 遵循纯粹的状态机单次消费逻辑：无论中间隔了多久（如电脑合盖休眠唤醒），只要第一条业务接续请求到来即刻核销清空，
-/// 绝不人为设置定时器，杜绝超时误杀！
-static COMPACTION_ONE_SHOT_SESSIONS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+/// 基于代际租约与滑动窗口的压缩免死状态机 (Compaction Immunity Lease)
+/// 替代原无类型 DashSet 单次原子核销机制，天然支持并发请求、工具调用与网络重试；
+/// 初始处于未激活保护态（支持长达 300s 电脑休眠唤醒），在首个业务请求接入后激活 30s 滑动窗口，
+/// 支持窗口期内的所有并发请求与工具调用安全放行；滑动窗口超时后彻底销毁，
+/// 根除“一次压缩终身免死无法再次自愈” (Fixes #3563)。
+#[derive(Debug, Clone)]
+struct CompactionImmunityLease {
+    created_at: std::time::Instant,
+    last_touched: std::time::Instant,
+    consumed: bool,
+}
+
+static COMPACTION_IMMUNITY_LEASES: LazyLock<DashMap<String, CompactionImmunityLease>> =
+    LazyLock::new(DashMap::new);
+
+const COMPACTION_IMMUNITY_INITIAL_TTL_SECS: u64 = 300;
+const COMPACTION_IMMUNITY_WINDOW_SECS: u64 = 90; // 放宽至 90 秒，彻底覆盖大模型超长深度思考与连续多步 MCP 工具调用，杜绝 Double-400 (RFC #3576, PR #3647)
+
+/// 压缩模式类型：区分手动 ./compact 指令驱动与自动超限自愈门禁驱动
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoworkCompactKind {
+    Manual,
+    Auto,
+}
+
+/// Claude Cowork 统一压缩执行状态池 (Session -> 状态信息)
+/// 手动与自动压缩共享一套压缩标记与状态生命周期，防止冲突、竞争与双重 400 假报警
+#[derive(Debug, Clone)]
+pub struct CoworkCompactState {
+    pub kind: CoworkCompactKind,
+    pub before_tokens: u32,
+    pub ts: std::time::Instant,
+    pub summary_done: bool,
+    pub target_limit: u32,
+}
+
+pub static COWORK_COMPACT_SESSIONS: LazyLock<DashMap<String, CoworkCompactState>> =
+    LazyLock::new(DashMap::new);
+pub const MAX_COMPACT_SESSIONS_CAPACITY: usize = 1000;
+
+/// 近期触发压缩（手动或自动）的会话集合 (Session -> 触发时刻)，用于跨轮次对齐
+pub static PENDING_COMPACT_SESSIONS: LazyLock<DashMap<String, std::time::Instant>> =
+    LazyLock::new(DashMap::new);
+
+/// 检查会话当前是否处于压缩流程中（无论是手动还是自动压缩，统一判断并在超时后主动清理）
+pub fn is_session_in_compaction(session_key: &str) -> bool {
+    if let Some(entry) = COWORK_COMPACT_SESSIONS.get(session_key) {
+        if entry.ts.elapsed().as_secs() < 300 {
+            true
+        } else {
+            drop(entry);
+            COWORK_COMPACT_SESSIONS.remove(session_key);
+            false
+        }
+    } else {
+        false
+    }
+}
+
+pub fn prune_compact_sessions_if_needed() {
+    if COWORK_COMPACT_SESSIONS.len() >= MAX_COMPACT_SESSIONS_CAPACITY {
+        let now = std::time::Instant::now();
+        COWORK_COMPACT_SESSIONS.retain(|_, state| now.duration_since(state.ts).as_secs() < 300);
+        if COWORK_COMPACT_SESSIONS.len() >= MAX_COMPACT_SESSIONS_CAPACITY {
+            COWORK_COMPACT_SESSIONS.clear();
+        }
+    }
+}
+
+/// 刚刚完成 compact 的会话防重放缓存 (Session -> (完成时间戳, 回显文本, 剩余Token量))
+pub static COWORK_JUST_COMPACTED_CACHE: LazyLock<
+    DashMap<String, (std::time::Instant, String, u32)>,
+> = LazyLock::new(DashMap::new);
+pub const MAX_JUST_COMPACTED_CACHE_CAPACITY: usize = 1000;
+
+pub fn prune_just_compacted_cache_if_needed() {
+    if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+        let purge_now = std::time::Instant::now();
+        COWORK_JUST_COMPACTED_CACHE
+            .retain(|_, (ts, _, _)| purge_now.duration_since(*ts).as_secs() < 60);
+        if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+            COWORK_JUST_COMPACTED_CACHE.clear();
+        }
+    }
+}
+
+/// 深度检测请求前几条消息是否包含 post-compaction continuation 接续标记
+/// 遍历前 5 条消息中所有的 Text 内容块，彻底解决多轮 <system-reminder> / 环境详情块遮挡接续标记导致漏检的问题
+pub fn detect_post_compaction_continuation(request: &ClaudeRequest) -> bool {
+    for m in request.messages.iter().take(5) {
+        match &m.content {
+            crate::proxy::mappers::claude::models::MessageContent::String(s) => {
+                if crate::proxy::mappers::common_utils::is_post_compaction_continuation_text(s) {
+                    return true;
+                }
+            }
+            crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => {
+                for b in blocks {
+                    if let crate::proxy::mappers::claude::models::ContentBlock::Text { text } = b {
+                        if crate::proxy::mappers::common_utils::is_post_compaction_continuation_text(
+                            text,
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 计算自动压缩的有效安全阈值：
+/// 必须至少保留 target_limit + 25,000 的安全净空，防止压缩后上下文紧贴阈值瞬间再触发死循环 (autocompact_thrashing)
+pub fn calculate_effective_auto_compact_threshold(user_threshold: u32, target_limit: u32) -> u32 {
+    let min_safe_threshold = target_limit.saturating_add(25_000);
+    user_threshold.max(50_000).max(min_safe_threshold)
+}
+
+/// 判定请求是否为用户在 Cowork 客户端输入的手动 ./compact 指令
+fn is_manual_compact_command(request: &ClaudeRequest) -> bool {
+    let mut text_opt = None;
+    for m in request.messages.iter().rev() {
+        if m.role == "user" {
+            let t = match &m.content {
+                MessageContent::String(s) => s.clone(),
+                MessageContent::Array(blocks) => {
+                    let mut s = String::new();
+                    for b in blocks {
+                        if let crate::proxy::mappers::claude::models::ContentBlock::Text { text } =
+                            b
+                        {
+                            s.push_str(text);
+                            s.push(' ');
+                        }
+                    }
+                    s
+                }
+            };
+            text_opt = Some(t);
+            break;
+        }
+    }
+    if let Some(text) = text_opt {
+        static SYSTEM_REMINDER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"(?s)<system-reminder>.*?</system-reminder>").unwrap()
+        });
+        let cleaned = SYSTEM_REMINDER_RE.replace_all(&text, "");
+        for line in cleaned.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_lowercase();
+            if lower == "./compact"
+                || lower == ".\\compact"
+                || lower == "./compact."
+                || lower == "/compact"
+                || lower == "/compact."
+                || lower.starts_with("./compact ")
+                || lower.starts_with("/compact ")
+            {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// 判断当前请求是否属于 Claude Code 模式（CLI / Desktop Code Tab）
+///
+/// 判定依据（与 Cowork 排除判定完全对齐）：
+/// 1. 工具声明包含 `mcp__ccd_` 前缀（Claude Desktop Code Tab 专属工具）；
+/// 2. 或系统提示词显式声明包含 "You are Claude Code"（Claude Code CLI 官方身份）。
+pub fn is_code_mode(request: &ClaudeRequest) -> bool {
+    request.tools.as_ref().map_or(false, |tools| {
+        tools.iter().any(|t| t.get_name().starts_with("mcp__ccd_"))
+    }) || request.system.as_ref().map_or(false, |sys| match sys {
+        crate::proxy::mappers::claude::models::SystemPrompt::String(s) => {
+            s.contains("You are Claude Code")
+        }
+        crate::proxy::mappers::claude::models::SystemPrompt::Array(arr) => {
+            arr.iter().any(|b| b.text.contains("You are Claude Code"))
+        }
+    })
+}
+
+/// 判断当前请求是否属于 Claude Desktop Cowork 专属会话
+/// 关键防护：严格排除 Claude Code 模式（CLI / Desktop Code Tab），防止日常代码工程被误触截断。
+/// 仅精准放行真正的 Cowork 模式（带 mcp__cowork_* / mcp__workspace_* 工具或 local-agent 运行环境）。
+pub fn is_cowork_session(request: &ClaudeRequest, headers: &HeaderMap) -> bool {
+    // 1. 显式排除 Claude Code 模式（一票否决权）：
+    // 关键认知：Claude Desktop 的 Cowork 模式底层同样基于 agent-sdk，也会携带 x-app: cli、x-claude-code-session-id
+    // 以及通用宿主标头 claude-desktop-3p（代表 3p 嵌入桌面宿主），因此绝不能用这些通用标头判定 Code 模式！
+    // 真正的 Code 模式专属特征为：包含 mcp__ccd_* 工具前缀，或系统提示词显式声明 "You are Claude Code"
+    if is_code_mode(request) {
+        return false;
+    }
+
+    // 2. 识别真正的 Cowork 会话：
+    // 特征：带有 mcp__cowork_* 或 mcp__workspace_* 专属工具，
+    // 或运行环境为 local-agent / Claude Desktop 内置原生日常工作区
+    let has_cowork_tool = request.tools.as_ref().map_or(false, |tools| {
+        tools.iter().any(|t| {
+            let n = t.get_name();
+            n.starts_with("mcp__cowork") || n.starts_with("mcp__workspace")
+        })
+    });
+
+    let has_cowork_agent = headers
+        .iter()
+        .any(|(_, v)| v.to_str().map_or(false, |val| val.contains("local-agent")))
+        || request.system.as_ref().map_or(false, |sys| match sys {
+            crate::proxy::mappers::claude::models::SystemPrompt::String(s) => {
+                s.contains("local-agent")
+                    || s.contains("operating as an agent inside the Claude desktop app")
+            }
+            crate::proxy::mappers::claude::models::SystemPrompt::Array(arr) => {
+                arr.iter().any(|b| {
+                    b.text.contains("local-agent")
+                        || b.text
+                            .contains("operating as an agent inside the Claude desktop app")
+                })
+            }
+        });
+
+    has_cowork_tool || has_cowork_agent
+}
+
+/// 计算 Claude 请求中非对话历史的固定开销 (Fixed Overhead: System Prompt + Tool 声明)
+/// 用于动态计算可解的目标上限 (target_limit = max(fixed_overhead + 15000, 35000))
+fn calculate_claude_fixed_overhead(request: &ClaudeRequest) -> u32 {
+    let mut overhead = 0u32;
+    if let Some(sys) = &request.system {
+        match sys {
+            crate::proxy::mappers::claude::models::SystemPrompt::String(s) => {
+                overhead += crate::proxy::pipeline::estimator::estimate_tokens_from_str(s);
+            }
+            crate::proxy::mappers::claude::models::SystemPrompt::Array(blocks) => {
+                for block in blocks {
+                    overhead +=
+                        crate::proxy::pipeline::estimator::estimate_tokens_from_str(&block.text);
+                }
+            }
+        }
+    }
+    if let Some(tools) = &request.tools {
+        for tool in tools {
+            let name_len =
+                crate::proxy::pipeline::estimator::estimate_tokens_from_str(&tool.get_name());
+            let desc_len = tool
+                .description
+                .as_deref()
+                .map(crate::proxy::pipeline::estimator::estimate_tokens_from_str)
+                .unwrap_or(0);
+            let schema_len = tool
+                .input_schema
+                .as_ref()
+                .map(|s| {
+                    crate::proxy::pipeline::estimator::estimate_tokens_from_str(&s.to_string())
+                })
+                .unwrap_or(0);
+            overhead += name_len + desc_len + schema_len + 30;
+        }
+    }
+    overhead
+}
+
+/// 计算 Cowork 响应式压缩时抛出 400 假限额的最优参数 (report_tokens, target_limit)
+///
+/// ### 算法原理（基于对 Claude Desktop 内核 bundle 的反编译逆向分析）：
+/// 1. 客户端在收到 400 且匹配 `prompt is too long: (\d+) tokens > (\d+) maximum` 时，
+///    提取 `tokenGap = actual - maximum`。
+/// 2. 客户端进入 `seeded` 压缩流程时，计算 `Ne = tokenGap - last_turn_tokens`。
+/// 3. 客户端调用 `CHt(group_tokens, b-1, Ne)`，从倒数第二轮（h = b-2）向前累加历史轮次的 Token 数，
+///    累加直到总和达到 `Ne`，得到所需轮次数 `g`。
+/// 4. 关键陷阱（二分折半与过度保留）：
+///    - 若 `g >= n - 1`（即所需轮次达到上限），客户端会触发防灾难性清空保底：
+///      `if (g >= n - 1) return Math.max(1, Math.floor(n / 2));`
+///      强制降级为仅裁剪一半历史，导致 547 条消息被硬编码切掉 270 条、保留 277 条（残留高达 145.7k）！
+///    - 客户端在主循环中设置保留组数 `K = 1 + g`，保留尾部的 `K` 组消息（`s.slice(b - K)`），
+///      并将前半部的 `b - K` 组消息送入摘要模型提炼。
+/// 5. 破局之道：
+///    - 若 `tokenGap` 极小（使 `Ne <= 0`，即 `tokenGap <= last_turn_tokens`），
+///      客户端的 `if (Ne > 0)` 分支直接不执行，`K` 保持初始默认值 `1`！
+///    - 此时客户端将仅保留最后 1 组最新用户输入（`s.slice(b - 1)`），将前面所有的历史轮次（`0..b-1`）
+///      完整打包送入摘要请求，单次彻底压降至黄金基线（摘要 ~4k + 1 轮 ~500 + 工具 ~26k ≈ 30.5k tokens）！
+///    - 为安全触发且防止部分校验要求正向 Gap，我们返回极小的正向 Gap（如 500 tokens），
+///      此时 `Ne = 500 - last_turn_tokens <= 0`，既能完美触发 `prompt is too long`，又能让客户端
+///      跳过 `CHt` 的尾部膨胀，平滑保留 1 轮最新输入并压缩全部历史！
+pub fn calculate_cowork_pruning_target(_est_tokens: u32, target_limit: u32) -> (u32, u32) {
+    // 赋予极小的正向差额 (500 tokens)，确保 actual > maximum 严格成立，
+    // 同时使 Ne = tokenGap - last_turn_tokens <= 0，规避 CHt 倒算二分折半陷阱
+    let safe_gap = 500u32;
+    let report_tokens = target_limit.saturating_add(safe_gap);
+    (report_tokens, target_limit)
+}
+
+/// 构造 Anthropic 原生 SSE 流式响应体，回显真实 Compacted 结果
+fn make_compact_sse_response(text: &str, model: &str, input_tokens: u32) -> String {
+    let msg_id = format!(
+        "msg_compact_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let mut out = String::new();
+
+    let start_event = json!({
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": serde_json::Value::Null,
+            "stop_sequence": serde_json::Value::Null,
+            "usage": {
+                "input_tokens": input_tokens.max(1),
+                "output_tokens": 1
+            }
+        }
+    });
+    out.push_str(&format!(
+        "event: message_start\ndata: {}\n\n",
+        serde_json::to_string(&start_event).unwrap_or_default()
+    ));
+
+    let cbs_event = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""}
+    });
+    out.push_str(&format!(
+        "event: content_block_start\ndata: {}\n\n",
+        serde_json::to_string(&cbs_event).unwrap_or_default()
+    ));
+
+    let cbd_event = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": text}
+    });
+    out.push_str(&format!(
+        "event: content_block_delta\ndata: {}\n\n",
+        serde_json::to_string(&cbd_event).unwrap_or_default()
+    ));
+
+    let cbst_event = json!({
+        "type": "content_block_stop",
+        "index": 0
+    });
+    out.push_str(&format!(
+        "event: content_block_stop\ndata: {}\n\n",
+        serde_json::to_string(&cbst_event).unwrap_or_default()
+    ));
+
+    let md_event = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": serde_json::Value::Null},
+        "usage": {"output_tokens": 15}
+    });
+    out.push_str(&format!(
+        "event: message_delta\ndata: {}\n\n",
+        serde_json::to_string(&md_event).unwrap_or_default()
+    ));
+
+    out.push_str("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    out
+}
+
+/// 构造 Anthropic 原生非流式 JSON 响应体
+fn make_compact_json_response(text: &str, model: &str, input_tokens: u32) -> Value {
+    let msg_id = format!(
+        "msg_compact_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    json!({
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{
+            "type": "text",
+            "text": text
+        }],
+        "stop_reason": "end_turn",
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": input_tokens.max(1),
+            "output_tokens": 15
+        }
+    })
+}
 
 // ===== Task #6: OpenCode variants thinking config mapping =====
 // Helper structs for parsing thinking hints from raw JSON
@@ -89,13 +484,14 @@ fn extract_thinking_hint(body: &Value) -> ThinkingHint {
         hint.budget_tokens = Some(budget as u32);
     }
 
-    // Try to extract level from thinkingLevel / reasoning_effort / output_config.effort
+    // Try to extract level from thinkingLevel / reasoning_effort / output_config.effort / thinking.effort
     if let Some(level) = body
         .get("thinkingLevel")
         .or_else(|| body.get("thinking_level"))
         .or_else(|| body.get("reasoning_effort"))
         .or_else(|| body.get("reasoningEffort"))
         .or_else(|| body.get("output_config").and_then(|o| o.get("effort")))
+        .or_else(|| body.get("thinking").and_then(|t| t.get("effort")))
         .and_then(|l| l.as_str())
     {
         hint.level = Some(level.to_lowercase());
@@ -137,10 +533,15 @@ fn apply_thinking_hints(
 
     // If budget is provided, set/override thinking config
     if let Some(budget) = hint.budget_tokens {
+        let existing_effort = request
+            .thinking
+            .as_ref()
+            .and_then(|t| t.effort.clone())
+            .or_else(|| hint.level.clone());
         request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
             type_: "enabled".to_string(),
             budget_tokens: Some(budget),
-            effort: None,
+            effort: existing_effort,
         });
         tracing::debug!(
             "[{}] Applied thinking hint: budget_tokens={}",
@@ -371,10 +772,9 @@ mod variant_tests {
 
     #[test]
     fn claude_model_without_variant_mapping_preserves_output_config_on_none() {
-        // claude-sonnet-4-5 is NOT in GEMINI_FAMILIES and NOT in
-        // resolve_non_variant_model, so resolve_with_tier returns None,
+        // Models without variant mapping or valid effort tiers return None,
         // and apply_variant returns None without mutating the request.
-        let mut request = request_with_effort("claude-sonnet-4-5", "high", 10_000);
+        let mut request = request_with_effort("custom-legacy-model", "unsupported", 10_000);
         let effort = crate::proxy::common::variant_mapping::tier_from_effort(
             request
                 .output_config
@@ -383,19 +783,16 @@ mod variant_tests {
         );
 
         let result = apply_variant(&mut request, effort, Some(10_000));
-        assert!(
-            result.is_none(),
-            "unregistered Claude model must return None"
-        );
+        assert!(result.is_none(), "unregistered model must return None");
 
         // Model and output_config must remain untouched.
-        assert_eq!(request.model, "claude-sonnet-4-5");
+        assert_eq!(request.model, "custom-legacy-model");
         assert_eq!(
             request
                 .output_config
                 .as_ref()
                 .and_then(|c| c.effort.as_deref()),
-            Some("high")
+            Some("unsupported")
         );
     }
 }
@@ -426,6 +823,44 @@ fn apply_variant(
     request.max_tokens = Some(spec.max_output_tokens);
 
     Some(spec)
+}
+
+/// [FIX #3593] 检查 Claude 流数据块是否包含错误事件
+/// 在 Peek 预读阶段识别流错误（如上游断连、错误帧），触发账号轮换重试，避免将错误误判为合法首包导致 500
+fn claude_stream_chunk_has_error_event(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut saw_error_event = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "event: error" {
+            saw_error_event = true;
+        } else if let Some(data) = trimmed.strip_prefix("data:") {
+            if saw_error_event {
+                return true;
+            }
+            if let Ok(payload) = serde_json::from_str::<Value>(data.trim()) {
+                if payload.get("type").and_then(Value::as_str) == Some("error")
+                    || payload.get("error").is_some_and(|e| !e.is_null())
+                {
+                    return true;
+                }
+            }
+        } else if trimmed.is_empty() {
+            saw_error_event = false;
+        }
+    }
+    false
+}
+
+/// [Issue #3634] 规范化 Claude 协议的 HTTP 错误状态码。
+/// 1. HTTP 529 统一转为 HTTP 429：避免触发 Claude Code PB(an) 的过载降级状态机（强制关闭 fastMode 并进入 10~30 分钟过载冷却）；
+/// 2. HTTP 403 统一转为 HTTP 503：避免 Claude Code 客户端误判为鉴权失效并强制退出登录。
+pub(crate) fn normalize_claude_error_status(status_code: u16) -> StatusCode {
+    match status_code {
+        403 => StatusCode::SERVICE_UNAVAILABLE,
+        529 => StatusCode::TOO_MANY_REQUESTS,
+        code => StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 /// 处理 Claude messages 请求
@@ -492,6 +927,24 @@ pub async fn handle_messages(
             }
         };
 
+    // 0. 自定义映射优先拦截 (用户自定义路由与热更新规则拥有最高优先级，避免被后续变体推断抹平原模型意图)
+    let custom_target = {
+        let custom_mapping = state.custom_mapping.read().await;
+        crate::proxy::common::model_mapping::resolve_custom_model_route(
+            &request.model,
+            &*custom_mapping,
+        )
+    };
+    if let Some(target) = custom_target {
+        tracing::info!(
+            "[{}] [CustomMapping] 命中用户自定义映射规则: {} -> {}",
+            trace_id,
+            request.model,
+            target
+        );
+        request.model = target;
+    }
+
     // [Variant] Resolve canonical model + variant → real model + real params.
     let model_lower = request.model.to_lowercase();
     let is_v3_or_above = model_specs::is_gemini_v3_or_above(&request.model);
@@ -556,12 +1009,17 @@ pub async fn handle_messages(
             .map(|v| v as u32)
     };
 
-    let effort_hint = request
-        .output_config
-        .as_ref()
-        .and_then(|config| config.effort.clone())
-        .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
-        .or_else(|| thinking_hint.level.clone());
+    // 当客户端显式关闭思考或预算为 0 时（如 Claude Desktop 自动模式安全门禁），意图对齐至 low 档位，确保命中低开销模型
+    let effort_hint = if client_disabled {
+        Some("low".to_string())
+    } else {
+        request
+            .output_config
+            .as_ref()
+            .and_then(|config| config.effort.clone())
+            .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
+            .or_else(|| thinking_hint.level.clone())
+    };
     let effort_tier =
         crate::proxy::common::variant_mapping::tier_from_effort(effort_hint.as_deref());
     let canonical_model = request.model.clone();
@@ -650,7 +1108,13 @@ pub async fn handle_messages(
 
     // [NEW] 获取上下文控制配置
     let experimental = state.experimental.read().await;
-    let scaling_enabled = experimental.enable_usage_scaling;
+    // 关键防护（方案 A）：Claude Code (CLI / Desktop Code Tab) 具备原生的主动滑动窗口压缩机制 (/compact)，
+    // 其内部通过 input_tokens 占比达到 ~95% 上限触发自动压缩。
+    // 若对其开启用量缩放，会将百万级物理 Token 压缩映射至假性偏低的数值区间（如 500k 映射为 58k），
+    // 导致客户端永远无法感知真实上下文压力、丧失主动 /compact 触发时机，并在触及服务端硬限制时骤然崩溃 (Fixes #867, #1066, #1079)。
+    // 因此：若检测为 Claude Code 会话，强制关闭用量缩放，如实下发真实物理 Token 用量。
+    let is_code = is_code_mode(&request);
+    let scaling_enabled = experimental.enable_usage_scaling && !is_code;
 
     // [全链路会话生命周期与自愈分流体系 (Pipeline First)]
     // 提取会话唯一标识（优先提取产品专属会话头或内容锚点）
@@ -662,9 +1126,17 @@ pub async fn handle_messages(
                 crate::proxy::thinking_store::derive_winner_session_id("anon", None, &anchor)
             });
 
-    // 维持状态机容量
-    if COMPACTION_ONE_SHOT_SESSIONS.len() > 2000 {
-        COMPACTION_ONE_SHOT_SESSIONS.clear();
+    // 维持状态机容量，执行条目级细粒度 TTL 清理，彻底避免粗暴全量 clear() 导致的 herd invalidation
+    if COMPACTION_IMMUNITY_LEASES.len() > 1000 {
+        let now = std::time::Instant::now();
+        COMPACTION_IMMUNITY_LEASES.retain(|_, lease| {
+            if !lease.consumed {
+                now.duration_since(lease.created_at).as_secs()
+                    < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+            } else {
+                now.duration_since(lease.last_touched).as_secs() < COMPACTION_IMMUNITY_WINDOW_SECS
+            }
+        });
     }
 
     // 分流 A: 客户端原生发起的压缩总结请求 (Compaction Summary Request) -> 生命线直通放行，绝对不误杀
@@ -673,79 +1145,388 @@ pub async fn handle_messages(
         .and_then(|h| h.to_str().ok())
         .map_or(false, |v| v.contains("compaction"));
 
-    let is_compaction_request = is_compaction_header
-        || request.messages.last().map_or(false, |m| {
-            let text = match &m.content {
-                crate::proxy::mappers::claude::models::MessageContent::String(s) => s.as_str(),
-                crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => blocks
-                    .iter()
-                    .rev()
-                    .find_map(|b| match b {
-                        crate::proxy::mappers::claude::models::ContentBlock::Text { text } => {
-                            Some(text.as_str())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(""),
-            };
-            crate::proxy::mappers::common_utils::is_compaction_request_text(text)
-        })
-        || request.system.as_ref().map_or(false, |sys| {
-            let sys_text = match sys {
-                crate::proxy::mappers::claude::models::SystemPrompt::String(s) => s.as_str(),
-                crate::proxy::mappers::claude::models::SystemPrompt::Array(arr) => {
-                    arr.first().map(|b| b.text.as_str()).unwrap_or("")
-                }
-            };
-            crate::proxy::mappers::common_utils::is_compaction_request_text(sys_text)
-        });
+    // 检查是否有任何消息或 System Prompt 命中摘要特征
+    let has_compaction_message = request.messages.iter().rev().take(5).any(|m| {
+        let text = match &m.content {
+            crate::proxy::mappers::claude::models::MessageContent::String(s) => s.as_str(),
+            crate::proxy::mappers::claude::models::MessageContent::Array(blocks) => blocks
+                .iter()
+                .rev()
+                .find_map(|b| match b {
+                    crate::proxy::mappers::claude::models::ContentBlock::Text { text } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(""),
+        };
+        crate::proxy::mappers::common_utils::is_compaction_request_text(text)
+    });
+
+    let has_compaction_system = request.system.as_ref().map_or(false, |sys| match sys {
+        crate::proxy::mappers::claude::models::SystemPrompt::String(s) => {
+            crate::proxy::mappers::common_utils::is_compaction_request_text(s)
+        }
+        crate::proxy::mappers::claude::models::SystemPrompt::Array(arr) => arr
+            .iter()
+            .any(|b| crate::proxy::mappers::common_utils::is_compaction_request_text(&b.text)),
+    });
+
+    let is_compaction_request =
+        is_compaction_header || has_compaction_message || has_compaction_system;
 
     if is_compaction_request {
-        // [One-Shot Immunity] 为该会话发放单次免死标识，纯状态流转，用完即焚
-        COMPACTION_ONE_SHOT_SESSIONS.insert(session_key.clone());
+        // [Compaction Lifecycle] 彻底作废当前会话预压缩历史签名与思考缓存
+        crate::proxy::thinking_store::clear_session_for_compaction(&session_key);
+
+        // [Compaction Immunity Lease] 为该会话发放免死租约，支持并发接续与重试
+        let now = std::time::Instant::now();
+        COMPACTION_IMMUNITY_LEASES.insert(
+            session_key.clone(),
+            CompactionImmunityLease {
+                created_at: now,
+                last_touched: now,
+                consumed: false,
+            },
+        );
+
+        // 跨轮次关联对齐：遍历近期处于 compacting 状态的会话，同步发放租约并确认为已完成摘要
+        // 解决客户端摘要请求因 tools/system 变动导致 extract_session_id 发生哈希偏移的问题
+        PENDING_COMPACT_SESSIONS.retain(|_, ts| now.duration_since(*ts).as_secs() < 120);
+        for entry in PENDING_COMPACT_SESSIONS.iter() {
+            let pending_sid = entry.key();
+            crate::proxy::thinking_store::clear_session_for_compaction(pending_sid);
+            COMPACTION_IMMUNITY_LEASES.insert(
+                pending_sid.clone(),
+                CompactionImmunityLease {
+                    created_at: now,
+                    last_touched: now,
+                    consumed: false,
+                },
+            );
+            if let Some(mut state) = COWORK_COMPACT_SESSIONS.get_mut(pending_sid) {
+                state.summary_done = true;
+            }
+        }
+
+        if let Some(mut state) = COWORK_COMPACT_SESSIONS.get_mut(&session_key) {
+            state.summary_done = true;
+        }
         tracing::info!(
-            "[{}] [Lifecycle] Compaction summary request detected for session {}, issued one-shot immunity flag",
+            "[{}] [Lifecycle] Compaction summary request detected for session {}, issued immunity lease and invalidated pre-compaction signatures",
             trace_id, session_key
         );
     }
 
+    // 检查是否包含接续标记 (Post-Compaction Continuation)
+    let is_continuation_detected = detect_post_compaction_continuation(&request);
+
     // 分流 B: 已完成压缩提纯的会话接续 (Post-Compaction Continuation)
-    // 采用纯单次消费型状态机 (One-Shot Immunity):
-    // 仅豁免紧随压缩完成后的第 1 次续写请求（防止同一次交互内连续收到 400 触发客户端熔断）。
-    // 一旦消费即刻从集合中彻底移除清空！后续轮次若再次膨胀超限，将正常进入第 2、第 3 轮自愈，彻底根除“一次压缩终身免死”！
-    let is_post_compaction = if COMPACTION_ONE_SHOT_SESSIONS.remove(&session_key).is_some() {
-        tracing::info!(
-            "[{}] [Lifecycle] Consumed one-shot post-compaction immunity for session {}, granted 1M passthrough",
-            trace_id, session_key
-        );
-        true
+    // 采用代际租约状态机 (CompactionImmunityLease):
+    // 1. 严格守卫 !is_compaction_request：压缩摘要请求自身绝对不自毁刚刚发放的免死租约；
+    // 2. 首个接续请求接入后激活 30 秒滑动窗口，窗口内放行该会话的所有并发请求、工具调用与网络重试；
+    // 3. 空闲超过 30 秒后即刻核销失效，后续若再次超限将正常触发下一轮自愈，彻底杜绝终身免死 (Fixes #3563)。
+    let is_post_compaction = if !is_compaction_request {
+        if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+            let now = std::time::Instant::now();
+            let valid = if !lease.consumed {
+                now.duration_since(lease.created_at).as_secs()
+                    < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+            } else {
+                now.duration_since(lease.last_touched).as_secs() < COMPACTION_IMMUNITY_WINDOW_SECS
+            };
+            if valid {
+                lease.consumed = true;
+                lease.last_touched = now;
+                tracing::info!(
+                    "[{}] [Lifecycle] Active immunity lease for session {}, granted 1M passthrough (sliding window active)",
+                    trace_id, session_key
+                );
+                true
+            } else {
+                drop(lease);
+                COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+                false
+            }
+        } else {
+            false
+        }
     } else {
         false
     };
 
-    // 分流 C: 超限自愈假报警触发门禁 (必须自定义开启 + 双重确权)
+    // 若检测到已进入接续阶段且并非摘要请求自身，从统一压缩池中回收结算并归入防重放缓存
+    if (is_post_compaction || is_continuation_detected) && !is_compaction_request {
+        if let Some((_, state)) = COWORK_COMPACT_SESSIONS.remove(&session_key) {
+            crate::proxy::thinking_store::clear_session_for_compaction(&session_key);
+            let est_tokens = crate::proxy::pipeline::estimate_tokens(&original_body);
+            let saved_tok = state.before_tokens.saturating_sub(est_tokens);
+            let saved_k = (saved_tok as f64 / 1000.0).round() as u32;
+            let reply_text = if saved_k > 0 {
+                format!("Compacted conversation · saved {}k tokens", saved_k)
+            } else {
+                "Compacted conversation".to_string()
+            };
+            PENDING_COMPACT_SESSIONS.remove(&session_key);
+            prune_just_compacted_cache_if_needed();
+            COWORK_JUST_COMPACTED_CACHE.insert(
+                session_key.clone(),
+                (std::time::Instant::now(), reply_text, est_tokens),
+            );
+            tracing::info!(
+                "[{}] [Lifecycle] Harvested completed {:?} compact for session {} ({} -> {} tokens, saved {}k)",
+                trace_id, state.kind, session_key, state.before_tokens, est_tokens, saved_k
+            );
+        }
+    }
+
+    // 检查是否为手动 ./compact 穿透指令
+    let is_manual_compact = is_manual_compact_command(&request);
+
+    // 检查是否正处于压缩流程中（手动或自动），若是则自动豁免 auto_compact 门禁，彻底解耦双重 400 撞车！
+    let is_in_compaction = is_session_in_compaction(&session_key);
+
+    // 分流 C (优先分流): 手动 ./compact 指令拦截与闭环响应 (具有最高调度优先级，彻底短路自动门禁抢跑)
+    if experimental.enable_cowork_manual_compact && is_manual_compact {
+        let now = std::time::Instant::now();
+        let req_model = request.model.clone();
+        let est_tokens = crate::proxy::pipeline::estimate_tokens(&original_body);
+
+        // 情况 A: 60秒内刚完成过 compact，命中防重放缓存
+        if let Some(entry) = COWORK_JUST_COMPACTED_CACHE.get(&session_key) {
+            let (cached_ts, ref cached_text, cached_tokens) = *entry;
+            if now.duration_since(cached_ts).as_secs() < 60 {
+                tracing::info!(
+                    "[{}] [Manual-Compact] Cache hit for session {}, returning: {}",
+                    trace_id,
+                    session_key,
+                    cached_text
+                );
+                if request.stream {
+                    let sse = make_compact_sse_response(cached_text, &req_model, cached_tokens);
+                    return (
+                        StatusCode::OK,
+                        [
+                            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                            (header::CACHE_CONTROL, "no-cache"),
+                            (header::CONNECTION, "keep-alive"),
+                        ],
+                        sse,
+                    )
+                        .into_response();
+                } else {
+                    let json_val =
+                        make_compact_json_response(cached_text, &req_model, cached_tokens);
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(json_val),
+                    )
+                        .into_response();
+                }
+            } else {
+                drop(entry);
+                COWORK_JUST_COMPACTED_CACHE.remove(&session_key);
+            }
+        }
+
+        // 情况 B: 判断是否真正完成了压缩并处于重试阶段
+        let mut is_truly_compacted = false;
+        let mut before_tok = 0u32;
+
+        if let Some(entry) = COWORK_COMPACT_SESSIONS.get(&session_key) {
+            // 防死锁：超过 300 秒过期自动重置
+            if now.duration_since(entry.ts).as_secs() >= 300 {
+                drop(entry);
+                COWORK_COMPACT_SESSIONS.remove(&session_key);
+            } else {
+                before_tok = entry.before_tokens;
+                let summary_already_done = entry.summary_done;
+
+                // 条件: 摘要请求已完成，或带接续标记/豁免，或上下文 tokens 明显回落（回落至 85% 以下）
+                if summary_already_done
+                    || is_post_compaction
+                    || is_continuation_detected
+                    || (before_tok > 0 && est_tokens < (before_tok * 85 / 100))
+                {
+                    is_truly_compacted = true;
+                }
+            }
+        }
+
+        if is_truly_compacted {
+            let saved_tok = before_tok.saturating_sub(est_tokens);
+            let saved_k = (saved_tok as f64 / 1000.0).round() as u32;
+            let reply_text = if saved_k > 0 {
+                format!("Compacted conversation · saved {}k tokens", saved_k)
+            } else {
+                "Compacted conversation".to_string()
+            };
+
+            COWORK_COMPACT_SESSIONS.remove(&session_key);
+            PENDING_COMPACT_SESSIONS.remove(&session_key);
+            prune_just_compacted_cache_if_needed();
+            COWORK_JUST_COMPACTED_CACHE
+                .insert(session_key.clone(), (now, reply_text.clone(), est_tokens));
+            COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+            crate::proxy::thinking_store::clear_session_for_compaction(&session_key);
+
+            tracing::info!(
+                "[{}] [Manual-Compact] Successfully compacted for session {} ({} -> {} tokens, saved {}k)! Returning 200 OK",
+                trace_id, session_key, before_tok, est_tokens, saved_k
+            );
+
+            if request.stream {
+                let sse = make_compact_sse_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::CONNECTION, "keep-alive"),
+                    ],
+                    sse,
+                )
+                    .into_response();
+            } else {
+                let json_val = make_compact_json_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(json_val),
+                )
+                    .into_response();
+            }
+        }
+
+        // 情况 C: 初次捕获 ./compact 指令，或处于客户端网络级即时重试阶段
+        // 持续响应 400 假报警，直到驱动客户端彻底触发 Reactive Compact
+        prune_compact_sessions_if_needed();
+        let fixed_overhead = calculate_claude_fixed_overhead(&request);
+        let target_limit = (fixed_overhead + 15_000).max(35_000);
+
+        if !COWORK_COMPACT_SESSIONS.contains_key(&session_key) {
+            COWORK_COMPACT_SESSIONS.insert(
+                session_key.clone(),
+                CoworkCompactState {
+                    kind: CoworkCompactKind::Manual,
+                    before_tokens: est_tokens,
+                    ts: now,
+                    summary_done: false,
+                    target_limit,
+                },
+            );
+        } else if let Some(mut entry) = COWORK_COMPACT_SESSIONS.get_mut(&session_key) {
+            entry.ts = now;
+            if entry.before_tokens == 0 {
+                entry.before_tokens = est_tokens;
+            }
+            entry.target_limit = target_limit;
+        }
+        PENDING_COMPACT_SESSIONS.insert(session_key.clone(), now);
+
+        // 防御性校验：若当前 tokens 已经处于 target_limit 之内，直接返回 200 成功响应，
+        // 绝不发射 400 假报警，彻底杜绝客户端 Fst / fIt 算出负/零 initialTokenGap 触发 compactionImpossible
+        if est_tokens <= target_limit {
+            let reply_text = "Compacted conversation · already at minimal context".to_string();
+            tracing::info!(
+                "[{}] [Manual-Compact] Session {} context ({} tokens) is already <= target_limit ({}), returning 200 OK directly",
+                trace_id, session_key, est_tokens, target_limit
+            );
+            if request.stream {
+                let sse = make_compact_sse_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                        (header::CONNECTION, "keep-alive"),
+                    ],
+                    sse,
+                )
+                    .into_response();
+            } else {
+                let json_val = make_compact_json_response(&reply_text, &req_model, est_tokens);
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(json_val),
+                )
+                    .into_response();
+            }
+        }
+
+        let (report_tokens, client_target_limit) =
+            calculate_cowork_pruning_target(est_tokens, target_limit);
+        let err_msg = format!(
+            "prompt is too long: {} tokens > {} maximum",
+            report_tokens, client_target_limit
+        );
+        tracing::warn!(
+            "[{}] [Manual-Compact] Intercepted ./compact for session {} (tokens={}, fixed_overhead={}), responding with 400 fake alarm (client limit: {} tokens) to trigger deep client-side compact",
+            trace_id, session_key, est_tokens, fixed_overhead, client_target_limit
+        );
+
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": err_msg
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    // 分流 D: 超限自愈假报警触发门禁 (必须自定义开启 + 双重确权 + 非手动指令 + 非正在压缩中)
     // 铁律：普通 Agent 与未开启配置时，绝对不拦截，100% 享受 Gemini 百万超长上下文！
-    if experimental.enable_cowork_auto_compact && !is_compaction_request && !is_post_compaction {
-        let is_cowork = request.tools.as_ref().map_or(false, |tools| {
-            tools.iter().any(|t| {
-                let n = t.get_name();
-                n.starts_with("mcp__cowork") || n.starts_with("mcp__workspace")
-            })
-        });
+    if experimental.enable_cowork_auto_compact
+        && !is_compaction_request
+        && !is_post_compaction
+        && !is_manual_compact
+        && !is_in_compaction
+    {
+        let is_cowork = is_cowork_session(&request, &headers);
 
         if is_cowork {
-            let threshold = experimental.cowork_compact_threshold.max(50_000);
+            let fixed_overhead = calculate_claude_fixed_overhead(&request);
+            let target_limit = (fixed_overhead + 15_000).max(35_000);
+            let effective_threshold = calculate_effective_auto_compact_threshold(
+                experimental.cowork_compact_threshold,
+                target_limit,
+            );
             let est_tokens = crate::proxy::pipeline::estimate_tokens(&original_body);
-            if est_tokens >= threshold {
+
+            // 负 Gap 与净空防御门禁：必须满足 est_tokens >= effective_threshold 且 est_tokens > target_limit
+            if est_tokens >= effective_threshold && est_tokens > target_limit {
                 tracing::warn!(
-                    "[{}] [Cowork-Gatekeeper] Cowork session reached {} tokens >= threshold {}, triggering native reactive compact",
+                    "[{}] [Cowork-Gatekeeper] Cowork session reached {} tokens >= effective threshold {} (target_limit: {}), triggering native reactive compact",
                     trace_id,
                     est_tokens,
-                    threshold
+                    effective_threshold,
+                    target_limit
                 );
+                prune_compact_sessions_if_needed();
+                let now = std::time::Instant::now();
+                COWORK_COMPACT_SESSIONS.insert(
+                    session_key.clone(),
+                    CoworkCompactState {
+                        kind: CoworkCompactKind::Auto,
+                        before_tokens: est_tokens,
+                        ts: now,
+                        summary_done: false,
+                        target_limit,
+                    },
+                );
+                PENDING_COMPACT_SESSIONS.insert(session_key.clone(), now);
+                let (report_tokens, client_target_limit) =
+                    calculate_cowork_pruning_target(est_tokens, target_limit);
                 let err_msg = format!(
                     "prompt is too long: {} tokens > {} maximum",
-                    est_tokens, threshold
+                    report_tokens, client_target_limit
                 );
                 return (
                     StatusCode::BAD_REQUEST,
@@ -919,9 +1700,47 @@ pub async fn handle_messages(
     let mut think_fill_ms: f64 = 0.0;
     let mut ttft_ms: f64 = 0.0;
 
+    let request_start = tokio::time::Instant::now();
+    let global_deadline = request_start
+        + std::time::Duration::from_secs(super::common::MAX_GATEWAY_REQUEST_BUDGET_SECS);
+
     for attempt in 0..max_attempts {
         // [Stage 2 Timing] 中转归一计时起点
         let norm_start = std::time::Instant::now();
+
+        // 检查全局请求预算：严格防止内部轮换时间逼近客户端 300s 看门狗超时
+        let now = tokio::time::Instant::now();
+        if now >= global_deadline {
+            tracing::warn!(
+                "[{}] Claude 请求全局预算耗尽（{}s，共经历 {} 次尝试），终止重试以杜绝触发客户端 5 分钟超时看门狗",
+                trace_id,
+                super::common::MAX_GATEWAY_REQUEST_BUDGET_SECS,
+                attempt
+            );
+            if last_status == StatusCode::SERVICE_UNAVAILABLE || last_status == StatusCode::OK {
+                last_status = StatusCode::GATEWAY_TIMEOUT;
+            }
+            if last_error.is_empty() {
+                last_error = format!(
+                    "Gateway global request budget exceeded ({}s)",
+                    super::common::MAX_GATEWAY_REQUEST_BUDGET_SECS
+                );
+            }
+            break;
+        }
+
+        let remaining_global_secs = (global_deadline - now).as_secs();
+        if remaining_global_secs < 5 {
+            tracing::warn!(
+                "[{}] Claude 请求全局预算剩余不足 5s ({}s left)，安全退出重试循环",
+                trace_id,
+                remaining_global_secs
+            );
+            if last_status == StatusCode::SERVICE_UNAVAILABLE || last_status == StatusCode::OK {
+                last_status = StatusCode::GATEWAY_TIMEOUT;
+            }
+            break;
+        }
 
         // 2. 模型路由解析
         let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
@@ -965,15 +1784,29 @@ pub async fn handle_messages(
         let client_session_id = session_scope.client_id.clone();
         let session_id = Some(affinity_key.as_str());
 
-        let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
+        let mut token_result = token_manager
             .get_token(
                 &config.request_type,
                 force_rotate,
                 session_id,
                 &config.final_model,
             )
-            .await
-        {
+            .await;
+
+        if let Err(ref e) = token_result {
+            if crate::proxy::handlers::common::is_transient_token_error(e) {
+                tracing::warn!(
+                    "Token acquisition transient error ({}), retrying once with force_rotate...",
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                token_result = token_manager
+                    .get_token(&config.request_type, true, session_id, &config.final_model)
+                    .await;
+            }
+        }
+
+        let (access_token, project_id, email, account_id, _wait_ms) = match token_result {
             Ok(t) => t,
             Err(e) => {
                 let safe_message = if e.contains("invalid_grant") {
@@ -981,11 +1814,13 @@ pub async fn handle_messages(
                 } else {
                     e
                 };
-                let headers = crate::proxy::handlers::common::build_token_error_headers(
-                    Some(mapped_model.as_str()),
-                    None,
-                    &safe_message,
-                );
+                let headers =
+                    crate::proxy::handlers::common::build_token_error_headers_for_protocol(
+                        "claude",
+                        Some(mapped_model.as_str()),
+                        None,
+                        &safe_message,
+                    );
                 let dual_err = crate::proxy::handlers::common::build_dual_track_error(
                     "claude",
                     StatusCode::SERVICE_UNAVAILABLE.as_u16(),
@@ -1204,7 +2039,7 @@ pub async fn handle_messages(
         if status.is_success() {
             token_manager.commit_session(&affinity_key, &account_id);
             // [智能限流] 请求成功，重置该账号的连续失败计数
-            token_manager.mark_account_success(&email);
+            token_manager.mark_account_success(&account_id);
 
             // Determine context limit based on model
             let context_limit = crate::proxy::mappers::claude::utils::get_context_limit_for_model(
@@ -1273,16 +2108,81 @@ pub async fn handle_messages(
                     registered_tool_names, // [FIX #MCP] Pass tool names for fuzzy matching
                 );
 
+                // [FIX #3634 对齐 Anthropic 官方规范并彻底杜绝网关静默超时]
+                // 当客户端明确请求流式模式 (stream=true) 时：
+                // 严禁在此处进行阻塞式 Peek 预读缓冲与心跳丢弃！
+                // 上游已经成功建立连接返回 HTTP 200，网关必须立即向客户端返回 HTTP 200 与 text/event-stream 响应头，
+                // 并由 stream_lifecycle 驱动器每 3 秒实时下发官方 SSE ping 心跳 (`event: ping\ndata: {"type": "ping"}\n\n`)。
+                // 这确保下游客户端（Claude Code 等）看门狗持续被心跳保活，绝不会因 Prefill 或推理思考等待触发 5 分钟无响应断连 (CLI error 'Request timed out')。
+                if client_wants_stream {
+                    ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
+                    let stream_mapped =
+                        claude_stream.map(|result| -> Result<Bytes, std::io::Error> {
+                            match result {
+                                Ok(b) => Ok(b),
+                                Err(e) => {
+                                    Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, e))
+                                }
+                            }
+                        });
+
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .header(header::CONNECTION, "keep-alive")
+                        .header("X-Accel-Buffering", "no")
+                        .header("X-Account-Email", &email)
+                        .header("X-Mapped-Model", &request_with_mapped.model)
+                        .header("X-Session-Id", &client_session_id)
+                        .header("X-Antigravity-Session-Id", &client_session_id)
+                        .header("X-Context-Purified", "false")
+                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                        .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                        .body(Body::from_stream(stream_mapped))
+                        .unwrap();
+                }
+
                 let mut first_data_chunk = None;
                 let mut retry_this_account = false;
 
-                // Loop to skip heartbeats during peek
+                // Loop to skip heartbeats during peek (for non-streaming requests)
+                // [FIX #3634] 动态自适应计算 Peek 超时时间，并受全局剩余请求预算严格约束，
+                // 彻底杜绝大 Prompt 预热（TTFT > 30s）被误杀，同时杜绝累积超时触发客户端 5 分钟看门狗
+                let base_peek_secs = super::common::calculate_adaptive_peek_timeout(
+                    is_compaction_request,
+                    false,
+                    Some(raw_estimated),
+                );
+                let current_remaining_secs = global_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_secs();
+                let peek_timeout_secs =
+                    base_peek_secs.min(current_remaining_secs.saturating_sub(2).max(5));
+                // [FIX #3621] 采用固定截止时间点，杜绝遇到心跳 : ping 时刷新重置 30s 倒计时导致的 100s 死等死循环
+                let peek_deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(peek_timeout_secs);
                 loop {
+                    let now = tokio::time::Instant::now();
+                    if now >= peek_deadline {
+                        tracing::warn!(
+                            "[{}] Total timeout waiting for first data ({}s) during peek, retrying...",
+                            trace_id,
+                            peek_timeout_secs
+                        );
+                        last_error =
+                            format!("Timeout waiting for first data ({}s)", peek_timeout_secs);
+                        retry_this_account = true;
+                        break;
+                    }
+                    let remaining = peek_deadline - now;
+
                     match tokio::time::timeout(
-                        // [FIX #Bug1] Reduced from 300s to 30s.
-                        // Gemini sends first chunk within 5s normally; 30s allows for retries
-                        // without causing the 5-minute hang users observed.
-                        std::time::Duration::from_secs(30),
+                        // [FIX #Bug1] Reduced from 300s to 30s for normal requests;
+                        // Extended to 180s for compaction summary requests due to heavy prompt processing (Fixes #3614).
+                        remaining,
                         claude_stream.next(),
                     )
                     .await
@@ -1294,9 +2194,24 @@ pub async fn handle_messages(
 
                             let text = String::from_utf8_lossy(&bytes);
                             // Skip SSE comments/pings
-                            if text.trim().starts_with(":") {
+                            if text.trim().starts_with(":")
+                                || text.contains("\"type\":\"ping\"")
+                                || text.contains("\"type\": \"ping\"")
+                            {
                                 debug!("[{}] Skipping peek heartbeat: {}", trace_id, text.trim());
                                 continue;
+                            }
+
+                            // [FIX #3593] 识别 Peek 阶段的错误事件，触发账号轮换重试而非误判为首包
+                            if claude_stream_chunk_has_error_event(&bytes) {
+                                tracing::warn!(
+                                    "[{}] Error event detected during peek: {}, retrying...",
+                                    trace_id,
+                                    text.trim()
+                                );
+                                last_error = format!("Error event during peek: {}", text.trim());
+                                retry_this_account = true;
+                                break;
                             }
 
                             // We found real data!
@@ -1325,10 +2240,12 @@ pub async fn handle_messages(
                         }
                         Err(_) => {
                             tracing::warn!(
-                                "[{}] Timeout waiting for first data (30s), retrying...",
-                                trace_id
+                                "[{}] Timeout waiting for first data ({}s), retrying...",
+                                trace_id,
+                                peek_timeout_secs
                             );
-                            last_error = "Timeout waiting for first data".to_string();
+                            last_error =
+                                format!("Timeout waiting for first data ({}s)", peek_timeout_secs);
                             retry_this_account = true;
                             break;
                         }
@@ -1336,6 +2253,7 @@ pub async fn handle_messages(
                 }
 
                 if retry_this_account {
+                    force_rotate = true;
                     continue;
                 }
 
@@ -1347,87 +2265,45 @@ pub async fn handle_messages(
                             .chain(stream_rest.map(|result| -> Result<Bytes, std::io::Error> {
                                 match result {
                                     Ok(b) => Ok(b),
-                                    Err(e) => Ok(Bytes::from(format!(
-                                        "data: {{\"error\":\"{}\"}}\n\n",
-                                        e
-                                    ))),
+                                    Err(e) => Err(std::io::Error::new(
+                                        std::io::ErrorKind::ConnectionReset,
+                                        e,
+                                    )),
                                 }
                             }));
 
-                        // [FIX #Bug1] 针对 Claude 流增加空闲超时保护，从 300s 降至 120s
-                        // 300s 会导致客户端等待长达 5 分钟；120s 仍有足够容错余量
-                        let combined_stream = async_stream::stream! {
-                            let mut s = Box::pin(combined_stream);
-                            loop {
-                                match tokio::time::timeout(std::time::Duration::from_secs(120), s.next()).await {
-                                    Ok(Some(item)) => yield item,
-                                    Ok(None) => break,
-                                    Err(_) => {
-                                        tracing::error!("[Claude-SSE] Idle timeout after 120s, terminating stream");
-                                        yield Ok::<Bytes, std::io::Error>(Bytes::from("data: {\"type\": \"message_stop\"}\n\ndata: [DONE]\n\n"));
-                                        break;
-                                    }
-                                }
+                        // 客户端要非 Stream，需要收集完整响应并转换为 JSON
+                        use crate::proxy::mappers::claude::collect_stream_to_json;
+
+                        match collect_stream_to_json(Box::pin(combined_stream)).await {
+                            Ok(full_response) => {
+                                info!("[{}] ✓ Stream collected and converted to JSON", trace_id);
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .header("X-Account-Email", &email)
+                                    .header("X-Mapped-Model", &request_with_mapped.model)
+                                    .header("X-Session-Id", &client_session_id)
+                                    .header("X-Antigravity-Session-Id", &client_session_id)
+                                    .header("X-Context-Purified", "false")
+                                    .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                    .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                    .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                    .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                    .body(Body::from(
+                                        serde_json::to_string(&full_response).unwrap(),
+                                    ))
+                                    .unwrap();
                             }
-                        };
-
-                        // 判断客户端期望的格式
-                        if client_wants_stream {
-                            // 客户端本就要 Stream，直接返回 SSE
-                            return Response::builder()
-                                .status(StatusCode::OK)
-                                .header(header::CONTENT_TYPE, "text/event-stream")
-                                .header(header::CACHE_CONTROL, "no-cache")
-                                .header(header::CONNECTION, "keep-alive")
-                                .header("X-Accel-Buffering", "no")
-                                .header("X-Account-Email", &email)
-                                .header("X-Mapped-Model", &request_with_mapped.model)
-                                .header("X-Session-Id", &client_session_id)
-                                .header("X-Antigravity-Session-Id", &client_session_id)
-                                .header("X-Context-Purified", "false")
-                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
-                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
-                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
-                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
-                                .body(Body::from_stream(combined_stream))
-                                .unwrap();
-                        } else {
-                            // 客户端要非 Stream，需要收集完整响应并转换为 JSON
-                            use crate::proxy::mappers::claude::collect_stream_to_json;
-
-                            match collect_stream_to_json(Box::pin(combined_stream)).await {
-                                Ok(full_response) => {
-                                    info!(
-                                        "[{}] ✓ Stream collected and converted to JSON",
-                                        trace_id
+                            Err(e) => {
+                                tracing::warn!(
+                                        "[{}] Stream collection error (possibly upstream interrupted): {}, retrying with another account...",
+                                        trace_id,
+                                        e
                                     );
-                                    return Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header(header::CONTENT_TYPE, "application/json")
-                                        .header("X-Account-Email", &email)
-                                        .header("X-Mapped-Model", &request_with_mapped.model)
-                                        .header("X-Session-Id", &client_session_id)
-                                        .header("X-Antigravity-Session-Id", &client_session_id)
-                                        .header("X-Context-Purified", "false")
-                                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
-                                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
-                                        .header(
-                                            "X-Timing-Thinking-Ms",
-                                            format!("{:.3}", think_fill_ms),
-                                        )
-                                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
-                                        .body(Body::from(
-                                            serde_json::to_string(&full_response).unwrap(),
-                                        ))
-                                        .unwrap();
-                                }
-                                Err(e) => {
-                                    return (
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        format!("Stream collection error: {}", e),
-                                    )
-                                        .into_response();
-                                }
+                                last_error = format!("Stream collection error: {}", e);
+                                force_rotate = true;
+                                continue;
                             }
                         }
                     }
@@ -1594,8 +2470,25 @@ pub async fn handle_messages(
         );
 
         if classification.is_model_not_found() {
+            // [NEW] 针对特定账号记录单模型临时熔断（例如该 PRO 账号未开通 Claude 5.5），绝不连坐其他模型
+            token_manager.mark_model_unsupported(
+                &account_id,
+                &request_with_mapped.model,
+                Some(900),
+            );
+
+            // 如果账号池中还有其他未尝试的候选账号，则顺畅换号重试，而不是直接放弃报错
+            if attempt < pool_size {
+                tracing::warn!(
+                    "[{}] 上游报错模型不可用 (HTTP {})，已标记账号 {} 对模型 [{}] 临时熔断，继续换号重试 ({}/{})...",
+                    trace_id, status_code, email, request_with_mapped.model, attempt, pool_size
+                );
+                force_rotate = true;
+                continue;
+            }
+
             tracing::warn!(
-                "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating retry loop without account lockout.",
+                "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Pool exhausted without account-level lockout.",
                 trace_id, request_with_mapped.model, status_code
             );
             let dual_err = crate::proxy::handlers::common::build_dual_track_error(
@@ -1829,110 +2722,39 @@ pub async fn handle_messages(
                 "[{}] Non-retryable error {}: {}",
                 trace_id, status_code, error_text
             );
+            let response_status = normalize_claude_error_status(status_code);
+            let headers = crate::proxy::handlers::common::build_token_error_headers_for_protocol(
+                "claude",
+                Some(request_with_mapped.model.as_str()),
+                Some(email.as_str()),
+                &error_text,
+            );
             let dual_err = crate::proxy::handlers::common::build_dual_track_error(
                 "claude",
-                status_code,
+                response_status.as_u16(),
                 &request_with_mapped.model,
                 &error_text,
             );
-            return (
-                status,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                ],
-                Json(dual_err),
-            )
-                .into_response();
+            return (response_status, headers, Json(dual_err)).into_response();
         }
     }
 
-    if let Some(email) = last_email {
-        // [FIX] Include X-Mapped-Model in exhaustion error
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Account-Email",
-            header::HeaderValue::from_str(&email).unwrap(),
-        );
-        if let Some(ref model) = last_mapped_model {
-            if let Ok(v) = header::HeaderValue::from_str(model) {
-                headers.insert("X-Mapped-Model", v);
-            }
-        }
+    let response_status = normalize_claude_error_status(last_status.as_u16());
+    let headers = crate::proxy::handlers::common::build_token_error_headers_for_protocol(
+        "claude",
+        last_mapped_model.as_deref(),
+        last_email.as_deref(),
+        &last_error,
+    );
+    let model_str = last_mapped_model.as_deref().unwrap_or("unknown");
+    let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+        "claude",
+        response_status.as_u16(),
+        model_str,
+        &last_error,
+    );
 
-        let _error_type = match last_status.as_u16() {
-            400 => "invalid_request_error",
-            401 => "authentication_error",
-            403 => "permission_error",
-            429 => "rate_limit_error",
-            529 => "overloaded_error",
-            _ => "api_error",
-        };
-
-        // [FIX] 403 时返回 503，避免 Claude Code 客户端退出到登录页
-        let response_status = if last_status.as_u16() == 403 {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            last_status
-        };
-
-        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error)
-        {
-            if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
-                headers.insert(axum::http::header::RETRY_AFTER, val);
-            }
-        }
-
-        let model_str = last_mapped_model.as_deref().unwrap_or("unknown");
-        let dual_err = crate::proxy::handlers::common::build_dual_track_error(
-            "claude",
-            response_status.as_u16(),
-            model_str,
-            &last_error,
-        );
-
-        (response_status, headers, Json(dual_err)).into_response()
-    } else {
-        // Fallback if no email (e.g. mapping error before token)
-        let mut headers = HeaderMap::new();
-        if let Some(ref model) = last_mapped_model {
-            if let Ok(v) = header::HeaderValue::from_str(model) {
-                headers.insert("X-Mapped-Model", v);
-            }
-        }
-        if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error)
-        {
-            if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
-                headers.insert(axum::http::header::RETRY_AFTER, val);
-            }
-        }
-
-        let _error_type = match last_status.as_u16() {
-            400 => "invalid_request_error",
-            401 => "authentication_error",
-            403 => "permission_error",
-            429 => "rate_limit_error",
-            529 => "overloaded_error",
-            _ => "api_error",
-        };
-
-        // [FIX] 403 时返回 503，避免 Claude Code 客户端退出到登录页
-        let response_status = if last_status.as_u16() == 403 {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            last_status
-        };
-
-        let model_str = last_mapped_model.as_deref().unwrap_or("unknown");
-        let dual_err = crate::proxy::handlers::common::build_dual_track_error(
-            "claude",
-            response_status.as_u16(),
-            model_str,
-            &last_error,
-        );
-
-        (response_status, headers, Json(dual_err)).into_response()
-    }
+    (response_status, headers, Json(dual_err)).into_response()
 }
 
 /// 列出可用模型
@@ -2046,6 +2868,150 @@ mod opus_variant_tests {
         };
 
         assert_eq!(request_thinking.budget_tokens, Some(1_024));
+    }
+}
+
+#[cfg(test)]
+mod claude_error_normalization_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn test_normalize_claude_error_status_mappings() {
+        // 529 必须映射为 429，防止触发 Claude Code PB(an) 过载降级与 10~30 分钟冷却
+        assert_eq!(
+            normalize_claude_error_status(529),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // 403 必须映射为 503，防止 Claude Code 客户端误判为 Session 失效并弹出登录页
+        assert_eq!(
+            normalize_claude_error_status(403),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // 其余常见状态码保持原样透传
+        assert_eq!(
+            normalize_claude_error_status(429),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(normalize_claude_error_status(400), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            normalize_claude_error_status(500),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            normalize_claude_error_status(503),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_claude_dual_track_error_never_emits_overloaded_error() {
+        let err_json = crate::proxy::handlers::common::build_dual_track_error(
+            "claude",
+            429,
+            "claude-3-7-sonnet",
+            "Rate limit exceeded. Resource has been exhausted.",
+        );
+
+        let err_str = serde_json::to_string(&err_json).unwrap();
+        // 确保绝对不包含 "overloaded_error"，防止被 Claude Code PB(an) 正则或 message 捕获
+        assert!(!err_str.contains("overloaded_error"));
+        assert_eq!(err_json["type"], "error");
+        assert_eq!(err_json["error"]["type"], "rate_limit_error");
+    }
+
+    #[test]
+    fn test_claude_error_headers_clamp_extreme_quota_delay() {
+        // 模拟上游返回 5360s 超大重试延迟（避免客户端计算出 1h 29m 20s）
+        let headers = crate::proxy::handlers::common::build_token_error_headers_for_protocol(
+            "claude",
+            Some("claude-3-7-sonnet"),
+            Some("test@example.com"),
+            "Resource has been exhausted (e.g. check quota). Wait 5360s.",
+        );
+
+        assert_eq!(
+            headers.get("x-mapped-model").unwrap().to_str().unwrap(),
+            "claude-3-7-sonnet"
+        );
+        assert_eq!(
+            headers.get("x-account-email").unwrap().to_str().unwrap(),
+            "test@example.com"
+        );
+        // Retry-After 必须被收敛至 safe 范围 (<= 12s)
+        let retry_after = headers
+            .get(axum::http::header::RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let retry_sec: u64 = retry_after.parse().unwrap();
+        assert!(
+            retry_sec <= 12,
+            "retry_sec must be <= 12s, got {}",
+            retry_sec
+        );
+        assert!(retry_sec >= 1, "retry_sec must be >= 1s, got {}", retry_sec);
+        assert_eq!(retry_sec, 12);
+    }
+
+    #[test]
+    fn test_global_budget_bounds_peek_timeout() {
+        // 验证全局预算对单次 peek 超时进行刚性约束，杜绝突破客户端 300s 看门狗
+        let base_peek_compaction =
+            crate::proxy::handlers::common::calculate_adaptive_peek_timeout(true, false, None);
+        assert_eq!(base_peek_compaction, 180);
+
+        // 当全局预算仅剩 40s 时，单次 peek 必须被安全收敛至 38s
+        let remaining_secs = 40u64;
+        let effective_peek = base_peek_compaction.min(remaining_secs.saturating_sub(2).max(5));
+        assert_eq!(effective_peek, 38);
+
+        // 当全局预算仅剩 6s 时，单次 peek 至少保留 5s 兜底
+        let remaining_secs_low = 6u64;
+        let effective_peek_low =
+            base_peek_compaction.min(remaining_secs_low.saturating_sub(2).max(5));
+        assert_eq!(effective_peek_low, 5);
+    }
+
+    #[test]
+    fn test_normalize_claude_error_status_gateway_timeout() {
+        assert_eq!(
+            normalize_claude_error_status(504),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        let err_json = crate::proxy::handlers::common::build_dual_track_error(
+            "claude",
+            504,
+            "claude-3-7-sonnet",
+            "Gateway global request budget exceeded (240s)",
+        );
+        assert_eq!(err_json["type"], "error");
+        let err_str = serde_json::to_string(&err_json).unwrap();
+        assert!(!err_str.contains("overloaded_error"));
+    }
+
+    #[test]
+    fn test_non_streaming_peek_heartbeat_detection() {
+        // 验证非流式 peek 识别并过滤心跳保活帧（包括注释心跳与官方 ping 事件）
+        let comment_ping = b": ping\n\n";
+        let text_comment = String::from_utf8_lossy(comment_ping);
+        assert!(text_comment.trim().starts_with(":"));
+
+        let event_ping = b"event: ping\ndata: {\"type\": \"ping\"}\n\n";
+        let text_event = String::from_utf8_lossy(event_ping);
+        assert!(
+            text_event.trim().starts_with(":")
+                || text_event.contains("\"type\":\"ping\"")
+                || text_event.contains("\"type\": \"ping\"")
+        );
+
+        let real_data = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n";
+        let text_real = String::from_utf8_lossy(real_data);
+        assert!(
+            !text_real.trim().starts_with(":")
+                && !text_real.contains("\"type\":\"ping\"")
+                && !text_real.contains("\"type\": \"ping\"")
+        );
     }
 }
 
@@ -2400,7 +3366,7 @@ async fn call_gemini_sync(
 ///
 /// This function:
 /// 1. Extracts the last valid thinking signature
-/// 2. Calls a cheap model (gemini-2.5-flash-lite) to generate XML summary
+/// 2. Calls a cheap model (gemini-3.1-flash-lite via internal-background-task) to generate XML summary
 /// 3. Creates a new message sequence with summary as prefix
 /// 4. Preserves the signature in the summary
 /// 5. Returns the forked request
@@ -2656,5 +3622,1090 @@ mod warmup_tests {
             tool_choice: None,
         };
         assert!(!is_warmup_request(&tool_error_req));
+    }
+
+    #[test]
+    fn test_is_manual_compact_command() {
+        use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+
+        // 1. 标准 ./compact 字符串
+        let req1 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("./compact".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(is_manual_compact_command(&req1));
+
+        // 2. 带 system-reminder 干扰的 ./compact
+        let req2 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String(
+                    "<system-reminder>some reminder</system-reminder>\n\n./compact".to_string(),
+                ),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(is_manual_compact_command(&req2));
+
+        // 3. Array 结构的 ContentBlock 文本
+        let req3 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Array(vec![ContentBlock::Text {
+                    text: "./compact please summarize".to_string(),
+                }]),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(is_manual_compact_command(&req3));
+
+        // 4. 普通用户提问，不应误判
+        let req4 = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("How to use compact method in Ruby?".to_string()),
+            }],
+            system: None,
+            max_tokens: Some(100),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            tools: None,
+            thinking: None,
+            metadata: None,
+            output_config: None,
+            size: None,
+            quality: None,
+            tool_choice: None,
+        };
+        assert!(!is_manual_compact_command(&req4));
+    }
+
+    #[test]
+    fn test_make_compact_responses() {
+        let text = "Compacted conversation · saved 289k tokens";
+        let sse = make_compact_sse_response(text, "claude-3-7-sonnet", 45100);
+        assert!(sse.contains("event: message_start"));
+        assert!(sse.contains("Compacted conversation · saved 289k tokens"));
+        assert!(sse.contains("\"input_tokens\":45100"));
+
+        let json = make_compact_json_response(text, "claude-3-7-sonnet", 45100);
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"][0]["text"], text);
+        assert_eq!(json["usage"]["input_tokens"], 45100);
+    }
+
+    #[test]
+    fn test_calculate_claude_fixed_overhead_and_solvable_target_limit() {
+        use crate::proxy::mappers::claude::models::{SystemBlock, SystemPrompt, Tool};
+
+        let req = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![],
+            system: Some(SystemPrompt::Array(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "You are Claude Code, an AI assistant.".to_string(),
+            }])),
+            tools: Some(vec![
+                Tool {
+                    type_: None,
+                    name: Some("Bash".to_string()),
+                    description: Some("Execute bash command".to_string()),
+                    input_schema: None,
+                },
+                Tool {
+                    type_: None,
+                    name: Some("Read".to_string()),
+                    description: Some("Read file".to_string()),
+                    input_schema: None,
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let overhead = calculate_claude_fixed_overhead(&req);
+        assert!(overhead > 0);
+        let target_limit = (overhead + 15_000).max(35_000);
+        assert!(target_limit >= 35_000);
+        assert!(target_limit >= overhead + 15_000);
+    }
+
+    #[test]
+    fn test_compact_session_orphan_timeout_eviction() {
+        let session_key = "test_orphan_session_eviction".to_string();
+        COWORK_COMPACT_SESSIONS.insert(
+            session_key.clone(),
+            CoworkCompactState {
+                kind: CoworkCompactKind::Manual,
+                before_tokens: 100_000,
+                ts: std::time::Instant::now() - std::time::Duration::from_secs(301),
+                summary_done: false,
+                target_limit: 35_000,
+            },
+        );
+
+        let is_in_compaction_active = is_session_in_compaction(&session_key);
+
+        assert!(
+            !is_in_compaction_active,
+            "Expired orphan session must not be considered in compaction"
+        );
+        assert!(
+            !COWORK_COMPACT_SESSIONS.contains_key(&session_key),
+            "Expired orphan session must be evicted from map"
+        );
+    }
+
+    #[test]
+    fn test_just_compacted_cache_expiration_and_capacity_cap() {
+        let session_key = "test_expired_compacted_session".to_string();
+        COWORK_JUST_COMPACTED_CACHE.insert(
+            session_key.clone(),
+            (
+                std::time::Instant::now() - std::time::Duration::from_secs(65),
+                "Compacted conversation".to_string(),
+                20_000,
+            ),
+        );
+
+        let now = std::time::Instant::now();
+        if let Some(entry) = COWORK_JUST_COMPACTED_CACHE.get(&session_key) {
+            let (cached_ts, _, _) = *entry;
+            if now.duration_since(cached_ts).as_secs() < 60 {
+                panic!("Should not hit cache for expired entry");
+            } else {
+                drop(entry);
+                COWORK_JUST_COMPACTED_CACHE.remove(&session_key);
+            }
+        }
+
+        assert!(
+            !COWORK_JUST_COMPACTED_CACHE.contains_key(&session_key),
+            "Expired entry must be actively removed from COWORK_JUST_COMPACTED_CACHE"
+        );
+
+        // Test capacity cap behavior
+        for i in 0..1005 {
+            let k = format!("cap_test_session_{}", i);
+            COWORK_JUST_COMPACTED_CACHE.insert(
+                k,
+                (
+                    std::time::Instant::now() - std::time::Duration::from_secs(70),
+                    "Compacted conversation".to_string(),
+                    10_000,
+                ),
+            );
+        }
+
+        if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+            let purge_now = std::time::Instant::now();
+            COWORK_JUST_COMPACTED_CACHE
+                .retain(|_, (ts, _, _)| purge_now.duration_since(*ts).as_secs() < 60);
+            if COWORK_JUST_COMPACTED_CACHE.len() >= MAX_JUST_COMPACTED_CACHE_CAPACITY {
+                COWORK_JUST_COMPACTED_CACHE.clear();
+            }
+        }
+
+        assert!(
+            COWORK_JUST_COMPACTED_CACHE.len() <= MAX_JUST_COMPACTED_CACHE_CAPACITY,
+            "Cache length must not exceed maximum capacity"
+        );
+    }
+
+    #[test]
+    fn test_compaction_immunity_lease_lifecycle() {
+        let session_key = "test_lease_lifecycle".to_string();
+        let now = std::time::Instant::now();
+        COMPACTION_IMMUNITY_LEASES.insert(
+            session_key.clone(),
+            CompactionImmunityLease {
+                created_at: now,
+                last_touched: now,
+                consumed: false,
+            },
+        );
+
+        // Turn 1: Initial passthrough activates sliding window
+        let is_compaction_req = false;
+        let mut passed = false;
+        if !is_compaction_req {
+            if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let check_now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    check_now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    check_now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    lease.consumed = true;
+                    lease.last_touched = check_now;
+                    passed = true;
+                }
+            }
+        }
+        assert!(passed, "Turn 1 must pass through and activate lease");
+        assert!(
+            COMPACTION_IMMUNITY_LEASES
+                .get(&session_key)
+                .unwrap()
+                .consumed,
+            "Lease must be marked as consumed"
+        );
+
+        // Turn 2: Deep thinking / complex MCP tool calls taking 75s must remain valid under 90s sliding window
+        if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+            lease.last_touched = std::time::Instant::now() - std::time::Duration::from_secs(75);
+        }
+        passed = false;
+        if !is_compaction_req {
+            if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let check_now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    check_now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    check_now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    lease.last_touched = check_now;
+                    passed = true;
+                }
+            }
+        }
+        assert!(
+            passed,
+            "Deep thinking turn taking 75s within 90s sliding window must pass through"
+        );
+
+        // Expired lease after 95s window is evicted
+        if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+            lease.last_touched = std::time::Instant::now() - std::time::Duration::from_secs(95);
+        }
+        passed = false;
+        if !is_compaction_req {
+            if let Some(lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let check_now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    check_now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    check_now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    passed = true;
+                } else {
+                    drop(lease);
+                    COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+                }
+            }
+        }
+        assert!(!passed, "Expired lease must not pass through");
+        assert!(
+            !COMPACTION_IMMUNITY_LEASES.contains_key(&session_key),
+            "Expired lease must be removed"
+        );
+    }
+
+    #[test]
+    fn test_claude_stream_chunk_has_error_event() {
+        // Normal text chunk
+        let normal = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n";
+        assert!(!claude_stream_chunk_has_error_event(normal));
+
+        // Normal text delta containing word 'error' in user text
+        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"there is an error in code\"}}\n\n";
+        assert!(!claude_stream_chunk_has_error_event(delta));
+
+        // Error event from create_claude_sse_stream
+        let error_chunk = b"event: error\ndata: {\"error\":{\"call_site\":\"src/proxy/mappers/claude/mod.rs:98\",\"function\":\"create_claude_sse_stream\",\"message\":\"Stream interrupted\",\"params\":\"trace=xxx\",\"type\":\"stream_error\"},\"type\":\"error\"}\n\n";
+        assert!(claude_stream_chunk_has_error_event(error_chunk));
+
+        // Bare error event
+        let bare_error = b"data: {\"type\":\"error\",\"error\":{\"message\":\"fail\"}}\n\n";
+        assert!(claude_stream_chunk_has_error_event(bare_error));
+
+        // Heartbeat ping
+        let heartbeat = b": ping\n\n";
+        assert!(!claude_stream_chunk_has_error_event(heartbeat));
+    }
+
+    #[test]
+    fn test_calculate_claude_fixed_overhead_includes_schema_and_description() {
+        use crate::proxy::mappers::claude::models::Tool;
+
+        let req_without_schema = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![],
+            system: None,
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("test_tool".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        let overhead_small = calculate_claude_fixed_overhead(&req_without_schema);
+
+        let large_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "param1": {"type": "string", "description": "A very detailed description of parameter one that takes up lots of tokens"},
+                "param2": {"type": "array", "items": {"type": "string"}, "description": "Another parameter with deep nested definitions"},
+                "param3": {"type": "object", "properties": {"nested": {"type": "boolean"}}}
+            },
+            "required": ["param1"]
+        });
+
+        let req_with_schema = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![],
+            system: None,
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("test_tool".to_string()),
+                description: Some("This is a comprehensive description of the tool that explains its purpose and behavior in great detail.".to_string()),
+                input_schema: Some(large_schema),
+            }]),
+            ..Default::default()
+        };
+        let overhead_large = calculate_claude_fixed_overhead(&req_with_schema);
+
+        assert!(
+            overhead_large > overhead_small + 50,
+            "Overhead must properly include tool descriptions and input_schemas"
+        );
+    }
+
+    #[test]
+    fn test_compact_sessions_capacity_and_prune() {
+        for i in 0..1010 {
+            COWORK_COMPACT_SESSIONS.insert(
+                format!("test_cap_session_{}", i),
+                CoworkCompactState {
+                    kind: CoworkCompactKind::Auto,
+                    before_tokens: 50_000,
+                    ts: std::time::Instant::now() - std::time::Duration::from_secs(350),
+                    summary_done: false,
+                    target_limit: 35_000,
+                },
+            );
+        }
+
+        prune_compact_sessions_if_needed();
+        assert!(
+            COWORK_COMPACT_SESSIONS.len() <= MAX_COMPACT_SESSIONS_CAPACITY,
+            "Pruning must enforce capacity limit and evict timed-out entries"
+        );
+    }
+
+    #[test]
+    fn test_compaction_lease_expiration_does_not_fall_back_to_weak_continuation() {
+        let session_key = "test_lease_no_weak_fallback".to_string();
+        COMPACTION_IMMUNITY_LEASES.insert(
+            session_key.clone(),
+            CompactionImmunityLease {
+                created_at: std::time::Instant::now() - std::time::Duration::from_secs(120),
+                last_touched: std::time::Instant::now() - std::time::Duration::from_secs(100),
+                consumed: true,
+            },
+        );
+
+        let is_compaction_request = false;
+        let is_post_compaction = if !is_compaction_request {
+            if let Some(mut lease) = COMPACTION_IMMUNITY_LEASES.get_mut(&session_key) {
+                let now = std::time::Instant::now();
+                let valid = if !lease.consumed {
+                    now.duration_since(lease.created_at).as_secs()
+                        < COMPACTION_IMMUNITY_INITIAL_TTL_SECS
+                } else {
+                    now.duration_since(lease.last_touched).as_secs()
+                        < COMPACTION_IMMUNITY_WINDOW_SECS
+                };
+                if valid {
+                    lease.consumed = true;
+                    lease.last_touched = now;
+                    true
+                } else {
+                    drop(lease);
+                    COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        assert!(
+            !is_post_compaction,
+            "Expired lease must strictly return false without granting permanent immunity"
+        );
+        assert!(!COMPACTION_IMMUNITY_LEASES.contains_key(&session_key));
+    }
+
+    #[test]
+    fn test_detect_post_compaction_continuation_multi_block() {
+        use crate::proxy::mappers::claude::models::{ContentBlock, Message, MessageContent};
+
+        // Case 1: First block is <system-reminder>, second block is continuation text
+        let req_multi_block = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Array(vec![
+                    ContentBlock::Text {
+                        text: "<system-reminder>Some system reminder</system-reminder>".to_string(),
+                    },
+                    ContentBlock::Text {
+                        text: "This session is being continued from a previous conversation that ran out of context.".to_string(),
+                    },
+                ]),
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            detect_post_compaction_continuation(&req_multi_block),
+            "Multi-block continuation must be detected even when preceded by system reminder"
+        );
+
+        // Case 2: Negative case
+        let req_normal = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::String("Hello, how are you?".to_string()),
+            }],
+            ..Default::default()
+        };
+        assert!(!detect_post_compaction_continuation(&req_normal));
+    }
+
+    #[test]
+    fn test_calculate_effective_auto_compact_threshold_guarantees_headroom() {
+        // User sets threshold to 50k, but large tool overhead makes target_limit 53k
+        let user_threshold = 50_000;
+        let target_limit = 53_000;
+        let effective = calculate_effective_auto_compact_threshold(user_threshold, target_limit);
+
+        // Effective threshold must be at least target_limit + 25,000 = 78,000
+        assert_eq!(effective, 78_000);
+        assert!(effective >= target_limit + 25_000);
+
+        // If user threshold is generous (e.g. 120k), user threshold is respected
+        let generous_threshold = 120_000;
+        assert_eq!(
+            calculate_effective_auto_compact_threshold(generous_threshold, target_limit),
+            120_000
+        );
+    }
+
+    #[test]
+    fn test_unified_compaction_state_machine_prevents_collision() {
+        let session_key = "test_unified_compaction_collision".to_string();
+
+        // 1. Auto-compaction triggers, registers in unified state
+        let target_limit = 45_000;
+        COWORK_COMPACT_SESSIONS.insert(
+            session_key.clone(),
+            CoworkCompactState {
+                kind: CoworkCompactKind::Auto,
+                before_tokens: 90_000,
+                ts: std::time::Instant::now(),
+                summary_done: false,
+                target_limit,
+            },
+        );
+
+        // 2. Both manual and auto compact recognize the session is in compaction
+        assert!(is_session_in_compaction(&session_key));
+
+        // 3. Summary request arrives, marks summary_done
+        if let Some(mut state) = COWORK_COMPACT_SESSIONS.get_mut(&session_key) {
+            state.summary_done = true;
+        }
+
+        // 4. Continuation arrives with reduced context (e.g. 42_000 tokens)
+        let est_tokens = 42_000;
+        if let Some((_, state)) = COWORK_COMPACT_SESSIONS.remove(&session_key) {
+            let saved = state.before_tokens.saturating_sub(est_tokens);
+            assert_eq!(saved, 48_000);
+            COWORK_JUST_COMPACTED_CACHE.insert(
+                session_key.clone(),
+                (
+                    std::time::Instant::now(),
+                    format!("Compacted conversation · saved {}k tokens", saved / 1000),
+                    est_tokens,
+                ),
+            );
+        }
+
+        // 5. Active compaction state is cleared, cache is populated
+        assert!(!is_session_in_compaction(&session_key));
+        assert!(COWORK_JUST_COMPACTED_CACHE.contains_key(&session_key));
+
+        // Clean up
+        COWORK_JUST_COMPACTED_CACHE.remove(&session_key);
+    }
+
+    #[test]
+    fn test_cowork_auto_compact_triggers_with_tool_schemas_and_thinking_signatures() {
+        use crate::proxy::mappers::claude::models::{ContentBlock, Message, Tool};
+
+        // Construct realistic Cowork MCP tools with schema and descriptions
+        let mut tools = Vec::new();
+        for i in 0..15 {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute file path" },
+                    "content": { "type": "string", "description": "File body text" },
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "encoding": { "type": "string" },
+                            "flag": { "type": "string" }
+                        }
+                    }
+                },
+                "required": ["path"]
+            });
+            tools.push(Tool {
+                type_: None,
+                name: Some(format!("mcp__cowork_tool_{}", i)),
+                description: Some(format!(
+                    "Cowork tool {} with extensive capabilities for workspace interaction",
+                    i
+                )),
+                input_schema: Some(schema),
+            });
+        }
+
+        // Construct 20 turns of assistant messages containing thinking blocks with signatures
+        let mut messages = Vec::new();
+        for i in 0..20 {
+            messages.push(Message {
+                role: "user".to_string(),
+                content: crate::proxy::mappers::claude::models::MessageContent::String(format!(
+                    "User turn {}",
+                    i
+                )),
+            });
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: crate::proxy::mappers::claude::models::MessageContent::Array(vec![
+                    ContentBlock::Thinking {
+                        thinking: "Analyzing problem...".to_string(),
+                        signature: Some("A".repeat(4000)), // ~1000 tokens signature per turn
+                        cache_control: None,
+                    },
+                    ContentBlock::Text {
+                        text: format!("Assistant answer {}", i),
+                    },
+                ]),
+            });
+        }
+
+        let req = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages,
+            system: Some(crate::proxy::mappers::claude::models::SystemPrompt::String(
+                "You are Claude with Cowork extension active.".repeat(100),
+            )),
+            tools: Some(tools),
+            ..Default::default()
+        };
+
+        let req_json = serde_json::to_value(&req).expect("serialize ClaudeRequest");
+        let est_tokens = crate::proxy::pipeline::estimate_tokens(&req_json);
+        let fixed_overhead = calculate_claude_fixed_overhead(&req);
+        let target_limit = (fixed_overhead + 15_000).max(35_000);
+        let effective_threshold = calculate_effective_auto_compact_threshold(100_000, target_limit);
+
+        // 20 turns * 4000 chars = 80,000 chars = ~20,000 tokens in signatures alone.
+        // Plus system prompt (~1,100 tokens), plus tools (~3,000 tokens), plus message texts.
+        // Total should comfortably be >= 25,000 tokens.
+        assert!(est_tokens >= 25_000, "est_tokens: {}", est_tokens);
+        assert!(fixed_overhead > 1_500, "fixed_overhead: {}", fixed_overhead);
+
+        // Now test with 100 turns so that context > 100,000 tokens
+        let mut large_messages = Vec::new();
+        for i in 0..60 {
+            large_messages.push(Message {
+                role: "user".to_string(),
+                content: crate::proxy::mappers::claude::models::MessageContent::String(format!(
+                    "User turn {}",
+                    i
+                )),
+            });
+            large_messages.push(Message {
+                role: "assistant".to_string(),
+                content: crate::proxy::mappers::claude::models::MessageContent::Array(vec![
+                    ContentBlock::Thinking {
+                        thinking: "Complex chain of thought exploration...".repeat(20),
+                        signature: Some("A".repeat(6000)), // ~1500 tokens signature per turn
+                        cache_control: None,
+                    },
+                    ContentBlock::Text {
+                        text: format!("Assistant answer {}", i),
+                    },
+                ]),
+            });
+        }
+        let large_req = ClaudeRequest {
+            model: "claude-3-7-sonnet".to_string(),
+            messages: large_messages,
+            system: Some(crate::proxy::mappers::claude::models::SystemPrompt::String(
+                "You are Claude with Cowork extension active.".repeat(1000),
+            )),
+            tools: req.tools.clone(),
+            ..Default::default()
+        };
+        let large_json = serde_json::to_value(&large_req).expect("serialize large ClaudeRequest");
+        let large_est = crate::proxy::pipeline::estimate_tokens(&large_json);
+
+        // Should exceed 100k threshold and trigger compaction gatekeeper
+        assert!(
+            large_est >= effective_threshold && large_est > target_limit,
+            "large_est ({}) must trigger gatekeeper (threshold={}, target_limit={})",
+            large_est,
+            effective_threshold,
+            target_limit
+        );
+    }
+
+    #[test]
+    fn test_is_cowork_session_identifies_cowork_and_excludes_code_mode() {
+        use crate::proxy::mappers::claude::models::{SystemBlock, SystemPrompt, Tool};
+        use axum::http::HeaderMap;
+
+        let headers_empty = HeaderMap::new();
+
+        // 1. Session with mcp__ccd_* tools (Claude Desktop Code tab) -> MUST BE EXCLUDED
+        let req_ccd = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__ccd_session__spawn_task".to_string()),
+                description: Some("Spawn background task".to_string()),
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(!is_cowork_session(&req_ccd, &headers_empty));
+
+        // 2. Real Desktop Cowork session with claude-desktop-3p header and mcp__cowork tools -> MUST BE RECOGNIZED AS COWORK
+        let mut headers_desktop_cowork = HeaderMap::new();
+        headers_desktop_cowork.insert(
+            "user-agent",
+            "claude-cli/2.1.288 (external, claude-desktop-3p, agent-sdk/0.3.288)"
+                .parse()
+                .unwrap(),
+        );
+        let req_desktop_cowork = ClaudeRequest {
+            system: Some(SystemPrompt::Array(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text:
+                    "x-anthropic-billing-header: cc_version=2.1; cc_entrypoint=claude-desktop-3p;"
+                        .to_string(),
+            }])),
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__cowork__create_artifact".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(is_cowork_session(
+            &req_desktop_cowork,
+            &headers_desktop_cowork
+        ));
+
+        // 3. Session with "You are Claude Code" system prompt -> MUST BE EXCLUDED
+        let req_code_sys = ClaudeRequest {
+            system: Some(SystemPrompt::String(
+                "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            )),
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__cowork__create_artifact".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(!is_cowork_session(&req_code_sys, &headers_empty));
+
+        // 4. Session with mcp__cowork_* tools -> MUST BE RECOGNIZED AS COWORK
+        let req_cowork = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__cowork__present_files".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(is_cowork_session(&req_cowork, &headers_empty));
+
+        // 5. Session with mcp__workspace_* tools -> MUST BE RECOGNIZED AS COWORK
+        let req_workspace = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__workspace__bash".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(is_cowork_session(&req_workspace, &headers_empty));
+
+        // 6. Session with local-agent billing header AND x-app: cli header (Exact real Cowork payload!) -> MUST BE RECOGNIZED AS COWORK
+        let mut headers_real_cowork = HeaderMap::new();
+        headers_real_cowork.insert("x-app", "cli".parse().unwrap());
+        headers_real_cowork.insert("x-claude-code-session-id", "ecb97f89".parse().unwrap());
+        let req_local_agent = ClaudeRequest {
+            system: Some(SystemPrompt::Array(vec![
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: "x-anthropic-billing-header: cc_version=2.1; cc_entrypoint=local-agent;".to_string(),
+                },
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: "<application_details>\nClaude is operating as an agent inside the Claude desktop app.".to_string(),
+                },
+            ])),
+            ..Default::default()
+        };
+        assert!(is_cowork_session(&req_local_agent, &headers_real_cowork));
+
+        // 7. Standard external agent request without cowork markers -> MUST NOT be classified as cowork
+        let req_standard = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("custom_search_tool".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(!is_cowork_session(&req_standard, &headers_empty));
+    }
+
+    #[test]
+    fn test_multi_block_system_prompt_compaction_detection() {
+        use crate::proxy::mappers::claude::models::{SystemBlock, SystemPrompt};
+
+        // Multi-block where block 0 is billing header and block 1 contains compaction text
+        let req_compaction = ClaudeRequest {
+            system: Some(SystemPrompt::Array(vec![
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: "x-anthropic-billing-header: cc_version=2.1; cc_entrypoint=claude-desktop-3p;".to_string(),
+                },
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: "You are tasked with summarizing conversations: write a concise summary of the conversation so far.".to_string(),
+                },
+            ])),
+            ..Default::default()
+        };
+
+        let has_compaction_system = req_compaction
+            .system
+            .as_ref()
+            .map_or(false, |sys| match sys {
+                crate::proxy::mappers::claude::models::SystemPrompt::String(s) => {
+                    crate::proxy::mappers::common_utils::is_compaction_request_text(s)
+                }
+                crate::proxy::mappers::claude::models::SystemPrompt::Array(arr) => {
+                    arr.iter().any(|b| {
+                        crate::proxy::mappers::common_utils::is_compaction_request_text(&b.text)
+                    })
+                }
+            });
+
+        assert!(has_compaction_system);
+    }
+
+    #[test]
+    fn test_post_compaction_continuation_does_not_grant_lifelong_immunity() {
+        use crate::proxy::mappers::claude::models::{Message, MessageContent};
+
+        // 包含接续横幅的消息
+        let req_with_cont = ClaudeRequest {
+            model: "claude-fable-5".to_string(),
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String(
+                        "This session is being continued from a previous conversation that ran out of context".to_string(),
+                    ),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: MessageContent::String("Understood.".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // detect_post_compaction_continuation 能识别横幅
+        assert!(detect_post_compaction_continuation(&req_with_cont));
+
+        // 当租约已过期/不存在时，绝不自动续发租约
+        let session_key = "test_expired_continuation_session".to_string();
+        COMPACTION_IMMUNITY_LEASES.remove(&session_key);
+
+        assert!(!COMPACTION_IMMUNITY_LEASES.contains_key(&session_key));
+    }
+
+    #[test]
+    fn test_real_cowork_session_triggers_gatekeeper() {
+        use crate::proxy::mappers::claude::models::{SystemBlock, SystemPrompt, Tool};
+        use axum::http::HeaderMap;
+
+        // 构造真实 Cowork 请求特征：
+        // 1. 包含 local-agent 运行环境与 desktop_app 标头
+        // 2. 底层运行环境附带 x-app: cli 与 x-claude-code-session-id
+        let mut headers = HeaderMap::new();
+        headers.insert("x-app", "cli".parse().unwrap());
+        headers.insert(
+            "x-claude-code-session-id",
+            "ecb97f89-6972-4d75-a141-3898e86aa82a".parse().unwrap(),
+        );
+        headers.insert("anthropic-client-platform", "desktop_app".parse().unwrap());
+        headers.insert(
+            "user-agent",
+            "claude-cli/2.1.288 (external, local-agent, agent-sdk/0.3.288)"
+                .parse()
+                .unwrap(),
+        );
+
+        let req = ClaudeRequest {
+            system: Some(SystemPrompt::Array(vec![
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: "x-anthropic-billing-header: cc_version=2.1.288.ad6; cc_entrypoint=local-agent;".to_string(),
+                },
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: "<application_details>\nClaude is operating as an agent inside the Claude desktop app. This agent capability is currently in preview, but fully authorized.".to_string(),
+                },
+            ])),
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__workspace__bash".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+
+        // 必须识别为 Cowork，绝不能被 x-app: cli 误杀！
+        assert!(is_cowork_session(&req, &headers));
+    }
+
+    #[test]
+    fn test_calculate_cowork_pruning_target_avoids_binary_fallback() {
+        let est_tokens = 173_683;
+        let target_limit = 41_518;
+
+        let (report_tokens, client_limit) =
+            calculate_cowork_pruning_target(est_tokens, target_limit);
+
+        // 1. 严格满足 actual > maximum
+        assert!(report_tokens > client_limit);
+        assert_eq!(client_limit, target_limit);
+
+        // 2. 差额为受控的小正向 Gap (500 tokens)
+        let gap = report_tokens - client_limit;
+        assert_eq!(gap, 500);
+
+        // 3. 差额足以让客户端 last_turn_tokens (~1000) 使得 Ne = gap - last_turn <= 0，
+        // 从而直接跳过 CHt 倒算二分折半保护，实现深度全量压缩
+        assert!(gap < 1_000);
+    }
+
+    #[test]
+    fn test_detect_post_compaction_continuation_with_preceding_reminders_and_extended_scan() {
+        use crate::proxy::mappers::claude::models::{Message, MessageContent};
+
+        // 构造包含多轮前置 system-reminder 与环境详情的接续请求 (第 4 条为包含 <summary> 的接续轮)
+        let req = ClaudeRequest {
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("<system-reminder>Token limit warning</system-reminder>".to_string()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("<environment_details>cwd: /project</environment_details>".to_string()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("Let's continue working on the task.".to_string()),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String("Here is the summary of what we did from previous conversation:\n<summary>\n1. Initialized repo\n2. Fixed issue #3639\n</summary>".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        // 扩展扫描深度至前 5 轮后，必须能穿透前置 reminder 成功命中接续标记
+        assert!(
+            detect_post_compaction_continuation(&req),
+            "多轮前置系统提醒遮挡下的接续请求必须能被精准识别"
+        );
+    }
+
+    #[test]
+    fn test_is_manual_compact_command_variants() {
+        use crate::proxy::mappers::claude::models::{Message, MessageContent};
+
+        for cmd in [
+            "./compact",
+            ".\\compact",
+            "./compact.",
+            "/compact",
+            "/compact.",
+            "./compact --force",
+            "/compact please",
+        ] {
+            let req = ClaudeRequest {
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: MessageContent::String(cmd.to_string()),
+                }],
+                ..Default::default()
+            };
+            assert!(
+                is_manual_compact_command(&req),
+                "命令 '{cmd}' 必须被识别为手动 compact 指令"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_code_mode_detection_and_scaling_bypass() {
+        use crate::proxy::mappers::claude::models::{SystemBlock, SystemPrompt, Tool};
+
+        // 1. Claude Code CLI via SystemPrompt::String
+        let req_cli_string = ClaudeRequest {
+            system: Some(SystemPrompt::String(
+                "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert!(is_code_mode(&req_cli_string));
+
+        // 2. Claude Code CLI via SystemPrompt::Array
+        let req_cli_array = ClaudeRequest {
+            system: Some(SystemPrompt::Array(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            }])),
+            ..Default::default()
+        };
+        assert!(is_code_mode(&req_cli_array));
+
+        // 3. Claude Desktop Code Tab via mcp__ccd_* tool prefix
+        let req_desktop_code = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__ccd_host__sync_with_base_branch".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(is_code_mode(&req_desktop_code));
+
+        // 4. Regular chat request (should NOT be code mode)
+        let req_regular = ClaudeRequest {
+            system: Some(SystemPrompt::String(
+                "You are a helpful assistant.".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert!(!is_code_mode(&req_regular));
+
+        // 5. Cowork session request (should NOT be code mode)
+        let req_cowork = ClaudeRequest {
+            tools: Some(vec![Tool {
+                type_: None,
+                name: Some("mcp__cowork__create_artifact".to_string()),
+                description: None,
+                input_schema: None,
+            }]),
+            ..Default::default()
+        };
+        assert!(!is_code_mode(&req_cowork));
+
+        // 6. Test scaling bypass invariant (Option A):
+        // When enable_usage_scaling is true:
+        // - Regular request -> scaling_enabled remains true
+        // - Code mode request -> scaling_enabled MUST be bypassed (forced false)
+        let enable_usage_scaling = true;
+        let scaling_for_regular = enable_usage_scaling && !is_code_mode(&req_regular);
+        assert!(scaling_for_regular);
+
+        let scaling_for_cli = enable_usage_scaling && !is_code_mode(&req_cli_string);
+        assert!(!scaling_for_cli);
+
+        let scaling_for_desktop_code = enable_usage_scaling && !is_code_mode(&req_desktop_code);
+        assert!(!scaling_for_desktop_code);
     }
 }

@@ -33,6 +33,7 @@ pub struct ProxyRequestLog {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
     pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
     #[serde(default)]
@@ -54,16 +55,35 @@ pub(crate) mod prompt_log_tests {
     }
 
     // Tests using ABV_DATA_DIR run serially and restore the previous process setting.
+    // Unified with crate::modules::account::SHARED_TEST_ENV_LOCK to prevent split-brain mutex race.
+    thread_local! {
+        static REENTRANCY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     pub(crate) struct TestDataDir {
+        _guard: Option<std::sync::MutexGuard<'static, ()>>,
         _dir: tempfile::TempDir,
         previous: Option<std::ffi::OsString>,
     }
     impl TestDataDir {
         pub(crate) fn new() -> Self {
+            let depth = REENTRANCY_DEPTH.get();
+            let guard = if depth == 0 {
+                Some(
+                    crate::modules::account::SHARED_TEST_ENV_LOCK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                )
+            } else {
+                None
+            };
+            REENTRANCY_DEPTH.set(depth + 1);
+
             let dir = tempfile::tempdir().unwrap();
             let previous = std::env::var_os("ABV_DATA_DIR");
             std::env::set_var("ABV_DATA_DIR", dir.path());
             Self {
+                _guard: guard,
                 _dir: dir,
                 previous,
             }
@@ -75,6 +95,10 @@ pub(crate) mod prompt_log_tests {
                 std::env::set_var("ABV_DATA_DIR", previous);
             } else {
                 std::env::remove_var("ABV_DATA_DIR");
+            }
+            let depth = REENTRANCY_DEPTH.get();
+            if depth > 0 {
+                REENTRANCY_DEPTH.set(depth - 1);
             }
         }
     }
@@ -136,6 +160,7 @@ impl ProxyRequestLog {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cached_tokens: self.cached_tokens,
+            reasoning_tokens: self.reasoning_tokens,
             protocol: self.protocol.clone(),
             username: self.username.clone(),
             session_id: self.session_id.clone(),
@@ -379,9 +404,10 @@ impl ProxyMonitor {
             let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
             let account = account.clone();
             let cached = log.cached_tokens.unwrap_or(0);
+            let reasoning = log.reasoning_tokens.unwrap_or(0);
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::modules::token_stats::record_usage(
-                    &account, &model, input, output, cached,
+                    &account, &model, input, output, cached, reasoning,
                 ) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }

@@ -203,6 +203,16 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
     },
 
     // Gemini 3.1 Pro & 图像
+    'gemini-3.1-pro': {
+        label: 'Gemini 3.1 Pro',
+        shortLabel: 'G3.1 Pro',
+        protectedKey: 'gemini-pro',
+        Icon: Gemini.Color,
+        i18nKey: 'proxy.model.pro',
+        i18nDescKey: 'proxy.model.pro',
+        group: 'Gemini 3',
+        tags: ['pro'],
+    },
     'gemini-3.1-pro-high': {
         label: 'Gemini 3.1 Pro High',
         shortLabel: 'G3.1 Pro',
@@ -222,6 +232,16 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
         i18nDescKey: 'proxy.model.pro_low',
         group: 'Gemini 3',
         tags: ['pro', 'low'],
+    },
+    'gemini-3.1-flash-lite': {
+        label: 'Gemini 3.1 Flash Lite',
+        shortLabel: 'G3.1 Lite',
+        protectedKey: 'gemini-flash',
+        Icon: Gemini.Color,
+        i18nKey: 'proxy.model.flash_lite',
+        i18nDescKey: 'proxy.model.flash_lite',
+        group: 'Gemini 3',
+        tags: ['flash', 'lite'],
     },
     'gemini-3.1-flash-image': {
         label: 'Gemini 3.1 Flash Image',
@@ -244,48 +264,6 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
         tags: ['image'],
     },
 
-    // Gemini 2.5 系列
-    'gemini-2.5-flash': {
-        label: 'Gemini 2.5 Flash',
-        shortLabel: 'G2.5 Flash',
-        protectedKey: 'gemini-flash',
-        Icon: Gemini.Color,
-        i18nKey: 'proxy.model.gemini_2_5_flash',
-        i18nDescKey: 'proxy.model.gemini_2_5_flash',
-        group: 'Gemini 2.5',
-        tags: ['flash'],
-    },
-    'gemini-2.5-flash-lite': {
-        label: 'Gemini 2.5 Flash Lite',
-        shortLabel: 'G2.5 Lite',
-        protectedKey: 'gemini-flash',
-        Icon: Gemini.Color,
-        i18nKey: 'proxy.model.flash_lite',
-        i18nDescKey: 'proxy.model.flash_lite',
-        group: 'Gemini 2.5',
-        tags: ['flash', 'lite'],
-    },
-    'gemini-2.5-flash-thinking': {
-        label: 'Gemini 2.5 Flash Think',
-        shortLabel: 'G2.5 Think',
-        protectedKey: 'gemini-flash',
-        Icon: Gemini.Color,
-        i18nKey: 'proxy.model.flash_thinking',
-        i18nDescKey: 'proxy.model.flash_thinking',
-        group: 'Gemini 2.5',
-        tags: ['flash', 'thinking'],
-    },
-    'gemini-2.5-pro': {
-        label: 'Gemini 2.5 Pro',
-        shortLabel: 'G2.5 Pro',
-        protectedKey: 'gemini-pro',
-        Icon: Gemini.Color,
-        i18nKey: 'proxy.model.gemini_2_5_pro',
-        i18nDescKey: 'proxy.model.gemini_2_5_pro',
-        group: 'Gemini 2.5',
-        tags: ['pro'],
-    },
-
     // Claude 系列
     'claude-sonnet-4-6': {
         label: 'Claude 4.6',
@@ -296,16 +274,6 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
         i18nDescKey: 'proxy.model.claude_sonnet',
         group: 'Claude',
         tags: ['sonnet'],
-    },
-    'claude-sonnet-4-6-thinking': {
-        label: 'Claude 4.6 TK',
-        shortLabel: 'Claude 4.6 TK',
-        protectedKey: 'claude',
-        Icon: Claude.Color,
-        i18nKey: 'proxy.model.claude_sonnet_thinking',
-        i18nDescKey: 'proxy.model.claude_sonnet_thinking',
-        group: 'Claude',
-        tags: ['sonnet', 'thinking'],
     },
     'claude-opus-4-6': {
         label: 'Claude Opus 4.6',
@@ -326,6 +294,48 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
         i18nDescKey: 'proxy.model.claude_opus_thinking',
         group: 'Claude',
         tags: ['opus', 'thinking'],
+    },
+
+    // 官方 Agent 与预览模型
+    'gemini-pro-agent': {
+        label: 'Gemini Pro Agent',
+        shortLabel: 'Pro Agent',
+        protectedKey: 'gemini-pro',
+        Icon: Gemini.Color,
+        i18nKey: 'proxy.model.pro_agent',
+        i18nDescKey: 'proxy.model.pro_agent',
+        group: 'Gemini 3',
+        tags: ['pro', 'agent'],
+    },
+    'gemini-3-flash-agent': {
+        label: 'Gemini 3 Flash Agent',
+        shortLabel: 'Flash Agent',
+        protectedKey: 'gemini-flash',
+        Icon: Gemini.Color,
+        i18nKey: 'proxy.model.flash_agent',
+        i18nDescKey: 'proxy.model.flash_agent',
+        group: 'Gemini 3',
+        tags: ['flash', 'agent'],
+    },
+    'tab_flash_lite_preview': {
+        label: 'Tab Flash Lite Preview',
+        shortLabel: 'Tab Flash Lite',
+        protectedKey: 'gemini-flash',
+        Icon: Gemini.Color,
+        i18nKey: 'proxy.model.tab_flash_lite',
+        i18nDescKey: 'proxy.model.tab_flash_lite',
+        group: 'Gemini 3',
+        tags: ['flash', 'preview'],
+    },
+    'tab_jump_flash_lite_preview': {
+        label: 'Tab Jump Flash Lite Preview',
+        shortLabel: 'Tab Jump Lite',
+        protectedKey: 'gemini-flash',
+        Icon: Gemini.Color,
+        i18nKey: 'proxy.model.tab_jump_flash_lite',
+        i18nDescKey: 'proxy.model.tab_jump_flash_lite',
+        group: 'Gemini 3',
+        tags: ['flash', 'preview'],
     },
 
     // OpenAI / Outros modelos

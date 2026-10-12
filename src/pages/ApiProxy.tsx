@@ -22,7 +22,8 @@ import {
     Edit2,
     Save,
     Share2,
-    Bot
+    Bot,
+    Timer
 } from 'lucide-react';
 import { AppConfig, ProxyConfig, StickySessionConfig, ExperimentalConfig } from '../types/config';
 import HelpTooltip from '../components/common/HelpTooltip';
@@ -33,11 +34,13 @@ import { useProxyModels } from '../hooks/useProxyModels';
 import GroupedSelect, { SelectOption } from '../components/common/GroupedSelect';
 import { CliSyncCard } from '../components/proxy/CliSyncCard';
 import { listAccounts } from '../services/accountService';
+import { motion } from 'framer-motion';
 import CircuitBreaker from '../components/settings/CircuitBreaker';
 import GlobalSystemPrompt from '../components/settings/GlobalSystemPrompt';
 import ImageThinkingMode from '../components/settings/ImageThinkingMode';
 import ThinkingBudget from '../components/settings/ThinkingBudget';
 import MultimodalSettings from '../components/settings/MultimodalSettings';
+import StreamTimeoutSettings from '../components/settings/StreamTimeoutSettings';
 import AgentSettings from '../components/settings/AgentSettings';
 import { CircuitBreakerConfig } from '../types/config';
 
@@ -466,17 +469,6 @@ export default function ApiProxy() {
         if (!appConfig) return;
 
         const trimmedKey = key.trim();
-        const lowerKey = trimmedKey.toLowerCase();
-
-        // 新增通配符仅允许内置 gemini-3.x-flash（x 必须大于 8）；已存在的项可继续编辑目标
-        const isExisting = !!(appConfig.proxy.custom_mapping && Object.prototype.hasOwnProperty.call(appConfig.proxy.custom_mapping, trimmedKey));
-        if (!isExisting && (trimmedKey.includes('*') || /gemini-3\.x-flash/i.test(trimmedKey) || lowerKey.includes('.x'))) {
-            if (lowerKey !== 'gemini-3.x-flash') {
-                showToast(t('proxy.router.wildcard_only_gemini_3x') || '仅允许内置通配符 gemini-3.x-flash（x 必须大于 8），其他请填写具体模型 ID', 'warning');
-                return;
-            }
-        }
-
         console.log('[DEBUG] handleMappingUpdate called:', { type, key: trimmedKey, value });
 
         const newConfig = { ...appConfig.proxy };
@@ -505,9 +497,7 @@ export default function ApiProxy() {
         // 恢复到默认预设映射值
         const newConfig = {
             ...appConfig.proxy,
-            custom_mapping: {
-                "gemini-3.x-flash": "3.x-flash-tiered",
-            }
+            custom_mapping: {}
         };
 
         try {
@@ -528,17 +518,16 @@ export default function ApiProxy() {
             name: t('proxy.router.preset_default'),
             description: t('proxy.router.preset_default_desc'),
             mappings: {
-                "gemini-3.x-flash": "3.x-flash-tiered",
                 "gpt-4*": "gemini-3.1-pro-high",
                 "gpt-4o*": "gemini-3.8-flash-high",
-                "gpt-3.5*": "gemini-2.5-flash",
+                "gpt-3.5*": "gemini-3.6-flash-medium",
                 "o1-*": "gemini-3.1-pro-high",
                 "o3-*": "gemini-3.1-pro-high",
                 "claude-3-5-sonnet-*": "claude-sonnet-4-6",
                 "claude-3-opus-*": "claude-opus-4-6-thinking",
                 "claude-opus-4-6*": "claude-opus-4-6-thinking",
-                "claude-haiku-*": "gemini-2.5-flash",
-                "claude-3-haiku-*": "gemini-2.5-flash",
+                "claude-haiku-*": "gemini-3.6-flash-medium",
+                "claude-3-haiku-*": "gemini-3.6-flash-medium",
             }
         },
         {
@@ -564,15 +553,15 @@ export default function ApiProxy() {
             description: t('proxy.router.preset_cost_desc'),
             mappings: {
                 "gpt-4*": "gemini-3.8-flash-high",
-                "gpt-4o*": "gemini-2.5-flash",
-                "gpt-3.5*": "gemini-2.5-flash",
+                "gpt-4o*": "gemini-3.6-flash-medium",
+                "gpt-3.5*": "gemini-3.1-flash-lite",
                 "o1-*": "gemini-3.8-flash-high",
                 "o3-*": "gemini-3.8-flash-high",
                 "claude-3-5-sonnet-*": "gemini-3.8-flash-high",
                 "claude-3-opus-*": "gemini-3.8-flash-high",
                 "claude-opus-4-*": "gemini-3.8-flash-high",
-                "claude-haiku-*": "gemini-2.5-flash",
-                "claude-3-haiku-*": "gemini-2.5-flash",
+                "claude-haiku-*": "gemini-3.1-flash-lite",
+                "claude-3-haiku-*": "gemini-3.1-flash-lite",
             }
         },
         {
@@ -582,15 +571,15 @@ export default function ApiProxy() {
             mappings: {
                 "gpt-4*": "gemini-3.1-pro-high",
                 "gpt-4o*": "gemini-3.8-flash-high",
-                "gpt-3.5*": "gemini-2.5-flash",
+                "gpt-3.5*": "gemini-3.6-flash-medium",
                 "o1-*": "claude-sonnet-4-6",
                 "o3-*": "claude-sonnet-4-6",
                 "claude-3-5-sonnet-*": "claude-sonnet-4-6",
                 "claude-3-opus-*": "gemini-3.1-pro-high",
                 "claude-opus-4-5*": "gemini-3.1-pro-high",
                 "claude-opus-4-6*": "claude-opus-4-6-thinking",
-                "claude-haiku-*": "gemini-2.5-flash",
-                "claude-3-haiku-*": "gemini-2.5-flash",
+                "claude-haiku-*": "gemini-3.6-flash-medium",
+                "claude-3-haiku-*": "gemini-3.6-flash-medium",
             }
         },
     ], [t]);
@@ -1151,9 +1140,6 @@ print(response.choices[0].message.content)`;
                                 {t('proxy.router.custom_mapping_tip')}
                                 <span className="text-amber-600 dark:text-amber-400">{t('proxy.router.custom_mapping_warning')}</span>
                             </p>
-                            <p className="text-[9px] text-amber-600 dark:text-amber-400 leading-relaxed">
-                                {t('proxy.router.wildcard_rule_notice') || '通配符规则 gemini-3.x-flash：x 必须大于 8，统一转为 3.x-flash-tiered'}
-                            </p>
                         </div>
                     </div>
                     <div className="flex flex-col gap-4">
@@ -1172,11 +1158,6 @@ print(response.choices[0].message.content)`;
                                                 <div className="flex items-center gap-2 overflow-hidden flex-1">
                                                     <div className="flex items-center gap-1.5 min-w-0">
                                                         <span className="font-mono text-[10px] font-bold text-blue-600 dark:text-blue-400 truncate max-w-[140px]" title={key}>{key}</span>
-                                                        {key.toLowerCase() === 'gemini-3.x-flash' && (
-                                                            <span className="badge badge-warning badge-outline text-[11px] font-bold font-mono py-0.5 px-1.5 h-5 shrink-0 ml-0.5 cursor-help shadow-xs" title={t('proxy.router.wildcard_rule_notice') || "x 必须大于 8，自动转为 3.x-flash-tiered"}>
-                                                                x &gt; 8
-                                                            </span>
-                                                        )}
                                                     </div>
                                                     <ArrowRight size={10} className="text-gray-300 dark:text-gray-600 shrink-0" />
 
@@ -1497,7 +1478,12 @@ print(response.choices[0].message.content)`;
     };
 
     return (
-        <div className="h-full w-full overflow-y-auto overflow-x-hidden">
+        <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="h-full w-full overflow-y-auto overflow-x-hidden"
+        >
             <div className="p-5 space-y-4 max-w-7xl mx-auto">
 
                 {/* Loading State */}
@@ -2032,6 +2018,19 @@ print(response.choices[0].message.content)`;
                         {/* TAB: 模型配置 (models) */}
                         {activeMenuTab === 'models' && (
                             <div className="p-4 space-y-4">
+                                {/* 流式超时设置 (Stream Timeout Settings) - 默认收起 */}
+                                <CollapsibleCard
+                                    title={t('proxy.config.stream_timeout_settings.title', { defaultValue: '流式超时设置 (Stream Timeout Settings)' })}
+                                    icon={<Timer size={18} className="text-blue-500" />}
+                                    defaultExpanded={false}
+                                >
+                                    <StreamTimeoutSettings
+                                        config={appConfig.proxy.stream_timeouts}
+                                        onChange={(timeoutConfig) => updateProxyConfig({ stream_timeouts: timeoutConfig })}
+                                        onSave={handleSaveProxySettings}
+                                    />
+                                </CollapsibleCard>
+
                                 {/* 思考设置 (Thinking & Reasoning Settings) - 默认收起 */}
                                 <CollapsibleCard
                                     title={t('proxy.config.thinking_settings.title', { defaultValue: '思考设置 (Thinking Settings)' })}
@@ -2053,6 +2052,10 @@ print(response.choices[0].message.content)`;
                                         thinkingRetentionDays={appConfig.proxy.experimental?.thinking_retention_days ?? 15}
                                         onThinkingRetentionDaysChange={(days: number) =>
                                             updateExperimentalConfig({ thinking_retention_days: days })
+                                        }
+                                        globalCompactionStripEnabled={appConfig.proxy.experimental?.enable_global_compaction_strip === true}
+                                        onGlobalCompactionStripChange={(enabled) =>
+                                            updateExperimentalConfig({ enable_global_compaction_strip: enabled })
                                         }
                                     />
                                 </CollapsibleCard>
@@ -2620,7 +2623,7 @@ print(response.choices[0].message.content)`;
                         </div>
                     </div>
                 </ModalDialog>
-            </div >
-        </div >
+            </div>
+        </motion.div>
     );
 }
