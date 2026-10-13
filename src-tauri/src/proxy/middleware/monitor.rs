@@ -1372,7 +1372,7 @@ async fn monitor_request(
 
                 // 优先从 tail 兜底提取 token（若当前尚无 token 数据）
                 if log.input_tokens.is_none() && log.output_tokens.is_none() {
-                    if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
+                    if let Ok(full_tail) = std::str::from_utf8(&all_stream_data) {
                         for line in full_tail.lines().rev() {
                             if line.starts_with("data: ")
                                 && (line.contains("\"usage\"")
@@ -1398,10 +1398,9 @@ async fn monitor_request(
                                     {
                                         log.input_tokens = extract_input_tokens(usage);
                                         log.output_tokens = extract_output_tokens(usage);
-                                        cached_tokens =
-                                            cached_tokens.or_else(|| extract_cached_tokens(usage));
-                                        log.cached_tokens = log.cached_tokens.or(cached_tokens);
-                                        reasoning_tokens = reasoning_tokens
+                                        log.cached_tokens = log.cached_tokens
+                                            .or_else(|| extract_cached_tokens(usage));
+                                        log.reasoning_tokens = log.reasoning_tokens
                                             .or_else(|| extract_reasoning_tokens(usage));
                                         break;
                                     }
