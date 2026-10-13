@@ -30,11 +30,11 @@ RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3
     sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources || \
     sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
     else \
-    echo "Using default APT sources..."; \
+    echo "Using default HTTPS APT sources..."; sed -i 's#http://deb.debian.org#https://deb.debian.org#g' /etc/apt/sources.list.d/debian.sources; \
     fi
 
 # Install build dependencies
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     pkg-config \
     build-essential \
     curl \
@@ -83,11 +83,12 @@ WORKDIR /app/src-tauri
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
-    cargo build --release --bin antigravity-tools && \
+    cargo build --release --locked --jobs 2 --bin antigravity-tools && \
     cp target/release/antigravity-tools /tmp/antigravity-tools
 
 # --- Final Runtime Stage ---
 FROM debian:bookworm-slim
+COPY --from=rust:1-slim-bookworm /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG USE_MIRROR=auto
 WORKDIR /app
 
@@ -97,11 +98,11 @@ RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3
     sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources || \
     sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
     else \
-    echo "Using default APT sources..."; \
+    echo "Using default HTTPS APT sources..."; sed -i 's#http://deb.debian.org#https://deb.debian.org#g' /etc/apt/sources.list.d/debian.sources; \
     fi
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     curl \
     libssl3 \
     libsqlite3-0 \
