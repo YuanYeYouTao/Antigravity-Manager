@@ -84,7 +84,27 @@ fn resolve_exchange_output_dir(cfg: &DebugLoggingConfig) -> Option<PathBuf> {
     resolve_output_dir(cfg).map(|dir| dir.join("debug_exchanges"))
 }
 
+fn legacy_payload_enabled(metadata_only: bool, log_bridge: bool) -> bool {
+    !metadata_only && log_bridge
+}
+
 pub async fn write_debug_payload(
+    cfg: &DebugLoggingConfig,
+    trace_id: Option<&str>,
+    prefix: &str,
+    payload: &Value,
+) {
+    // The persistent switch selects metadata-only mode, including when LogBridge is active.
+    if !legacy_payload_enabled(
+        cfg.enabled,
+        crate::modules::log_bridge::is_log_bridge_enabled(),
+    ) {
+        return;
+    }
+    write_payload(cfg, trace_id, prefix, payload).await;
+}
+
+async fn write_payload(
     cfg: &DebugLoggingConfig,
     trace_id: Option<&str>,
     prefix: &str,
@@ -128,7 +148,10 @@ pub async fn write_exchange_payload(
     prefix: &str,
     payload: &Value,
 ) {
-    if !is_enabled(cfg) {
+    if !legacy_payload_enabled(
+        cfg.enabled,
+        crate::modules::log_bridge::is_log_bridge_enabled(),
+    ) {
         return;
     }
 
@@ -253,7 +276,7 @@ async fn write_upstream_diagnostic(
         "physical_request": ctx.physical_request,
         "data": data,
     });
-    write_debug_payload(&ctx.cfg, Some(&ctx.request_id), &prefix, &payload).await;
+    write_payload(&ctx.cfg, Some(&ctx.request_id), &prefix, &payload).await;
 }
 
 pub(crate) async fn log_upstream_dispatch(
@@ -489,6 +512,10 @@ where
         } else {
             stream
         };
+
+    if cfg.enabled {
+        return stream;
+    }
 
     let wrapped = async_stream::stream! {
         let mut capture = BoundedStreamCapture::new();
@@ -796,7 +823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn debug_stream_capture_is_bounded_and_forwarding_is_unchanged() {
+    async fn upstream_diagnostics_metadata_mode_forwards_without_legacy_stream_capture() {
         let data = bytes::Bytes::from(vec![b'A'; 1024 * 1024]);
         let output_dir = std::env::temp_dir().join(format!(
             "antigravity-debug-stream-{}",
@@ -819,27 +846,60 @@ mod tests {
             .await;
         assert_eq!(forwarded, vec![data]);
 
-        let exchange_dir = output_dir.join("debug_exchanges");
-        let mut entries = tokio::fs::read_dir(&exchange_dir)
-            .await
-            .expect("debug log dir");
-        let path = entries
-            .next_entry()
-            .await
-            .expect("read debug entry")
-            .expect("debug entry")
-            .path();
-        let payload: Value =
-            serde_json::from_slice(&tokio::fs::read(path).await.expect("read debug payload"))
-                .expect("debug json");
-        assert_eq!(payload["raw_stream_bytes"], 1024 * 1024);
-        assert_eq!(payload["truncated"], true);
+        assert!(!output_dir.exists());
+
+        let mut legacy_capture = BoundedStreamCapture::new();
+        legacy_capture.push(&forwarded[0]);
+        assert!(legacy_capture.truncated());
+        assert_eq!(legacy_capture.total_bytes, 1024 * 1024);
         assert!(
-            payload["raw_stream"].as_str().unwrap().len()
+            legacy_capture.bounded_bytes().len()
                 <= DEBUG_STREAM_HEAD_BYTES + DEBUG_STREAM_TAIL_BYTES + 64
         );
-        tokio::fs::remove_dir_all(output_dir)
-            .await
-            .expect("remove test debug dir");
+    }
+
+    #[tokio::test]
+    async fn upstream_diagnostics_metadata_mode_blocks_legacy_payload_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = DebugLoggingConfig {
+            enabled: true,
+            output_dir: Some(dir.path().to_string_lossy().into_owned()),
+        };
+        // Metadata mode wins for both bridge states, while bridge-only legacy mode is retained.
+        assert!(!legacy_payload_enabled(true, true));
+        assert!(!legacy_payload_enabled(true, false));
+        assert!(!legacy_payload_enabled(false, false));
+        assert!(legacy_payload_enabled(false, true));
+        assert!(is_enabled(&cfg));
+        let legacy = serde_json::json!({
+            "request":{"messages":[{"content":"private-message"}],"system":"private-system"},
+            "headers":{"Authorization":"private-credential"},
+            "tool_args":{"value":"private-tool"},
+        });
+        write_debug_payload(&cfg, Some("legacy-id"), "client_request", &legacy).await;
+        write_exchange_payload(&cfg, Some("legacy-id"), "exchange_summary", &legacy).await;
+        let holder = diagnostic_holder(dir.path());
+        let data = bytes::Bytes::from_static(b"data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"private-message\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"cachedContentTokenCount\":0}}}\n\n");
+        let expected = data.clone();
+        let forwarded = CURRENT_UPSTREAM_CAPTURE
+            .scope(holder, async {
+                wrap_stream_with_debug(
+                    Box::pin(stream::iter(vec![Ok::<_, String>(data)])),
+                    cfg,
+                    "legacy-id".to_string(),
+                    "upstream_response",
+                    legacy,
+                )
+                .collect::<Vec<_>>()
+                .await
+            })
+            .await;
+        assert_eq!(forwarded, vec![Ok(expected)]);
+        assert!(!dir.path().join("debug_exchanges").exists());
+        let logs = diagnostic_files(dir.path()).await;
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().any(|log| log["kind"] == "upstream_usage_sse"));
+        assert!(logs.iter().all(|log| !log.to_string().contains("private-")));
+        assert!(logs.iter().all(|log| log.get("raw_stream").is_none()));
     }
 }

@@ -683,6 +683,7 @@ fn default_false() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugLoggingConfig {
+    /// Persistent metadata-only mode; suppresses legacy payload/exchange captures even with LogBridge.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
