@@ -2347,6 +2347,7 @@ pub async fn handle_messages(
                 };
 
                 // 解包 response 字段（v1internal 格式）
+                debug_logger::log_upstream_json_usage(&gemini_resp).await;
                 let raw = gemini_resp.get("response").unwrap_or(&gemini_resp);
                 if let Some(usage) = raw.get("usageMetadata") {
                     crate::proxy::monitor::record_upstream_usage(usage);

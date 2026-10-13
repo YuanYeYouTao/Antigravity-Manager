@@ -271,7 +271,9 @@ where
                         "[{}] [Stream-AutoHeal] ✓ Auto-heal request succeeded (HTTP 200), piping healed stream directly into client connection...",
                         ctx.trace_id
                     );
-                    let mut stream2 = call_success.response.bytes_stream();
+                    let mut stream2 = crate::proxy::debug_logger::wrap_stream_with_upstream_usage_diagnostics(
+                        Box::pin(call_success.response.bytes_stream()),
+                    );
                     while let Some(item) = stream2.next().await {
                         match item {
                             Ok(bytes) => yield Ok(bytes),

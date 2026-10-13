@@ -629,11 +629,18 @@ impl UpstreamClient {
                     );
                     capture.record_dispatch();
                 });
+                crate::proxy::debug_logger::log_upstream_dispatch(&url, method, &body, account_id)
+                    .await;
                 let response = req_builder.send().await;
 
                 match response {
                     Ok(resp) => {
                         let status = resp.status();
+                        crate::proxy::debug_logger::log_upstream_result(
+                            Some(resp.url().as_str()),
+                            Some(status.as_u16()),
+                        )
+                        .await;
                         if status.is_success() {
                             self.endpoint_health.mark_success(base_url);
                             if idx > 0 {
@@ -697,6 +704,7 @@ impl UpstreamClient {
                         });
                     }
                     Err(e) => {
+                        crate::proxy::debug_logger::log_upstream_result(None, None).await;
                         self.endpoint_health.mark_failure(base_url);
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);
@@ -803,6 +811,8 @@ impl UpstreamClient {
 
             let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
                 .try_with(|capture| capture.record_dispatch());
+            crate::proxy::debug_logger::log_upstream_dispatch(&url, method, &body, account_id)
+                .await;
             let response = match client
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", access_token))
@@ -814,6 +824,7 @@ impl UpstreamClient {
             {
                 Ok(response) => response,
                 Err(e) => {
+                    crate::proxy::debug_logger::log_upstream_result(None, None).await;
                     self.endpoint_health.mark_failure(base_url);
                     tracing::warn!(
                         endpoint = %url,
@@ -826,6 +837,11 @@ impl UpstreamClient {
             };
 
             let status = response.status();
+            crate::proxy::debug_logger::log_upstream_result(
+                Some(response.url().as_str()),
+                Some(status.as_u16()),
+            )
+            .await;
             if !status.is_success() {
                 let text = response.text().await.unwrap_or_default();
                 last_error = format!("{} returned {}: {}", url, status, text);
@@ -849,10 +865,12 @@ impl UpstreamClient {
             }
 
             self.endpoint_health.mark_success(base_url);
-            return response
-                .json()
+            let json = response
+                .json::<Value>()
                 .await
-                .map_err(|e| format!("failed to parse response from {}: {}", url, e));
+                .map_err(|e| format!("failed to parse response from {}: {}", url, e))?;
+            crate::proxy::debug_logger::log_upstream_json_usage(&json).await;
+            return Ok(json);
         }
 
         let final_err = if last_error.is_empty() {
