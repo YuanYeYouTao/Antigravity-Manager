@@ -713,11 +713,13 @@ pub async fn monitor_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    monitor_request(state.monitor, request, next).await
+    let debug_cfg = state.debug_logging.read().await.clone();
+    monitor_request(state.monitor, debug_cfg, request, next).await
 }
 
 async fn monitor_request(
     monitor: std::sync::Arc<crate::proxy::monitor::ProxyMonitor>,
+    debug_cfg: crate::proxy::config::DebugLoggingConfig,
     request: Request,
     next: Next,
 ) -> Response {
@@ -840,7 +842,9 @@ async fn monitor_request(
         request
     };
 
+    let log_id = uuid::Uuid::new_v4().to_string();
     let upstream_holder = UpstreamRequestBodyHolder::new();
+    upstream_holder.configure_diagnostics(debug_cfg, log_id.clone());
     let mut request = request;
     request.extensions_mut().insert(upstream_holder.clone());
 
@@ -923,7 +927,7 @@ async fn monitor_request(
         .map(|s| s.to_string());
 
     let mut log = ProxyRequestLog {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: log_id,
         timestamp: chrono::Utc::now().timestamp_millis(),
         method,
         url: uri,
@@ -1643,6 +1647,78 @@ async fn monitor_request(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn upstream_diagnostics_reuse_monitor_uuid_and_leave_request_body_unchanged() {
+        use crate::proxy::config::DebugLoggingConfig;
+        use crate::proxy::monitor::{prompt_log_tests, CURRENT_UPSTREAM_CAPTURE};
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use tower::ServiceExt;
+
+        let _data = prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        crate::modules::token_stats::init_db().unwrap();
+        let debug_dir = tempfile::tempdir().unwrap();
+        let cfg = DebugLoggingConfig {
+            enabled: true,
+            output_dir: Some(debug_dir.path().to_string_lossy().into_owned()),
+        };
+        let monitor = std::sync::Arc::new(prompt_log_tests::test_monitor());
+        let middleware_monitor = monitor.clone();
+        let app = Router::new().route("/v1/chat/completions", post(|Json(body): Json<Value>| async move {
+            assert_eq!(body, json!({"model":"fixture-model","messages":[{"role":"user","content":"private-request-fixture"}]}));
+            CURRENT_UPSTREAM_CAPTURE.with(|capture| capture.record_dispatch());
+            crate::proxy::debug_logger::log_upstream_dispatch(
+                "https://upstream.example/v1internal:generateContent?key=private-query",
+                "generateContent", &body, None,
+            ).await;
+            crate::proxy::debug_logger::log_upstream_result(Some("https://final.example/private-path?key=private-query"), Some(200)).await;
+            let raw = json!({"usageMetadata":{"promptTokenCount":10,"cachedContentTokenCount":0}});
+            crate::proxy::debug_logger::log_upstream_json_usage(&raw).await;
+            crate::proxy::monitor::record_upstream_usage(&raw);
+            ([("X-Account-Email","diagnostic@test")], Json(raw))
+        })).layer(axum::middleware::from_fn(move |request, next| {
+            super::monitor_request(middleware_monitor.clone(), cfg.clone(), request, next)
+        }));
+        let request_body = json!({"model":"fixture-model","messages":[{"role":"user","content":"private-request-fixture"}]}).to_string();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        wait_for_persisted_requests(1).await;
+        let logs = monitor.get_logs(1).await;
+        assert_eq!(logs.len(), 1);
+        let mut files = tokio::fs::read_dir(debug_dir.path()).await.unwrap();
+        let mut count = 0;
+        while let Some(file) = files.next_entry().await.unwrap() {
+            let diagnostic: Value =
+                serde_json::from_slice(&tokio::fs::read(file.path()).await.unwrap()).unwrap();
+            assert_eq!(diagnostic["request_id"], logs[0].id);
+            assert_eq!(diagnostic["physical_request"], 1);
+            assert!(!diagnostic.to_string().contains("private-"));
+            if diagnostic["kind"] == "upstream_result" {
+                assert_eq!(
+                    diagnostic["data"]["endpoint_origin"],
+                    "https://final.example"
+                );
+                assert_eq!(diagnostic["data"]["status"], 200);
+            }
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
     async fn wait_for_persisted_requests(count: u64) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
@@ -1767,7 +1843,7 @@ mod tests {
                         };
                         ([ ("X-Account-Email", "usage@test") ], Json(response)).into_response()
                     }
-                })).layer(axum::middleware::from_fn(move |request, next| super::monitor_request(middleware_monitor.clone(), request, next)));
+                })).layer(axum::middleware::from_fn(move |request, next| super::monitor_request(middleware_monitor.clone(), crate::proxy::config::DebugLoggingConfig::default(), request, next)));
                 let response = app
                     .oneshot(
                         axum::http::Request::builder()
@@ -1906,7 +1982,7 @@ mod tests {
                     crate::proxy::mappers::claude::create_claude_sse_stream(Box::pin(native), "usage-fixture".into(), "usage@test".into(), None, false, 1_048_576, None, 0, None, Vec::new())
                 };
                 axum::response::Response::builder().header("content-type", "text/event-stream").header("X-Account-Email", "usage@test").body(axum::body::Body::from_stream(mapped)).unwrap()
-            })).layer(axum::middleware::from_fn(move |request, next| super::monitor_request(monitor.clone(), request, next)));
+            })).layer(axum::middleware::from_fn(move |request, next| super::monitor_request(monitor.clone(), crate::proxy::config::DebugLoggingConfig::default(), request, next)));
             let response = app
                 .oneshot(
                     axum::http::Request::builder()

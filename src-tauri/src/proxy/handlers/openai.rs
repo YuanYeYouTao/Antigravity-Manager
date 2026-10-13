@@ -2815,6 +2815,7 @@ pub async fn handle_chat_completions(
                 .json()
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            debug_logger::log_upstream_json_usage(&gemini_resp).await;
 
             if let Some(usage) = gemini_resp
                 .get("response")
@@ -4769,6 +4770,7 @@ pub async fn handle_completions(
             {
                 crate::proxy::monitor::record_upstream_usage(usage);
             }
+            debug_logger::log_upstream_json_usage(&gemini_resp).await;
             crate::proxy::thinking_store::capture_gemini_response(&session_id_str, &gemini_resp);
 
             let chat_resp = transform_openai_response(

@@ -141,6 +141,13 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib --no-run
 
+      - name: Test upstream diagnostics
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib upstream_diagnostics
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib actual_mappers_monitor_and_stats_keep_partial_raw_usage_and_totals
+          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib lazy_body_dispatch_uses_the_same_capture_and_keeps_only_its_own_usage
+
       - name: Stage Linux validation executables
         if: startsWith(matrix.platform, 'ubuntu')
         run: |

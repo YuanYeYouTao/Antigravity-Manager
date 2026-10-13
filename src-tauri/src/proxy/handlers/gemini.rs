@@ -898,6 +898,7 @@ pub async fn handle_generate(
                 .json()
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+            debug_logger::log_upstream_json_usage(&gemini_resp).await;
             if let Some(usage) = gemini_resp
                 .get("response")
                 .unwrap_or(&gemini_resp)

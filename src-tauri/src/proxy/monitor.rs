@@ -264,6 +264,7 @@ pub(crate) struct UpstreamCapture {
     headers: Option<String>,
     physical_requests: Option<u32>,
     usage: Option<serde_json::Map<String, serde_json::Value>>,
+    diagnostics: Option<(crate::proxy::config::DebugLoggingConfig, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -274,6 +275,30 @@ tokio::task_local! {
 }
 
 impl UpstreamRequestBodyHolder {
+    pub(crate) fn configure_diagnostics(
+        &self,
+        cfg: crate::proxy::config::DebugLoggingConfig,
+        request_id: String,
+    ) {
+        if crate::proxy::debug_logger::is_enabled(&cfg) {
+            if let Ok(mut capture) = self.0.lock() {
+                capture.diagnostics = Some((cfg, request_id));
+            }
+        }
+    }
+
+    pub(crate) fn diagnostic_context(
+        &self,
+    ) -> Option<crate::proxy::debug_logger::UpstreamDiagnosticContext> {
+        let capture = self.0.lock().ok()?;
+        let (cfg, request_id) = capture.diagnostics.as_ref()?;
+        Some(crate::proxy::debug_logger::UpstreamDiagnosticContext {
+            cfg: cfg.clone(),
+            request_id: request_id.clone(),
+            physical_request: capture.physical_requests?,
+        })
+    }
+
     pub fn record_dispatch(&self) {
         if let Ok(mut capture) = self.0.lock() {
             capture.physical_requests = Some(capture.physical_requests.unwrap_or(0) + 1);
