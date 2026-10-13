@@ -886,6 +886,13 @@ async fn monitor_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // Extract upstream model from X-Upstream-Model header if present
+    let upstream_model = response
+        .headers()
+        .get("X-Upstream-Model")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Determine protocol from URL path
     let protocol = if uri.contains("/v1/messages") || uri.contains("/v1/models/claude") {
         Some("anthropic".to_string())
@@ -924,6 +931,7 @@ async fn monitor_request(
         duration,
         model,
         mapped_model,
+        upstream_model,
         account_email,
         client_ip,
         error: None,
@@ -1011,6 +1019,12 @@ async fn monitor_request(
                     }
 
                     if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                        if let Some(mv) = json.get("modelVersion").and_then(|v| v.as_str()) {
+                            if !mv.trim().is_empty() {
+                                log.upstream_model = Some(mv.to_string());
+                            }
+                        }
+
                         // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
                         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                             for choice in choices {
@@ -1356,7 +1370,47 @@ async fn monitor_request(
                 );
                 timing_obj.insert("total_s".to_string(), serde_json::json!(total_ms / 1000.0));
 
-                apply_captured_usage(&mut log, &mut usage_obj, captured_usage.as_ref());
+                // 优先从 tail 兜底提取 token（若当前尚无 token 数据）
+                if log.input_tokens.is_none() && log.output_tokens.is_none() {
+                    if let Ok(full_tail) = std::str::from_utf8(&last_few_bytes) {
+                        for line in full_tail.lines().rev() {
+                            if line.starts_with("data: ")
+                                && (line.contains("\"usage\"")
+                                    || line.contains("\"usageMetadata\""))
+                            {
+                                let json_str = line.trim_start_matches("data: ").trim();
+                                if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                                    if let Some(mv) =
+                                        json.get("modelVersion").and_then(|v| v.as_str())
+                                    {
+                                        if !mv.trim().is_empty() {
+                                            log.upstream_model = Some(mv.to_string());
+                                        }
+                                    }
+
+                                    if let Some(usage) = json
+                                        .get("usage")
+                                        .or(json.get("usageMetadata"))
+                                        .or(json.get("response").and_then(|r| r.get("usage")))
+                                        .or(json
+                                            .get("response")
+                                            .and_then(|r| r.get("usageMetadata")))
+                                    {
+                                        log.input_tokens = extract_input_tokens(usage);
+                                        log.output_tokens = extract_output_tokens(usage);
+                                        cached_tokens =
+                                            cached_tokens.or_else(|| extract_cached_tokens(usage));
+                                        log.cached_tokens = log.cached_tokens.or(cached_tokens);
+                                        reasoning_tokens = reasoning_tokens
+                                            .or_else(|| extract_reasoning_tokens(usage));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let has_actual_content = !response_content.is_empty()
                     || !tool_calls.is_empty()
                     || !thinking_content.is_empty();
@@ -1482,6 +1536,16 @@ async fn monitor_request(
                 let captured_usage = upstream_holder.usage();
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
+                        if let Some(mv) = json
+                            .get("modelVersion")
+                            .or_else(|| json.get("response").and_then(|r| r.get("modelVersion")))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !mv.trim().is_empty() {
+                                log.upstream_model = Some(mv.to_string());
+                            }
+                        }
+
                         // 支持 OpenAI "usage" 或 Gemini "usageMetadata"
                         if let Some(usage) = json
                             .get("usage")

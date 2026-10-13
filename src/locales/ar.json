@@ -185,7 +185,24 @@
         "cooling_5h_warning": "{{count}} حساب(ات) حالياً في فترة تجميد التهدئة لمدة 5 ساعات",
         "view_mode_weighted": "المرجح الشامل",
         "view_mode_5h": "5 ساعات متجددة",
-        "view_mode_weekly": "أسبوعي 7 أيام"
+        "view_mode_weekly": "أسبوعي 7 أيام",
+        "gemini_group_desc": "يشمل Pro / Flash / توليد الصور",
+        "claude_group_desc": "مجموعة نماذج الطرف الثالث",
+        "available_and_proxy": "الحسابات المتاحة / البروكسي متصل",
+        "active_with_disabled_hint": "{{count}} حسابات عادية متوقف البروكسي بها",
+        "available_accounts_unit": "متاح",
+        "proxy_online_unit": "بروكسي متصل",
+        "btn_proxy_online": "الوكيل المتصل ({{count}})",
+        "btn_all_available": "المتاحة ({{count}})",
+        "btn_title_proxy_online": "يتم احتساب الحسابات المشاركة في الوكيل فقط حاليًا",
+        "btn_title_all_available": "يتم احتساب جميع الحسابات النشطة حاليًا",
+        "proxy_joined_pool": "✓ {{count}} حساب في مجمع الوكيل",
+        "asset_rate": "معدل الأصول",
+        "health_and_risk": "الحالة والمخاطر",
+        "health_available_rate": "معدل الجاهزية السليمة",
+        "circuit_break": "قاطع الدائرة",
+        "health_all_green": "سليم تمامًا",
+        "abnormal_badge": "{{count}} غير طبيعي"
     },
     "accounts": {
         "account": "الحساب",
@@ -293,8 +310,9 @@
         "quota_protected": "محمي",
         "details": {
             "title": "تفاصيل الحصة",
-            "model_quota": "حصة النموذج",
-            "protected_models": "النماذج المحمية"
+            "model_quota": "حصص النماذج الفردية",
+            "protected_models": "النماذج المحمية",
+            "thinking_budget": "ميزانية التفكير"
         },
         "toast": {
             "proxy_enabled": "تم تفعيل الوكيل لـ {{count}} حساب",
@@ -414,7 +432,12 @@
         },
         "quota_window_5h": "5-Hour Rolling Quota",
         "quota_window_weekly": "7-Day Weekly Quota",
-        "quota_window_weekly_short": "Weekly"
+        "quota_window_weekly_short": "Weekly",
+        "quota_group_gemini": "نماذج Gemini",
+        "quota_group_claude": "نماذج Claude و GPT",
+        "weekly_constrained_tooltip": "مقيد بالحد الأسبوعي",
+        "weekly_tokens": "توكن الدورة",
+        "weekly_tokens_tooltip": "التوكنات المسجلة بواسطة هذا المثيل في دورة الحصة الحالية (إدخال + إخراج)"
     },
     "settings": {
         "save": "حفظ الإعدادات",
@@ -1526,7 +1549,23 @@
             "usage": "توكنز",
             "duration": "المدة",
             "time": "الوقت",
-            "empty": "لم يتم تسجيل أي طلبات"
+            "empty": "لم يتم تسجيل أي طلبات",
+            "endpoint": "نقطة النهاية / البروتوكول",
+            "model_routing": "النموذج (الطلب / الفعلي)",
+            "duration_ttft": "المدة / TTFT",
+            "resize_handle_tooltip": "اسحب لتغيير الحجم / انقر نقرًا مزدوجًا لإعادة التعيين",
+            "req_prefix": "الطلب:",
+            "real_prefix": "الفعلي:",
+            "req_model_title": "النموذج المطلوب",
+            "real_model_title": "النموذج الفعلي المستخدم",
+            "in_prefix": "الدخل:",
+            "out_prefix": "الخرج:",
+            "cache_prefix": "المؤقتة:",
+            "in_tokens_title": "رموز الإدخال",
+            "out_tokens_title": "رموز الإخراج",
+            "ttft_prefix": "أول رمز:",
+            "total_duration_title": "إجمالي الوقت",
+            "ttft_title": "زمن استجابة أول رمز (TTFT)"
         },
         "details": {
             "title": "تفاصيل الطلب",

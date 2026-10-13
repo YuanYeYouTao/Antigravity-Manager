@@ -186,7 +186,24 @@
         "cooling_5h_warning": "{{count}} hesap şu anda 5 saatlik soğuma dondurmasında",
         "view_mode_weighted": "Ağırlıklı",
         "view_mode_5h": "5 Saatlik Kayan",
-        "view_mode_weekly": "7 Günlük Haftalık"
+        "view_mode_weekly": "7 Günlük Haftalık",
+        "gemini_group_desc": "Pro / Flash / Görsel dahil",
+        "claude_group_desc": "Üçüncü taraf model havuzu",
+        "available_and_proxy": "Kullanılabilir Hesaplar / Proxy Çevrimiçi",
+        "active_with_disabled_hint": "{{count}} normal hesabın proxy'si duraklatıldı",
+        "available_accounts_unit": "Kullanılabilir",
+        "proxy_online_unit": "Proxy çevrimiçi",
+        "btn_proxy_online": "Proxy Çevrimiçi ({{count}})",
+        "btn_all_available": "Kullanılabilir ({{count}})",
+        "btn_title_proxy_online": "Şu anda yalnızca proxy dağıtımındaki hesaplar sayılıyor",
+        "btn_title_all_available": "Şu anda tüm etkin hesaplar sayılıyor",
+        "proxy_joined_pool": "✓ {{count}} hesap proxy havuzunda",
+        "asset_rate": "Varlık Oranı",
+        "health_and_risk": "Sağlık ve Risk",
+        "health_available_rate": "Sağlıklı Kullanılabilirlik",
+        "circuit_break": "Kesildi",
+        "health_all_green": "Tamamen Sağlıklı",
+        "abnormal_badge": "{{count}} Anormal"
     },
     "accounts": {
         "account": "Hesap",
@@ -285,8 +302,9 @@
         "quota_protected": "Korumalı",
         "details": {
             "title": "Kota Detayları",
-            "model_quota": "Model Kotası",
-            "protected_models": "Korumalı Modeller"
+            "model_quota": "Bireysel model kotaları",
+            "protected_models": "Korumalı Modeller",
+            "thinking_budget": "Düşünme bütçesi"
         },
         "toast": {
             "proxy_enabled": "{{count}} hesap için proxy etkinleştirildi",
@@ -416,7 +434,12 @@
         "warmup_batch_triggered": "Warmup tasks triggered for {{count}} accounts",
         "quota_window_5h": "5-Hour Rolling Quota",
         "quota_window_weekly": "7-Day Weekly Quota",
-        "quota_window_weekly_short": "Weekly"
+        "quota_window_weekly_short": "Weekly",
+        "quota_group_gemini": "Gemini Modelleri",
+        "quota_group_claude": "Claude ve GPT Modelleri",
+        "weekly_constrained_tooltip": "Haftalık kota sınırı ile kısıtlandı",
+        "weekly_tokens": "Döngü tokenleri",
+        "weekly_tokens_tooltip": "Bu örneğin mevcut kota döngüsünde kaydettiği token kullanımı (girdi + çıktı)"
     },
     "settings": {
         "save": "Ayarları Kaydet",
@@ -1576,7 +1599,23 @@
             "usage": "Token'lar",
             "duration": "Süre",
             "time": "Zaman",
-            "empty": "Kayıtlı istek yok"
+            "empty": "Kayıtlı istek yok",
+            "endpoint": "Uç Nokta / Protokol",
+            "model_routing": "Model (İstek / Gerçek)",
+            "duration_ttft": "Süre / TTFT",
+            "resize_handle_tooltip": "Genişliği ayarlamak için sürükleyin / Sıfırlamak için çift tıklayın",
+            "req_prefix": "İstek:",
+            "real_prefix": "Gerçek:",
+            "req_model_title": "İstenen Model",
+            "real_model_title": "Gerçek Upstream Model",
+            "in_prefix": "Giriş:",
+            "out_prefix": "Çıkış:",
+            "cache_prefix": "Önbellek:",
+            "in_tokens_title": "Giriş Belirteçleri",
+            "out_tokens_title": "Çıkış Belirteçleri",
+            "ttft_prefix": "TTFT:",
+            "total_duration_title": "Toplam Gecikme",
+            "ttft_title": "İlk Belirteç Gecikmesi (TTFT)"
         },
         "details": {
             "title": "İstek Detayları",

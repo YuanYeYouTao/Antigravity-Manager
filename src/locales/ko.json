@@ -187,7 +187,24 @@
         "cooling_5h_warning": "{{count}}개 계정이 현재 5H 냉각 동결 상태임",
         "view_mode_weighted": "가중 종합",
         "view_mode_5h": "5H 롤링",
-        "view_mode_weekly": "7일 주간"
+        "view_mode_weekly": "7일 주간",
+        "gemini_group_desc": "Pro / Flash / 이미지 생성 포함",
+        "claude_group_desc": "서드파티 모델 풀",
+        "available_and_proxy": "사용 가능 계정 / 프록시 온라인",
+        "active_with_disabled_hint": "정상 계정 {{count}}개의 프록시가 일시 중지됨",
+        "available_accounts_unit": "사용 가능",
+        "proxy_online_unit": "프록시 온라인",
+        "btn_proxy_online": "프록시 온라인 ({{count}})",
+        "btn_all_available": "사용 가능 ({{count}})",
+        "btn_title_proxy_online": "현재: 프록시에 참여 중인 계정만 집계",
+        "btn_title_all_available": "현재: 사용 가능한 모든 정상 계정 집계",
+        "proxy_joined_pool": "✓ {{count}}개 계정이 프록시 풀에 참여 중",
+        "asset_rate": "자산 가용률",
+        "health_and_risk": "건전성 및 리스크",
+        "health_available_rate": "정상 가용률",
+        "circuit_break": "차단",
+        "health_all_green": "모두 정상",
+        "abnormal_badge": "{{count}}개 이상"
     },
     "accounts": {
         "account": "계정",
@@ -316,8 +333,9 @@
         "quota_protected": "보호됨",
         "details": {
             "title": "할당량 상세",
-            "model_quota": "모델 할당량",
-            "protected_models": "보호된 모델"
+            "model_quota": "개별 모델 할당량",
+            "protected_models": "보호된 모델",
+            "thinking_budget": "추론 예산"
         },
         "toast": {
             "proxy_enabled": "{{count}}개 계정의 프록시를 활성화했습니다",
@@ -416,7 +434,12 @@
         "switch_to_agy": "Antigravity CLI (agy)로 전환",
         "drag_disabled_during_sort": "열 정렬이 활성화되어 드래그 정렬이 일시 중지되었습니다",
         "go_to_appeal": "이의 제기하러 가기",
-        "copy_appeal_url": "이의 제기 URL 복사"
+        "copy_appeal_url": "이의 제기 URL 복사",
+        "quota_group_gemini": "Gemini 모델",
+        "quota_group_claude": "Claude & GPT 모델",
+        "weekly_constrained_tooltip": "주간 할당량 한도에 의해 제한됨",
+        "weekly_tokens": "주기 토큰",
+        "weekly_tokens_tooltip": "이 인스턴스가 현재 할당량 주기에서 기록한 토큰 사용량 (입력 + 출력)"
     },
     "settings": {
         "save": "설정 저장",
@@ -1523,7 +1546,23 @@
             "usage": "토큰",
             "duration": "소요 시간",
             "time": "시간",
-            "empty": "기록된 요청 없음"
+            "empty": "기록된 요청 없음",
+            "endpoint": "엔드포인트 / 프로토콜",
+            "model_routing": "모델 (요청 / 실제)",
+            "duration_ttft": "소요 시간 / TTFT",
+            "resize_handle_tooltip": "드래그하여 너비 조절 / 더블클릭하여 초기화",
+            "req_prefix": "요청:",
+            "real_prefix": "실제:",
+            "req_model_title": "요청된 모델",
+            "real_model_title": "실제 사용된 모델",
+            "in_prefix": "입력:",
+            "out_prefix": "출력:",
+            "cache_prefix": "캐시:",
+            "in_tokens_title": "입력 토큰",
+            "out_tokens_title": "출력 토큰",
+            "ttft_prefix": "첫 글자:",
+            "total_duration_title": "총 소요 시간",
+            "ttft_title": "첫 글자 지연 시간 (TTFT)"
         },
         "details": {
             "title": "요청 상세",

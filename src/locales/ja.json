@@ -187,7 +187,24 @@
         "cooling_5h_warning": "{{count}} 個のアカウントが現在 5H クールダウン凍結中です",
         "view_mode_weighted": "加重総合",
         "view_mode_5h": "5H ローリング",
-        "view_mode_weekly": "7日間週間"
+        "view_mode_weekly": "7日間週間",
+        "gemini_group_desc": "Pro / Flash / 画像生成を含む",
+        "claude_group_desc": "サードパーティモデルプール",
+        "available_and_proxy": "利用可能アカウント / プロキシ稼働中",
+        "active_with_disabled_hint": "{{count}} 件の正常アカウントのプロキシが一時停止中",
+        "available_accounts_unit": "利用可能",
+        "proxy_online_unit": "プロキシ稼働",
+        "btn_proxy_online": "プロキシ ({{count}})",
+        "btn_all_available": "利用可能 ({{count}})",
+        "btn_title_proxy_online": "現在：プロキシ配信に参加中のアカウントのみ集計",
+        "btn_title_all_available": "現在：すべての利用可能なアカウントを集計",
+        "proxy_joined_pool": "✓ {{count}} 件のアカウントがプロキシに参加中",
+        "asset_rate": "アセット率",
+        "health_and_risk": "健全性とリスク",
+        "health_available_rate": "健全利用可能率",
+        "circuit_break": "遮断",
+        "health_all_green": "すべて正常",
+        "abnormal_badge": "{{count}}件 異常"
     },
     "accounts": {
         "account": "アカウント",
@@ -316,8 +333,9 @@
         "quota_protected": "保護中",
         "details": {
             "title": "クォータ詳細",
-            "model_quota": "モデルクォータ",
-            "protected_models": "保護されたモデル"
+            "model_quota": "個別モデルクォータ",
+            "protected_models": "保護されたモデル",
+            "thinking_budget": "思考予算"
         },
         "toast": {
             "proxy_enabled": "{{count}} 個のアカウントのプロキシを有効にしました",
@@ -416,7 +434,12 @@
         "switch_to_agy": "Switch to Antigravity CLI (agy)",
         "drag_disabled_during_sort": "列ソートが有効なため、ドラッグ並び替えは一時停止中です",
         "go_to_appeal": "異議申し立てへ移動",
-        "copy_appeal_url": "異議申し立てURLをコピー"
+        "copy_appeal_url": "異議申し立てURLをコピー",
+        "quota_group_gemini": "Gemini モデル",
+        "quota_group_claude": "Claude & GPT モデル",
+        "weekly_constrained_tooltip": "週間クォータの上限による制限",
+        "weekly_tokens": "サイクル Token",
+        "weekly_tokens_tooltip": "このインスタンスが現在のクォータサイクルで記録した Token 使用量（入力 + 出力）"
     },
     "settings": {
         "save": "設定を保存",
@@ -1523,7 +1546,23 @@
             "usage": "トークン",
             "duration": "所要時間",
             "time": "時間",
-            "empty": "記録されたリクエストはありません"
+            "empty": "記録されたリクエストはありません",
+            "endpoint": "エンドポイント / プロトコル",
+            "model_routing": "モデル (リクエスト / 実際)",
+            "duration_ttft": "所要時間 / TTFT",
+            "resize_handle_tooltip": "ドラッグで幅調整 / ダブルクリックで初期化",
+            "req_prefix": "リクエスト:",
+            "real_prefix": "実際:",
+            "req_model_title": "リクエストモデル",
+            "real_model_title": "実際に使用されたモデル",
+            "in_prefix": "入力:",
+            "out_prefix": "出力:",
+            "cache_prefix": "キャッシュ:",
+            "in_tokens_title": "入力トークン",
+            "out_tokens_title": "出力トークン",
+            "ttft_prefix": "初字:",
+            "total_duration_title": "総所要時間",
+            "ttft_title": "最初のトークン遅延 (TTFT)"
         },
         "details": {
             "title": "リクエスト詳細",

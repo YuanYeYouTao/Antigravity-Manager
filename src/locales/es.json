@@ -187,7 +187,24 @@
         "cooling_5h_warning": "{{count}} cuenta(s) actualmente en enfriamiento 5H",
         "view_mode_weighted": "Ponderado",
         "view_mode_5h": "5H Rotativo",
-        "view_mode_weekly": "Semanal 7D"
+        "view_mode_weekly": "Semanal 7D",
+        "gemini_group_desc": "Incluye Pro / Flash / Imagen",
+        "claude_group_desc": "Grupo de modelos de terceros",
+        "available_and_proxy": "Cuentas disponibles / Proxy en línea",
+        "active_with_disabled_hint": "{{count}} cuentas normales tienen el proxy en pausa",
+        "available_accounts_unit": "Disponible",
+        "proxy_online_unit": "Proxy en línea",
+        "btn_proxy_online": "Proxy Online ({{count}})",
+        "btn_all_available": "Disponibles ({{count}})",
+        "btn_title_proxy_online": "Actualmente contando solo cuentas en proxy",
+        "btn_title_all_available": "Actualmente contando todas las cuentas activas",
+        "proxy_joined_pool": "✓ {{count}} cuenta(s) en el pool de proxy",
+        "asset_rate": "Tasa de Activos",
+        "health_and_risk": "Salud y Riesgo",
+        "health_available_rate": "Disponibilidad Saludable",
+        "circuit_break": "Interrumpido",
+        "health_all_green": "Todo Saludable",
+        "abnormal_badge": "{{count}} Anormales"
     },
     "accounts": {
         "account": "Cuenta",
@@ -316,8 +333,9 @@
         "quota_protected": "Protegida",
         "details": {
             "title": "Detalles de Cuota",
-            "model_quota": "Cuota de Modelo",
-            "protected_models": "Modelos Protegidos"
+            "model_quota": "Cuotas individuales de modelos",
+            "protected_models": "Modelos Protegidos",
+            "thinking_budget": "Presupuesto de pensamiento"
         },
         "toast": {
             "proxy_enabled": "Proxy habilitado para {{count}} cuentas",
@@ -416,7 +434,12 @@
         "switch_to_agy": "Cambiar a CLI de Antigravity (agy)",
         "drag_disabled_during_sort": "La ordenación por columnas está activa; el arrastre está en pausa",
         "go_to_appeal": "Go to Appeal",
-        "copy_appeal_url": "Copy Appeal URL"
+        "copy_appeal_url": "Copy Appeal URL",
+        "quota_group_gemini": "Modelos Gemini",
+        "quota_group_claude": "Modelos Claude y GPT",
+        "weekly_constrained_tooltip": "Restringido por el límite semanal",
+        "weekly_tokens": "Tokens del ciclo",
+        "weekly_tokens_tooltip": "Tokens registrados por esta instancia en este ciclo de cuota (entrada + salida)"
     },
     "settings": {
         "save": "Guardar Configuración",
@@ -1523,7 +1546,23 @@
             "usage": "Tokens",
             "duration": "Duración",
             "time": "Hora",
-            "empty": "No hay solicitudes registradas"
+            "empty": "No hay solicitudes registradas",
+            "endpoint": "Extremo / Protocolo",
+            "model_routing": "Modelo (Sol. / Real)",
+            "duration_ttft": "Duración / TTFT",
+            "resize_handle_tooltip": "Arrastrar para cambiar ancho / Doble clic para restablecer",
+            "req_prefix": "Sol:",
+            "real_prefix": "Real:",
+            "req_model_title": "Modelo solicitado",
+            "real_model_title": "Modelo upstream real",
+            "in_prefix": "Ent:",
+            "out_prefix": "Sal:",
+            "cache_prefix": "Caché:",
+            "in_tokens_title": "Tokens de entrada",
+            "out_tokens_title": "Tokens de salida",
+            "ttft_prefix": "TTFT:",
+            "total_duration_title": "Latencia total",
+            "ttft_title": "Latencia del primer token (TTFT)"
         },
         "details": {
             "title": "Detalles de Solicitud",

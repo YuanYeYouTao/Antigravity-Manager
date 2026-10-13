@@ -37,11 +37,12 @@ pub fn get_max_output_tokens(model_id: &str, token: Option<&ProxyToken>) -> u64 
     // 1. 尝试从账号动态数据中读取
     if let Some(t) = token {
         if let Some(&limit) = t.model_limits.get(&std_id) {
-            return limit;
+            // [FIX #3215] 保护输出上限：避免某些 agent 专属通道配置的 2048 小限额卡死模型长文本生成能力
+            return limit.max(8192);
         }
         // 如果原始 ID 没找到，尝试用归一化后的 ID 找
         if let Some(&limit) = t.model_limits.get(model_id) {
-            return limit;
+            return limit.max(8192);
         }
     }
 

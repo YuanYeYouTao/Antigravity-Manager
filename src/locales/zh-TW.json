@@ -186,7 +186,24 @@
         "cooling_5h_warning": "{{count}} 個帳號當前處於 5H 冷卻凍結中",
         "view_mode_weighted": "綜合加權",
         "view_mode_5h": "5H 滾動",
-        "view_mode_weekly": "7天週配額"
+        "view_mode_weekly": "7天週配額",
+        "gemini_group_desc": "包含 Pro / Flash / 繪圖",
+        "claude_group_desc": "第三方模型池",
+        "available_and_proxy": "可用帳號 / 反代在線",
+        "active_with_disabled_hint": "{{count}} 個正常帳號已暫停反代",
+        "available_accounts_unit": "可用",
+        "proxy_online_unit": "反代在線",
+        "btn_proxy_online": "反代帳號 ({{count}})",
+        "btn_all_available": "可用帳號 ({{count}})",
+        "btn_title_proxy_online": "目前：僅統計參與反代分發的在線帳號配額",
+        "btn_title_all_available": "目前：統計所有正常未停用的可用帳號配額",
+        "proxy_joined_pool": "✓ {{count}} 個帳號已加入反代服務池",
+        "asset_rate": "資產率",
+        "health_and_risk": "健康度 & 風控",
+        "health_available_rate": "健康可用率",
+        "circuit_break": "熔斷",
+        "health_all_green": "全綠無風險",
+        "abnormal_badge": "{{count}} 異常"
     },
     "accounts": {
         "account": "帳號",
@@ -293,8 +310,9 @@
         "quota_protected": "受保護",
         "details": {
             "title": "配額詳情",
-            "model_quota": "模型配額",
-            "protected_models": "受保護模型"
+            "model_quota": "具體模型配額",
+            "protected_models": "受保護模型",
+            "thinking_budget": "思考預算"
         },
         "toast": {
             "proxy_enabled": "成功啟用 {{count}} 個帳號的反向代理功能",
@@ -416,7 +434,12 @@
             "tip2": "For production environments, using a <1>Service Account</1> JSON key is highly recommended for stability and headless operation.",
             "tip3": "If it still fails, check the Generative Language API in <1>Google Cloud Console</1> to see if permissions are frozen. If so, your account is under risk control. Please let the account cool down for 72 hours before trying again.",
             "tip4": "You can also try <1>npm install -g @google/gemini-cli</1>. If it doesn't throw errors, simply deleting and re-authorizing the account in the app will likely fix it."
-        }
+        },
+        "quota_group_gemini": "Gemini 模型",
+        "quota_group_claude": "Claude & GPT 模型",
+        "weekly_constrained_tooltip": "受到週配額短板壓制",
+        "weekly_tokens": "本週期 Token",
+        "weekly_tokens_tooltip": "本實例在此配額週期記錄的 Token 用量（輸入 + 輸出）"
     },
     "settings": {
         "save": "儲存設定",
@@ -1652,7 +1675,23 @@
             "usage": "Token 消耗",
             "duration": "耗時",
             "time": "時間",
-            "empty": "暫無請求紀錄"
+            "empty": "暫無請求紀錄",
+            "endpoint": "端點 / 協定",
+            "model_routing": "模型 (請求 / 實際)",
+            "duration_ttft": "耗時 / 首字",
+            "resize_handle_tooltip": "拖曳調整寬度 / 按兩下恢復預設",
+            "req_prefix": "請求:",
+            "real_prefix": "實際:",
+            "req_model_title": "請求模型",
+            "real_model_title": "實際使用模型",
+            "in_prefix": "入:",
+            "out_prefix": "出:",
+            "cache_prefix": "快取:",
+            "in_tokens_title": "輸入 Token",
+            "out_tokens_title": "輸出 Token",
+            "ttft_prefix": "首字:",
+            "total_duration_title": "總耗時",
+            "ttft_title": "首字延遲 (TTFT)"
         },
         "details": {
             "title": "請求詳情",

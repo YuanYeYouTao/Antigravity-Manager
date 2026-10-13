@@ -185,7 +185,24 @@
         "cooling_5h_warning": "{{count}} akaun sedang dalam pembekuan bertenang 5J",
         "view_mode_weighted": "Wajaran Komprehensif",
         "view_mode_5h": "5J Bergulir",
-        "view_mode_weekly": "7 Hari Mingguan"
+        "view_mode_weekly": "7 Hari Mingguan",
+        "gemini_group_desc": "Pro / Flash / ပုံဖော်ခြင်း အပါအဝင်",
+        "claude_group_desc": "ပြင်ပမော်ဒယ်အုပ်စု",
+        "available_and_proxy": "အသုံးပြုနိုင်သော အကောင့်များ / ပရောက်စီ အွန်လိုင်း",
+        "active_with_disabled_hint": "ပုံမှန်အကောင့် {{count}} ခု ပရောက်စီ ရပ်နားထားသည်",
+        "available_accounts_unit": "အသုံးပြုနိုင်",
+        "proxy_online_unit": "ပရောက်စီ အွန်လိုင်း",
+        "btn_proxy_online": "ပရောက်စီ အွန်လိုင်း ({{count}})",
+        "btn_all_available": "အသုံးပြုနိုင်သည် ({{count}})",
+        "btn_title_proxy_online": "လတ်တလောတွင် ပရောက်စီပါဝင်သော အကောင့်များကိုသာ ရေတွက်နေသည်",
+        "btn_title_all_available": "လတ်တလောတွင် အသုံးပြုနိုင်သော အကောင့်အားလုံးကို ရေတွက်နေသည်",
+        "proxy_joined_pool": "✓ ပရောက်စီအုပ်စုတွင် အကောင့် {{count}} ခု ပါဝင်သည်",
+        "asset_rate": "ပိုင်ဆိုင်မှုနှုန်း",
+        "health_and_risk": "ကျန်းမာရေးနှင့် အန္တရာယ်",
+        "health_available_rate": "ကျန်းမာစွာ အသုံးပြုနိုင်မှုနှုန်း",
+        "circuit_break": "ဖြတ်တောက်မှု",
+        "health_all_green": "အားလုံး ကောင်းမွန်သည်",
+        "abnormal_badge": "{{count}} ပုံမှန်မဟုတ်ပါ"
     },
     "accounts": {
         "account": "အကောင့်",
@@ -293,8 +310,9 @@
         "quota_protected": "Dilindungi",
         "details": {
             "title": "Butiran Kuota",
-            "model_quota": "Kuota Model",
-            "protected_models": "Model Dilindungi"
+            "model_quota": "Kuota model individu",
+            "protected_models": "Model Dilindungi",
+            "thinking_budget": "Belanjawan pemikiran"
         },
         "toast": {
             "proxy_enabled": "Proksi diaktifkan untuk {{count}} akaun",
@@ -414,7 +432,12 @@
         },
         "quota_window_5h": "5-Hour Rolling Quota",
         "quota_window_weekly": "7-Day Weekly Quota",
-        "quota_window_weekly_short": "Weekly"
+        "quota_window_weekly_short": "Weekly",
+        "quota_group_gemini": "Model Gemini",
+        "quota_group_claude": "Model Claude & GPT",
+        "weekly_constrained_tooltip": "Dikekang oleh had mingguan",
+        "weekly_tokens": "Token kitaran",
+        "weekly_tokens_tooltip": "Token yang direkodkan oleh kejadian ini dalam kitaran kuota semasa (input + output)"
     },
     "settings": {
         "save": "Simpan Tetapan",
@@ -1517,7 +1540,23 @@
             "usage": "Token",
             "duration": "Tempoh",
             "time": "Masa",
-            "empty": "Tiada permintaan direkod"
+            "empty": "Tiada permintaan direkod",
+            "endpoint": "Endpoint / Protocol",
+            "model_routing": "မော်ဒယ် (တောင်းဆိုမှု / အစစ်အမှန်)",
+            "duration_ttft": "ကြာချိန် / TTFT",
+            "resize_handle_tooltip": "ဆွဲယူ၍ အကျယ်ချိန်ညှိရန် / မူလအတိုင်းပြန်ထားရန် နှစ်ချက်နှိပ်ပါ",
+            "req_prefix": "တောင်းဆိုမှု:",
+            "real_prefix": "အစစ်အမှန်:",
+            "req_model_title": "တောင်းဆိုထားသော မော်ဒယ်",
+            "real_model_title": "အမှန်တကယ် အသုံးပြုသော မော်ဒယ်",
+            "in_prefix": "အဝင်:",
+            "out_prefix": "အထွက်:",
+            "cache_prefix": "ယာယီသိမ်း:",
+            "in_tokens_title": "အဝင် တိုကင်များ",
+            "out_tokens_title": "အထွက် တိုကင်များ",
+            "ttft_prefix": "ပထမစာလုံး:",
+            "total_duration_title": "စုစုပေါင်း ကြာချိန်",
+            "ttft_title": "ပထမဆုံး တိုကင် ကြာချိန် (TTFT)"
         },
         "details": {
             "title": "Butiran Permintaan",

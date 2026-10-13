@@ -797,6 +797,7 @@ pub async fn handle_generate(
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
+                        .header("X-Upstream-Model", config.final_model.as_str())
                         .header("X-Session-Id", &client_session_id)
                         .header("X-Antigravity-Session-Id", &client_session_id)
                         .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
@@ -835,6 +836,7 @@ pub async fn handle_generate(
                                     .header("Content-Type", "application/json")
                                     .header("X-Account-Email", &email)
                                     .header("X-Mapped-Model", &mapped_model)
+                                    .header("X-Upstream-Model", config.final_model.as_str())
                                     .header("X-Session-Id", &client_session_id)
                                     .header("X-Antigravity-Session-Id", &client_session_id)
                                     .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
@@ -855,6 +857,7 @@ pub async fn handle_generate(
                                 .header("Content-Type", "application/json")
                                 .header("X-Account-Email", &email)
                                 .header("X-Mapped-Model", &mapped_model)
+                                .header("X-Upstream-Model", config.final_model.as_str())
                                 .header("X-Session-Id", &client_session_id)
                                 .header("X-Antigravity-Session-Id", &client_session_id)
                                 .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
@@ -879,6 +882,7 @@ pub async fn handle_generate(
                                 .header("Content-Type", "application/json")
                                 .header("X-Account-Email", &email)
                                 .header("X-Mapped-Model", &mapped_model)
+                                .header("X-Upstream-Model", config.final_model.as_str())
                                 .header("X-Session-Id", &client_session_id)
                                 .header("X-Antigravity-Session-Id", &client_session_id)
                                 .body(Body::from(serde_json::to_string(&error_json).unwrap()))
@@ -952,6 +956,7 @@ pub async fn handle_generate(
                 .header("Content-Type", "application/json")
                 .header("X-Account-Email", &email)
                 .header("X-Mapped-Model", &mapped_model)
+                .header("X-Upstream-Model", config.final_model.as_str())
                 .header("X-Session-Id", &client_session_id)
                 .header("X-Antigravity-Session-Id", &client_session_id)
                 .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
@@ -1106,6 +1111,7 @@ pub async fn handle_generate(
                 [
                     ("X-Account-Email", email.as_str()),
                     ("X-Mapped-Model", mapped_model.as_str()),
+                    ("X-Upstream-Model", config.final_model.as_str()),
                 ],
                 Json(dual_err),
             )
@@ -1215,6 +1221,7 @@ pub async fn handle_generate(
             [
                 ("X-Account-Email", email.as_str()),
                 ("X-Mapped-Model", mapped_model.as_str()),
+                ("X-Upstream-Model", config.final_model.as_str()),
             ],
             Json(dual_err),
         )
@@ -1411,6 +1418,7 @@ pub async fn execute_count_tokens(
                 [
                     ("X-Account-Email", "offline-estimate"),
                     ("X-Mapped-Model", mapped_model.as_str()),
+                    ("X-Upstream-Model", config.final_model.as_str()),
                 ],
                 Json(json!({ "totalTokens": local_tokens })),
             )
@@ -1455,6 +1463,7 @@ pub async fn execute_count_tokens(
                 [
                     ("X-Account-Email", email.as_str()),
                     ("X-Mapped-Model", mapped_model.as_str()),
+                    ("X-Upstream-Model", config.final_model.as_str()),
                 ],
                 Json(json!({ "totalTokens": local_tokens })),
             )
@@ -1478,6 +1487,7 @@ pub async fn execute_count_tokens(
             [
                 ("X-Account-Email", email.as_str()),
                 ("X-Mapped-Model", mapped_model.as_str()),
+                ("X-Upstream-Model", config.final_model.as_str()),
             ],
             Json(json!({ "totalTokens": local_tokens })),
         )
@@ -1509,6 +1519,7 @@ pub async fn execute_count_tokens(
         [
             ("X-Account-Email", email.as_str()),
             ("X-Mapped-Model", mapped_model.as_str()),
+            ("X-Upstream-Model", config.final_model.as_str()),
         ],
         Json(json!({ "totalTokens": total_tokens })),
     )

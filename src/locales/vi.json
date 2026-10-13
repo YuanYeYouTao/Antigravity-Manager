@@ -186,7 +186,24 @@
         "cooling_5h_warning": "{{count}} tài khoản hiện đang trong thời gian đóng băng 5H",
         "view_mode_weighted": "Trọng số tổng hợp",
         "view_mode_5h": "5H Cuộn",
-        "view_mode_weekly": "Hạn ngạch tuần 7 ngày"
+        "view_mode_weekly": "Hạn ngạch tuần 7 ngày",
+        "gemini_group_desc": "Bao gồm Pro / Flash / Tạo ảnh",
+        "claude_group_desc": "Nhóm mô hình bên thứ ba",
+        "available_and_proxy": "Tài khoản khả dụng / Proxy trực tuyến",
+        "active_with_disabled_hint": "{{count}} tài khoản bình thường đã tạm dừng proxy",
+        "available_accounts_unit": "Khả dụng",
+        "proxy_online_unit": "Proxy trực tuyến",
+        "btn_proxy_online": "Proxy trực tuyến ({{count}})",
+        "btn_all_available": "Khả dụng ({{count}})",
+        "btn_title_proxy_online": "Hiện chỉ thống kê tài khoản tham gia proxy",
+        "btn_title_all_available": "Hiện thống kê tất cả tài khoản hoạt động",
+        "proxy_joined_pool": "✓ {{count}} tài khoản trong nhóm proxy",
+        "asset_rate": "Tỷ lệ tài sản",
+        "health_and_risk": "Sức khỏe & Rủi ro",
+        "health_available_rate": "Khả dụng khỏe mạnh",
+        "circuit_break": "Ngắt mạch",
+        "health_all_green": "Hoàn toàn khỏe mạnh",
+        "abnormal_badge": "{{count}} bất thường"
     },
     "accounts": {
         "account": "Tài khoản",
@@ -290,8 +307,9 @@
         "quota_protected": "Được bảo vệ",
         "details": {
             "title": "Chi tiết Hạn mức",
-            "model_quota": "Hạn mức Mô hình",
-            "protected_models": "Mô hình Được Bảo vệ"
+            "model_quota": "Hạn mức từng mô hình",
+            "protected_models": "Mô hình Được Bảo vệ",
+            "thinking_budget": "Ngân sách suy nghĩ"
         },
         "toast": {
             "proxy_enabled": "Đã bật proxy cho {{count}} tài khoản",
@@ -416,7 +434,12 @@
         },
         "quota_window_5h": "5-Hour Rolling Quota",
         "quota_window_weekly": "7-Day Weekly Quota",
-        "quota_window_weekly_short": "Weekly"
+        "quota_window_weekly_short": "Weekly",
+        "quota_group_gemini": "Mô hình Gemini",
+        "quota_group_claude": "Mô hình Claude & GPT",
+        "weekly_constrained_tooltip": "Bị hạn chế bởi giới hạn tuần",
+        "weekly_tokens": "Token chu kỳ",
+        "weekly_tokens_tooltip": "Token được ghi nhận bởi phiên bản này trong chu kỳ hạn mức hiện tại (đầu vào + đầu ra)"
     },
     "settings": {
         "save": "Lưu Cài đặt",
@@ -1574,7 +1597,23 @@
             "usage": "Tokens",
             "duration": "Thời gian",
             "time": "Thời điểm",
-            "empty": "Chưa có request nào được ghi lại"
+            "empty": "Chưa có request nào được ghi lại",
+            "endpoint": "Điểm cuối / Giao thức",
+            "model_routing": "Mô hình (Yêu cầu / Thực tế)",
+            "duration_ttft": "Thời gian / TTFT",
+            "resize_handle_tooltip": "Kéo để đổi độ rộng / Nhấp đúp để đặt lại",
+            "req_prefix": "Y/cầu:",
+            "real_prefix": "Thực:",
+            "req_model_title": "Mô hình yêu cầu",
+            "real_model_title": "Mô hình thực tế sử dụng",
+            "in_prefix": "Vào:",
+            "out_prefix": "Ra:",
+            "cache_prefix": "Đệm:",
+            "in_tokens_title": "Token đầu vào",
+            "out_tokens_title": "Token đầu ra",
+            "ttft_prefix": "Ký tự đầu:",
+            "total_duration_title": "Tổng thời gian",
+            "ttft_title": "Độ trễ ký tự đầu tiên (TTFT)"
         },
         "details": {
             "title": "Chi tiết Request",

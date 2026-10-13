@@ -187,7 +187,24 @@
         "cooling_5h_warning": "{{count}} аккаунт(ов) сейчас находится в 5ч охлаждении",
         "view_mode_weighted": "Взвешенный",
         "view_mode_5h": "5ч скользящий",
-        "view_mode_weekly": "7-дневный недельный"
+        "view_mode_weekly": "7-дневный недельный",
+        "gemini_group_desc": "Включая Pro / Flash / Генерация изображений",
+        "claude_group_desc": "Пул сторонних моделей",
+        "available_and_proxy": "Доступные аккаунты / Прокси онлайн",
+        "active_with_disabled_hint": "У {{count}} норм. аккаунтов прокси отключен",
+        "available_accounts_unit": "Доступно",
+        "proxy_online_unit": "Прокси онлайн",
+        "btn_proxy_online": "Прокси онлайн ({{count}})",
+        "btn_all_available": "Доступно ({{count}})",
+        "btn_title_proxy_online": "В данный момент учитываются только аккаунты в пуле прокси",
+        "btn_title_all_available": "В данный момент учитываются все активные аккаунты",
+        "proxy_joined_pool": "✓ {{count}} акк. в пуле прокси",
+        "asset_rate": "Доля активов",
+        "health_and_risk": "Здоровье и риски",
+        "health_available_rate": "Доступность",
+        "circuit_break": "Сбой",
+        "health_all_green": "Все в норме",
+        "abnormal_badge": "{{count}} сбоев"
     },
     "accounts": {
         "account": "Аккаунт",
@@ -316,8 +333,9 @@
         "quota_protected": "Защищено",
         "details": {
             "title": "Детали квоты",
-            "model_quota": "Квота модели",
-            "protected_models": "Защищенные модели"
+            "model_quota": "Квоты отдельных моделей",
+            "protected_models": "Защищенные модели",
+            "thinking_budget": "Бюджет размышлений"
         },
         "toast": {
             "proxy_enabled": "Включен прокси для {{count}} аккаунтов",
@@ -416,7 +434,12 @@
         "switch_to_agy": "Переключить для Antigravity CLI (agy)",
         "drag_disabled_during_sort": "Активна сортировка по столбцам; перетаскивание приостановлено",
         "go_to_appeal": "Go to Appeal",
-        "copy_appeal_url": "Copy Appeal URL"
+        "copy_appeal_url": "Copy Appeal URL",
+        "quota_group_gemini": "Модели Gemini",
+        "quota_group_claude": "Модели Claude и GPT",
+        "weekly_constrained_tooltip": "Ограничено недельной квотой",
+        "weekly_tokens": "Токены за цикл",
+        "weekly_tokens_tooltip": "Токены, зафиксированные этим инстансом в текущем цикле квоты (ввод + вывод)"
     },
     "settings": {
         "save": "Сохранить настройки",
@@ -1591,7 +1614,23 @@
             "usage": "Токены",
             "duration": "Длительность",
             "time": "Время",
-            "empty": "Запросов не записано"
+            "empty": "Запросов не записано",
+            "endpoint": "Эндпоинт / Протокол",
+            "model_routing": "Модель (Запрос / Факт)",
+            "duration_ttft": "Длительность / TTFT",
+            "resize_handle_tooltip": "Потяните для изменения / Двойной клик для сброса",
+            "req_prefix": "Запрос:",
+            "real_prefix": "Факт:",
+            "req_model_title": "Запрошенная модель",
+            "real_model_title": "Фактическая модель апстрима",
+            "in_prefix": "Вх:",
+            "out_prefix": "Исх:",
+            "cache_prefix": "Кэш:",
+            "in_tokens_title": "Входные токены",
+            "out_tokens_title": "Выходные токены",
+            "ttft_prefix": "TTFT:",
+            "total_duration_title": "Общая задержка",
+            "ttft_title": "Задержка первого токена (TTFT)"
         },
         "details": {
             "title": "Детали запроса",

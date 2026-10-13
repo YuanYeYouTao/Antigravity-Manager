@@ -187,7 +187,24 @@
         "cooling_5h_warning": "{{count}} conta(s) atualmente em resfriamento de 5H",
         "view_mode_weighted": "Ponderado",
         "view_mode_5h": "5H Rotativo",
-        "view_mode_weekly": "Semanal 7D"
+        "view_mode_weekly": "Semanal 7D",
+        "gemini_group_desc": "Inclui Pro / Flash / Imagem",
+        "claude_group_desc": "Pool de modelos de terceiros",
+        "available_and_proxy": "Contas disponíveis / Proxy online",
+        "active_with_disabled_hint": "{{count}} contas normais com proxy pausado",
+        "available_accounts_unit": "Disponível",
+        "proxy_online_unit": "Proxy online",
+        "btn_proxy_online": "Proxy Online ({{count}})",
+        "btn_all_available": "Disponíveis ({{count}})",
+        "btn_title_proxy_online": "Atualmente contando apenas contas no proxy",
+        "btn_title_all_available": "Atualmente contando todas as contas ativas",
+        "proxy_joined_pool": "✓ {{count}} conta(s) no pool de proxy",
+        "asset_rate": "Taxa de Ativos",
+        "health_and_risk": "Saúde e Risco",
+        "health_available_rate": "Disponibilidade Saudável",
+        "circuit_break": "Interrompido",
+        "health_all_green": "Tudo Saudável",
+        "abnormal_badge": "{{count}} Anormais"
     },
     "accounts": {
         "account": "Conta",
@@ -319,9 +336,10 @@
         "quota_protected": "Protegido",
         "details": {
             "title": "Detalhes da Cota",
-            "model_quota": "Cota do Modelo",
+            "model_quota": "Cotas de modelos individuais",
             "protected_models": "Modelos Protegidos",
-            "quota_groups": "Cota Detalhada"
+            "quota_groups": "Cota Detalhada",
+            "thinking_budget": "Orçamento de pensamento"
         },
         "toast": {
             "proxy_enabled": "Proxy habilitado para {{count}} contas",
@@ -420,7 +438,12 @@
         },
         "switch_to_agy": "Alternar para Antigravity CLI (agy)",
         "warmup_all_triggered": "Tarefa de pré-aquecimento disparada para todas as contas",
-        "drag_disabled_during_sort": "A ordenação por coluna está ativa; o arrasto está pausado"
+        "drag_disabled_during_sort": "A ordenação por coluna está ativa; o arrasto está pausado",
+        "quota_group_gemini": "Modelos Gemini",
+        "quota_group_claude": "Modelos Claude e GPT",
+        "weekly_constrained_tooltip": "Limitado pela cota semanal",
+        "weekly_tokens": "Tokens do ciclo",
+        "weekly_tokens_tooltip": "Tokens registrados por esta instância neste ciclo de cota (entrada + saída)"
     },
     "settings": {
         "save": "Salvar Configurações",
@@ -1559,7 +1582,23 @@
             "usage": "Tokens",
             "duration": "Duração",
             "time": "Tempo",
-            "empty": "Nenhuma solicitação registrada"
+            "empty": "Nenhuma solicitação registrada",
+            "endpoint": "Endpoint / Protocolo",
+            "model_routing": "Modelo (Req. / Real)",
+            "duration_ttft": "Duração / TTFT",
+            "resize_handle_tooltip": "Arraste para redimensionar / Clique duplo para redefinir",
+            "req_prefix": "Req:",
+            "real_prefix": "Real:",
+            "req_model_title": "Modelo solicitado",
+            "real_model_title": "Modelo upstream real",
+            "in_prefix": "Ent:",
+            "out_prefix": "Saída:",
+            "cache_prefix": "Cache:",
+            "in_tokens_title": "Tokens de entrada",
+            "out_tokens_title": "Tokens de saída",
+            "ttft_prefix": "TTFT:",
+            "total_duration_title": "Latência total",
+            "ttft_title": "Latência do primeiro token (TTFT)"
         },
         "details": {
             "title": "Detalhes da Solicitação",

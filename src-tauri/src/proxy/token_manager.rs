@@ -1489,14 +1489,15 @@ impl TokenManager {
         };
 
         // Keep requested model as top priority, then fallback across the same family.
+        // [FIX #3215] 优先回退到真实高阶模型 (high/preview)，避免优先选择输出上限仅 2k 的老旧 gemini-pro-agent
         push(&model);
-        push("gemini-pro-agent");
-        push("gemini-3.1-pro-preview");
-        push("gemini-3-pro-preview");
         push("gemini-3.1-pro-high");
         push("gemini-3-pro-high");
+        push("gemini-3.1-pro-preview");
+        push("gemini-3-pro-preview");
         push("gemini-3.1-pro-low");
         push("gemini-3-pro-low");
+        push("gemini-pro-agent");
 
         Some(out)
     }
