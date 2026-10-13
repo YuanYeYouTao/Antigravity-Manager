@@ -217,8 +217,11 @@ fn diagnostic_usage(usage: &Value) -> Value {
     for name in [
         "promptTokenCount",
         "cachedContentTokenCount",
+        "cached_content_token_count",
         "candidatesTokenCount",
+        "candidates_token_count",
         "thoughtsTokenCount",
+        "totalThoughtTokens",
         "totalTokenCount",
         "total_input_tokens",
         "total_cached_tokens",
@@ -633,6 +636,13 @@ mod tests {
         );
         assert_eq!(zero["cachedContentTokenCount"], 0);
         assert_eq!(zero["total_cached_tokens"], 0);
+        let aliases = diagnostic_usage(
+            &serde_json::json!({"cached_content_token_count":0,"candidates_token_count":2,"totalThoughtTokens":3}),
+        );
+        assert_eq!(aliases["cached_content_token_count"], 0);
+        assert_eq!(aliases["candidates_token_count"], 2);
+        assert_eq!(aliases["totalThoughtTokens"], 3);
+        assert!(aliases.get("cachedContentTokenCount").is_none());
         let unknown = diagnostic_usage(
             &serde_json::json!({"cachedContentTokenCount":null,"promptTokenCount":"private-value","private_metadata":"private-value"}),
         );

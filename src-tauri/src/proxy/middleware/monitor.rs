@@ -1414,6 +1414,7 @@ async fn monitor_request(
                     }
                 }
 
+                apply_captured_usage(&mut log, &mut usage_obj, captured_usage.as_ref());
                 let has_actual_content = !response_content.is_empty()
                     || !tool_calls.is_empty()
                     || !thinking_content.is_empty();
