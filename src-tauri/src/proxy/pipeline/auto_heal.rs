@@ -443,12 +443,18 @@ mod tests {
         assert_eq!(healed["requestId"], "agent/1234/1_heal1");
         assert_eq!(healed["request"]["requestId"], "agent/1234/1_heal1");
         let mut restored = healed;
-        let placeholder = restored["request"]["contents"][0]["parts"]
+        let placeholder = restored["request"]["contents"]
             .as_array_mut()
             .unwrap()
             .pop()
             .unwrap();
-        assert_eq!(placeholder, json!({"text": TRANSIT_DEFENSE_FALLBACK_TEXT}));
+        assert_eq!(
+            placeholder,
+            json!({
+                "role": "user",
+                "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]
+            })
+        );
         restored["requestId"] = original["requestId"].clone();
         restored["request"]["requestId"] = original["request"]["requestId"].clone();
         assert_eq!(restored, original);
@@ -586,6 +592,15 @@ mod tests {
             TRANSIT_DEFENSE_FALLBACK_TEXT
         );
         assert_eq!(original["requestId"], "req_root_123");
+        let mut restored = healed;
+        let placeholder = restored["contents"][0]["parts"]
+            .as_array_mut()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(placeholder, json!({"text": TRANSIT_DEFENSE_FALLBACK_TEXT}));
+        restored["requestId"] = original["requestId"].clone();
+        assert_eq!(restored, original);
     }
 
     #[test]

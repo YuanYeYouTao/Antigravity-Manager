@@ -1527,7 +1527,7 @@ mod tests {
     fn prompt_log_identity_cleanup_only_changes_system_instructions() {
         // 身份声明归一化由协议无关的流水线节点承担（`PromptSanitizer::sanitize_gemini_payload`），
         // 适配层只产出原样系统提示词。本用例校验「适配层产出 → 流水线清洗」的真实链路：
-        // 系统提示词块内的身份声明被统一归一化为中性身份，user / tool 文本逐字保留。
+        // 系统提示词块内的身份声明统一为官方 Antigravity 身份，user / tool 文本逐字保留。
         for old in [
             "You are Codex, an agent based on GPT-5.",
             "You are Codex, a coding agent based on GPT-5.",
@@ -1552,6 +1552,7 @@ mod tests {
             assert!(body["request"]["systemInstruction"]
                 .to_string()
                 .contains(old));
+            let original_contents = body["request"]["contents"].clone();
 
             crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
                 &mut body,
@@ -1559,10 +1560,12 @@ mod tests {
 
             let system = body["request"]["systemInstruction"].to_string();
             assert!(!system.contains(old));
-            assert!(system.contains("Top-level: You are an AI Agent."));
-            assert!(system.contains("System: You are an AI Agent."));
-            assert!(system.contains("<model_switch>You are an AI Agent.</model_switch>"));
+            let identity = crate::proxy::mappers::prompt_sanitizer::OFFICIAL_ANTIGRAVITY_IDENTITY;
+            assert!(system.contains(&format!("Top-level: {identity}")));
+            assert!(system.contains(&format!("System: {identity}")));
+            assert!(system.contains(&format!("<model_switch>{identity}</model_switch>")));
             // 用户提问与工具消息（含管道自身提示词）零改动
+            assert_eq!(body["request"]["contents"], original_contents);
             let contents = body["request"]["contents"].to_string();
             assert_eq!(contents.matches(old).count(), 2);
         }
@@ -1580,16 +1583,19 @@ mod tests {
     }
 
     #[test]
-    fn tiered_flash_ignores_client_effort_and_keeps_include_thoughts_only() {
+    fn tiered_flash_preserves_model_and_applies_real_budget_minimum() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Server-authoritative: client reasoning.effort must not set thinkingLevel, but populates thinkingBudget per tier.
-        for model in ["gemini-3.8-flash-tiered", "gemini-9.9-flash-tiered"] {
+        // Effort maps to a numeric budget; Gemini >= 4 requires at least 1024 for positive budgets.
+        for (model, low_budget) in [
+            ("gemini-3.8-flash-tiered", 1000),
+            ("gemini-9.9-flash-tiered", 1024),
+        ] {
             assert!(is_tiered_flash_model(model));
             for (effort, expected_budget) in [
                 (None, -1),
-                (Some("low"), 1000),
+                (Some("low"), low_budget),
                 (Some("medium"), 4000),
                 (Some("high"), -1),
                 (Some("xhigh"), -1),
