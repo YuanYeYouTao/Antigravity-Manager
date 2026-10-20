@@ -49,8 +49,9 @@ pub struct TokenUsageLog {
     pub token_id: String,
     pub ip_address: String,
     pub model: String,
-    pub input_tokens: i32,
-    pub output_tokens: i32,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
     pub request_time: i64,
     pub status: u16,
 }
@@ -144,6 +145,7 @@ pub fn init_db() -> Result<(), String> {
             model TEXT,
             input_tokens INTEGER,
             output_tokens INTEGER,
+            total_tokens INTEGER,
             request_time INTEGER NOT NULL,
             status INTEGER,
             FOREIGN KEY(token_id) REFERENCES user_tokens(id) ON DELETE CASCADE
@@ -151,6 +153,15 @@ pub fn init_db() -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("Failed to create token_usage_logs table: {}", e))?;
+
+    match conn.execute(
+        "ALTER TABLE token_usage_logs ADD COLUMN total_tokens INTEGER",
+        [],
+    ) {
+        Ok(_) => {}
+        Err(e) if e.to_string().contains("duplicate column name") => {}
+        Err(e) => return Err(e.to_string()),
+    }
 
     // 创建索引
     let _ = conn.execute(
@@ -512,8 +523,9 @@ pub fn record_token_usage_and_ip(
     token_id: &str,
     ip: &str,
     model: &str,
-    input_tokens: i32,
-    output_tokens: i32,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    total_tokens: Option<u32>,
     status: u16,
     user_agent: Option<String>,
 ) -> Result<(), String> {
@@ -525,12 +537,12 @@ pub fn record_token_usage_and_ip(
 
     // 1. 更新 user_tokens 主表
     tx.execute(
-        "UPDATE user_tokens SET 
-            last_used_at = ?1, 
-            total_requests = total_requests + 1, 
-            total_tokens_used = total_tokens_used + ?2 
+        "UPDATE user_tokens SET
+            last_used_at = ?1,
+            total_requests = total_requests + 1,
+            total_tokens_used = total_tokens_used + COALESCE(?2, 0)
         WHERE id = ?3",
-        params![now, input_tokens + output_tokens, token_id],
+        params![now, total_tokens, token_id],
     )
     .map_err(|e| format!("Failed to update user_tokens stats: {}", e))?;
 
@@ -543,8 +555,8 @@ pub fn record_token_usage_and_ip(
 
     if binding_exists {
         tx.execute(
-            "UPDATE token_ip_bindings SET 
-                last_seen_at = ?1, 
+            "UPDATE token_ip_bindings SET
+                last_seen_at = ?1,
                 request_count = request_count + 1,
                 user_agent = COALESCE(?2, user_agent)
             WHERE token_id = ?3 AND ip_address = ?4",
@@ -566,8 +578,8 @@ pub fn record_token_usage_and_ip(
     let log_id = Uuid::new_v4().to_string();
     tx.execute(
         "INSERT INTO token_usage_logs (
-            id, token_id, ip_address, model, input_tokens, output_tokens, request_time, status
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            id, token_id, ip_address, model, input_tokens, output_tokens, request_time, status, total_tokens
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             log_id,
             token_id,
@@ -576,7 +588,8 @@ pub fn record_token_usage_and_ip(
             input_tokens,
             output_tokens,
             now,
-            status
+            status,
+            total_tokens
         ],
     )
     .map_err(|e| format!("Failed to insert usage log: {}", e))?;
@@ -677,10 +690,10 @@ pub fn get_username_for_ip(ip: &str) -> Result<Option<String>, String> {
     let result: Option<String> = conn
         .query_row(
             "SELECT t.username
-         FROM token_ip_bindings b 
-         JOIN user_tokens t ON b.token_id = t.id 
-         WHERE b.ip_address = ?1 
-         ORDER BY b.last_seen_at DESC 
+         FROM token_ip_bindings b
+         JOIN user_tokens t ON b.token_id = t.id
+         WHERE b.ip_address = ?1
+         ORDER BY b.last_seen_at DESC
          LIMIT 1",
             params![ip],
             |row| row.get(0),
@@ -691,13 +704,305 @@ pub fn get_username_for_ip(ip: &str) -> Result<Option<String>, String> {
     Ok(result)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTokenDetailedSummary {
+    pub total_requests: i64,
+    pub total_input_tokens: Option<i64>,
+    pub total_output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub total_reported_requests: i64,
+    pub success_requests: i64,
+    pub failed_requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTokenTrendPoint {
+    pub timestamp_label: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub requests: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTokenModelStat {
+    pub model: String,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub requests: i64,
+    pub percentage: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTokenDetailedStats {
+    pub token: UserToken,
+    pub summary: UserTokenDetailedSummary,
+    pub trend: Vec<UserTokenTrendPoint>,
+    pub models: Vec<UserTokenModelStat>,
+    pub recent_ips: Vec<TokenIpBinding>,
+}
+
+/// 查询单个 User Token 的详细统计数据
+pub fn get_token_detailed_stats(
+    token_id: &str,
+    time_range: &str,
+) -> Result<UserTokenDetailedStats, String> {
+    let token = get_token_by_id(token_id)?
+        .ok_or_else(|| format!("User token with id {} not found", token_id))?;
+
+    let conn = connect_db()?;
+    let now = Utc::now().timestamp();
+
+    let (start_time, time_format) = match time_range {
+        "24h" => (now - 86400, "%m-%d %H:00"),
+        "7d" => (now - 7 * 86400, "%m-%d"),
+        "30d" => (now - 30 * 86400, "%m-%d"),
+        _ => (0, "%Y-%m-%d"),
+    };
+
+    // 1. 查询概览指标
+    let summary: UserTokenDetailedSummary = conn
+        .query_row(
+            "SELECT
+                COUNT(*),
+                SUM(input_tokens),
+                SUM(output_tokens),
+                SUM(total_tokens),
+                COALESCE(SUM(CASE WHEN status >= 200 AND status < 400 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END), 0),
+                COUNT(total_tokens)
+            FROM token_usage_logs
+            WHERE token_id = ?1 AND request_time >= ?2",
+            params![token_id, start_time],
+            |row| {
+                Ok(UserTokenDetailedSummary {
+                    total_requests: row.get(0)?,
+                    total_input_tokens: row.get(1)?,
+                    total_output_tokens: row.get(2)?,
+                    total_tokens: row.get(3)?,
+                    success_requests: row.get(4)?,
+                    failed_requests: row.get(5)?,
+                    total_reported_requests: row.get(6)?,
+                })
+            },
+        )
+        .map_err(|e| format!("Failed to query token summary: {}", e))?;
+
+    // 2. 查询时间走势
+    let mut trend_stmt = conn
+        .prepare(
+            "SELECT
+                strftime(?1, datetime(request_time, 'unixepoch', 'localtime')) as time_group,
+                SUM(input_tokens),
+                SUM(output_tokens),
+                SUM(total_tokens),
+                COUNT(*)
+            FROM token_usage_logs
+            WHERE token_id = ?2 AND request_time >= ?3
+            GROUP BY time_group
+            ORDER BY time_group ASC",
+        )
+        .map_err(|e| format!("Failed to prepare trend query: {}", e))?;
+
+    let trend_rows = trend_stmt
+        .query_map(params![time_format, token_id, start_time], |row| {
+            Ok(UserTokenTrendPoint {
+                timestamp_label: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+                total_tokens: row.get(3)?,
+                requests: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("Failed to execute trend query: {}", e))?;
+
+    let mut trend = Vec::new();
+    for row in trend_rows {
+        trend.push(row.map_err(|e| e.to_string())?);
+    }
+
+    // 3. 查询模型分布
+    let mut model_stmt = conn
+        .prepare(
+            "SELECT
+                COALESCE(NULLIF(model, ''), 'unknown') as model_name,
+                SUM(input_tokens),
+                SUM(output_tokens),
+                SUM(total_tokens) as total_toks,
+                COUNT(*)
+            FROM token_usage_logs
+            WHERE token_id = ?1 AND request_time >= ?2
+            GROUP BY model_name
+            ORDER BY total_toks DESC",
+        )
+        .map_err(|e| format!("Failed to prepare model query: {}", e))?;
+
+    let model_rows = model_stmt
+        .query_map(params![token_id, start_time], |row| {
+            let model: String = row.get(0)?;
+            let input_tokens: Option<i64> = row.get(1)?;
+            let output_tokens: Option<i64> = row.get(2)?;
+            let total_tokens: Option<i64> = row.get(3)?;
+            let requests: i64 = row.get(4)?;
+            Ok((model, input_tokens, output_tokens, total_tokens, requests))
+        })
+        .map_err(|e| format!("Failed to execute model query: {}", e))?;
+
+    let mut models_raw = Vec::new();
+    let mut grand_total_tokens: i64 = 0;
+    for row in model_rows {
+        let (model, input_tokens, output_tokens, total_tokens, requests) =
+            row.map_err(|e| e.to_string())?;
+        grand_total_tokens += total_tokens.unwrap_or(0);
+        models_raw.push((model, input_tokens, output_tokens, total_tokens, requests));
+    }
+
+    let models = models_raw
+        .into_iter()
+        .map(
+            |(model, input_tokens, output_tokens, total_tokens, requests)| {
+                let percentage = total_tokens.map(|total| {
+                    if grand_total_tokens > 0 {
+                        ((total as f64 / grand_total_tokens as f64) * 1000.0).round() / 10.0
+                    } else {
+                        0.0
+                    }
+                });
+                UserTokenModelStat {
+                    model,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    requests,
+                    percentage,
+                }
+            },
+        )
+        .collect();
+
+    // 4. 获取前 5 个最近 IP 绑定
+    let all_ips = get_token_ips(token_id)?;
+    let recent_ips = all_ips.into_iter().take(5).collect();
+
+    Ok(UserTokenDetailedStats {
+        token,
+        summary,
+        trend,
+        models,
+        recent_ips,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTokenRankItem {
+    pub id: String,
+    pub token: String,
+    pub username: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub expires_type: String,
+    pub expires_at: Option<i64>,
+    pub max_ips: i32,
+    pub total_tokens: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub requests: i64,
+    pub percentage: Option<f64>,
+}
+
+/// 查询用户 Token 的消耗排行榜
+pub fn get_user_tokens_ranking(time_range: &str) -> Result<Vec<UserTokenRankItem>, String> {
+    let conn = connect_db()?;
+    let now = Utc::now().timestamp();
+
+    let start_time = match time_range {
+        "minute" => now - 3600,
+        "hourly" | "24h" => now - 86400,
+        "daily" => now - 14 * 86400,
+        "weekly" => now - 84 * 86400,
+        "7d" => now - 7 * 86400,
+        "30d" => now - 30 * 86400,
+        _ => 0,
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                t.id,
+                t.token,
+                t.username,
+                t.description,
+                t.enabled,
+                t.expires_type,
+                t.expires_at,
+                t.max_ips,
+                SUM(l.total_tokens) as period_tokens,
+                SUM(l.input_tokens) as period_in,
+                SUM(l.output_tokens) as period_out,
+                COUNT(l.id) as period_requests
+            FROM user_tokens t
+            LEFT JOIN token_usage_logs l ON t.id = l.token_id AND l.request_time >= ?1
+            GROUP BY t.id
+            ORDER BY period_tokens DESC, t.id",
+        )
+        .map_err(|e| format!("Failed to prepare ranking query: {}", e))?;
+
+    let rows = stmt
+        .query_map(params![start_time], |row| {
+            let id: String = row.get(0)?;
+            let token: String = row.get(1)?;
+            let username: String = row.get(2)?;
+            let description: Option<String> = row.get(3)?;
+            let enabled: bool = row.get(4)?;
+            let expires_type: String = row.get(5)?;
+            let expires_at: Option<i64> = row.get(6)?;
+            let max_ips: i32 = row.get(7)?;
+            Ok(UserTokenRankItem {
+                id,
+                token,
+                username,
+                description,
+                enabled,
+                expires_type,
+                expires_at,
+                max_ips,
+                total_tokens: row.get(8)?,
+                input_tokens: row.get(9)?,
+                output_tokens: row.get(10)?,
+                requests: row.get(11)?,
+                percentage: None,
+            })
+        })
+        .map_err(|e| format!("Failed to execute ranking query: {}", e))?;
+
+    let mut list = Vec::new();
+    let mut grand_total: i64 = 0;
+    for r in rows {
+        let item = r.map_err(|e| e.to_string())?;
+        grand_total += item.total_tokens.unwrap_or(0);
+        list.push(item);
+    }
+
+    for item in &mut list {
+        if grand_total > 0 {
+            item.percentage = item
+                .total_tokens
+                .map(|total| ((total as f64 / grand_total as f64) * 1000.0).round() / 10.0);
+        }
+    }
+
+    Ok(list)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_create_and_query_token() {
-        let _ = init_db(); // Ensure DB is initialized
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
 
         // Use a random username to avoid collisions in existing DB runs during dev
         let username = format!("TestUser_{}", Uuid::new_v4());
@@ -723,7 +1028,8 @@ mod tests {
 
     #[test]
     fn test_never_expire_token_validation() {
-        let _ = init_db();
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
         let username = format!("NeverExpireUser_{}", Uuid::new_v4());
         let token_res = create_token(
             username.clone(),
@@ -743,5 +1049,144 @@ mod tests {
             "Token with expires_type never must be valid, reason: {:?}",
             reason
         );
+    }
+
+    #[test]
+    fn user_usage_keeps_unknown_zero_and_reported_total_separate() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let token = create_token(
+            "Usage fixture".into(),
+            "never".into(),
+            None,
+            0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        record_token_usage_and_ip(
+            &token.id,
+            "127.0.0.1",
+            "fixture",
+            None,
+            None,
+            None,
+            200,
+            None,
+        )
+        .unwrap();
+        let unknown = get_token_detailed_stats(&token.id, "all").unwrap();
+        assert_eq!(unknown.summary.total_input_tokens, None);
+        assert_eq!(unknown.summary.total_output_tokens, None);
+        assert_eq!(unknown.summary.total_tokens, None);
+        assert_eq!(unknown.summary.total_reported_requests, 0);
+        assert_eq!(unknown.models[0].total_tokens, None);
+        assert_eq!(unknown.trend[0].total_tokens, None);
+        assert_eq!(
+            get_user_tokens_ranking("all").unwrap()[0].total_tokens,
+            None
+        );
+
+        record_token_usage_and_ip(
+            &token.id,
+            "127.0.0.1",
+            "fixture",
+            Some(0),
+            Some(0),
+            Some(0),
+            200,
+            None,
+        )
+        .unwrap();
+        let zero = get_token_detailed_stats(&token.id, "all").unwrap();
+        assert_eq!(zero.summary.total_input_tokens, Some(0));
+        assert_eq!(zero.summary.total_output_tokens, Some(0));
+        assert_eq!(zero.summary.total_tokens, Some(0));
+        assert_eq!(zero.summary.total_reported_requests, 1);
+
+        record_token_usage_and_ip(
+            &token.id,
+            "127.0.0.1",
+            "fixture",
+            Some(2),
+            Some(3),
+            Some(9),
+            200,
+            None,
+        )
+        .unwrap();
+        let reported = get_token_detailed_stats(&token.id, "all").unwrap();
+        assert_eq!(reported.summary.total_tokens, Some(9));
+        assert_eq!(reported.summary.total_reported_requests, 2);
+        assert_eq!(reported.token.total_tokens_used, 9);
+        let ranked = get_user_tokens_ranking("all").unwrap();
+        assert_eq!(ranked[0].total_tokens, Some(9));
+        assert_eq!(ranked[0].input_tokens, Some(2));
+        assert_eq!(ranked[0].requests, 3);
+        let conn = connect_db().unwrap();
+        let missing: (Option<i64>, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens FROM token_usage_logs ORDER BY rowid LIMIT 1", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(missing, (None, None, None));
+    }
+
+    #[test]
+    fn user_usage_upgrade_keeps_legacy_numbers_without_inventing_reported_total() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let conn = connect_db().unwrap();
+        conn.execute_batch("CREATE TABLE token_usage_logs (
+            id TEXT PRIMARY KEY, token_id TEXT NOT NULL, ip_address TEXT, model TEXT,
+            input_tokens INTEGER, output_tokens INTEGER, request_time INTEGER NOT NULL, status INTEGER);
+            INSERT INTO token_usage_logs VALUES ('legacy', 'owner', '127.0.0.1', 'fixture', 0, 7, 1, 200);").unwrap();
+        init_db().unwrap();
+        init_db().unwrap();
+        let existing: (Option<i64>, Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT input_tokens, output_tokens, total_tokens FROM token_usage_logs WHERE id = 'legacy'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(existing, (Some(0), Some(7), None));
+    }
+
+    #[test]
+    fn test_get_token_detailed_stats() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        init_db().unwrap();
+        let username = format!("StatsUser_{}", Uuid::new_v4());
+        let token_res = create_token(
+            username.clone(),
+            "month".to_string(),
+            Some("Stats token".to_string()),
+            0,
+            None,
+            None,
+            None,
+        );
+        assert!(token_res.is_ok());
+        let token = token_res.unwrap();
+
+        // 记录一条使用用量
+        let _ = record_token_usage_and_ip(
+            &token.id,
+            "127.0.0.1",
+            "gemini-2.5-flash",
+            Some(100),
+            Some(200),
+            Some(350),
+            200,
+            Some("test-agent".to_string()),
+        );
+
+        let stats_res = get_token_detailed_stats(&token.id, "7d");
+        assert!(stats_res.is_ok());
+        let stats = stats_res.unwrap();
+        assert_eq!(stats.summary.total_requests, 1);
+        assert_eq!(stats.summary.total_input_tokens, Some(100));
+        assert_eq!(stats.summary.total_output_tokens, Some(200));
+        assert_eq!(stats.summary.total_tokens, Some(350));
+        assert_eq!(stats.summary.total_reported_requests, 1);
+        assert_eq!(stats.models.len(), 1);
+        assert_eq!(stats.models[0].model, "gemini-2.5-flash");
+        assert_eq!(stats.recent_ips.len(), 1);
+        assert_eq!(stats.recent_ips[0].ip_address, "127.0.0.1");
     }
 }

@@ -651,6 +651,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unterminated_first_frame_preserves_text_and_closes_claude_once() {
+        use futures::StreamExt;
+
+        for finished in [false, true] {
+            let mut candidate = serde_json::json!({
+                "content": {"parts": [{"text": "EOF original text"}]}
+            });
+            if finished {
+                candidate["finishReason"] = serde_json::json!("STOP");
+            }
+            let source = futures::stream::iter(vec![Ok::<bytes::Bytes, std::io::Error>(
+                bytes::Bytes::from(format!(
+                    "data: {}",
+                    serde_json::json!({"candidates": [candidate]})
+                )),
+            )]);
+            let mut output = create_claude_sse_stream(
+                Box::pin(source),
+                "unterminated-claude".to_string(),
+                "offline-fixture".to_string(),
+                None,
+                false,
+                1_000,
+                None,
+                1,
+                None,
+                Vec::new(),
+            );
+            let mut rendered = String::new();
+            while let Some(chunk) = output.next().await {
+                rendered.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+            }
+            assert!(rendered.contains("EOF original text"));
+            assert_eq!(rendered.matches("event: message_stop\n").count(), 1);
+            assert_eq!(rendered.matches("event: message_delta\n").count(), 1);
+            assert_eq!(rendered.matches("event: content_block_stop\n").count(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn test_create_claude_sse_stream_initial_error_emits_standard_api_error_without_trailing_events(
     ) {
         use futures::StreamExt;

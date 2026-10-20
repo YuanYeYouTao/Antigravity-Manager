@@ -36,6 +36,19 @@ pub struct ThinkingAutoHealContext {
     pub trace_id: String,
 }
 
+fn append_protocol_placeholder(contents: &mut Vec<Value>) {
+    if let Some(last) = contents.last_mut().filter(|turn| turn["role"] == "user") {
+        last["parts"].as_array_mut().unwrap().push(json!({
+            "text": TRANSIT_DEFENSE_FALLBACK_TEXT
+        }));
+    } else {
+        contents.push(json!({
+            "role": "user",
+            "parts": [{ "text": TRANSIT_DEFENSE_FALLBACK_TEXT }]
+        }));
+    }
+}
+
 /// 保留原上下文与身份，仅为单次自愈追加非指令协议占位。
 pub fn create_auto_heal_continuation_body(original_body: &Value) -> Value {
     let mut new_body = original_body.clone();
@@ -50,20 +63,15 @@ pub fn create_auto_heal_continuation_body(original_body: &Value) -> Value {
         }
     }
 
-    // 2. 追加非空协议占位，不伪造用户的继续执行指令。
-    let user_turn = json!({
-        "role": "user",
-        "parts": [{ "text": TRANSIT_DEFENSE_FALLBACK_TEXT }]
-    });
-
+    // 2. 添加非指令占位；已有 user 尾轮时保留原 parts 并就地追加。
     if let Some(contents) = new_body
         .get_mut("request")
         .and_then(|r| r.get_mut("contents"))
         .and_then(|c| c.as_array_mut())
     {
-        contents.push(user_turn);
+        append_protocol_placeholder(contents);
     } else if let Some(contents) = new_body.get_mut("contents").and_then(|c| c.as_array_mut()) {
-        contents.push(user_turn);
+        append_protocol_placeholder(contents);
     }
 
     new_body
@@ -435,22 +443,33 @@ mod tests {
         assert_eq!(healed["requestId"], "agent/1234/1_heal1");
         assert_eq!(healed["request"]["requestId"], "agent/1234/1_heal1");
         let mut restored = healed;
-        let placeholder = restored["request"]["contents"]
+        let placeholder = restored["request"]["contents"][0]["parts"]
             .as_array_mut()
             .unwrap()
             .pop()
             .unwrap();
-        assert_eq!(
-            placeholder,
-            json!({
-                "role": "user",
-                "parts": [{"text": "."}]
-            })
-        );
+        assert_eq!(placeholder, json!({"text": TRANSIT_DEFENSE_FALLBACK_TEXT}));
         restored["requestId"] = original["requestId"].clone();
         restored["request"]["requestId"] = original["request"]["requestId"].clone();
         assert_eq!(restored, original);
         assert_eq!(original, frozen);
+    }
+
+    #[test]
+    fn model_ending_heal_preserves_original_turn_and_adds_only_placeholder() {
+        let original = json!({"contents": [
+            {"role": "user", "parts": [{"text": "What is 2+2?"}]},
+            {"role": "model", "parts": [{"text": "Let me calculate."}]}
+        ]});
+        let healed = create_auto_heal_continuation_body(&original);
+        let contents = healed["contents"].as_array().unwrap();
+        assert_eq!(&contents[..2], original["contents"].as_array().unwrap());
+        assert_eq!(
+            contents[2],
+            json!({
+                "role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]
+            })
+        );
     }
 
     #[test]
@@ -559,11 +578,11 @@ mod tests {
         let healed = create_auto_heal_continuation_body(&original);
         assert_eq!(healed["requestId"], "req_root_123_heal1");
         let contents = healed["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 2);
-        assert_eq!(contents[1]["role"], "user");
-        assert_eq!(contents[0], original["contents"][0]);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0], original["contents"][0]["parts"][0]);
         assert_eq!(
-            contents[1]["parts"][0]["text"],
+            contents[0]["parts"][1]["text"],
             TRANSIT_DEFENSE_FALLBACK_TEXT
         );
         assert_eq!(original["requestId"], "req_root_123");

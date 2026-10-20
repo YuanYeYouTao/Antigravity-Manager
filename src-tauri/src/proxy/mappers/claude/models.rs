@@ -45,7 +45,7 @@ pub struct ClaudeRequest {
 }
 
 /// Thinking 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub type_: String, // "enabled" or "adaptive"
@@ -60,6 +60,8 @@ pub struct ThinkingConfig {
     pub budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>, // "low", "high", or "max"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>, // "omitted", "summarized", or "highlights"
 }
 
 /// System Prompt
@@ -284,6 +286,8 @@ pub struct Usage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<serde_json::Value>,
 }
 
@@ -300,6 +304,7 @@ impl Usage {
         self.cache_creation_input_tokens = reported
             .cache_creation_input_tokens
             .or(self.cache_creation_input_tokens);
+        self.cache_creation = reported.cache_creation.or(self.cache_creation.take());
         self.server_tool_use = reported.server_tool_use.or(self.server_tool_use.take());
     }
 }
@@ -385,7 +390,7 @@ pub struct Candidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "finishReason")]
+    #[serde(rename = "finishReason", alias = "finish_reason")]
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
@@ -542,6 +547,48 @@ mod tests {
                 assert_eq!(blocks.len(), 2);
             }
             _ => panic!("Expected MessageContent::Array"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_display() {
+        let json_str = r#"{"type": "adaptive", "display": "summarized"}"#;
+        let config: ThinkingConfig = serde_json::from_str(json_str).expect("should deserialize");
+        assert_eq!(config.type_, "adaptive");
+        assert_eq!(config.display.as_deref(), Some("summarized"));
+        assert_eq!(config.budget_tokens, None);
+
+        let serialized = serde_json::to_string(&config).expect("should serialize");
+        assert!(serialized.contains(r#""display":"summarized""#));
+    }
+
+    #[test]
+    fn test_usage_cache_creation() {
+        let json_str = r#"{
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 80,
+                "ephemeral_1h_input_tokens": 0
+            }
+        }"#;
+        let usage: Usage = serde_json::from_str(json_str).expect("should deserialize");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(50));
+        assert!(usage.cache_creation.is_some());
+        let cc = usage.cache_creation.as_ref().unwrap();
+        assert_eq!(cc["ephemeral_5m_input_tokens"], 80);
+
+        let serialized = serde_json::to_string(&usage).expect("should serialize");
+        assert!(serialized.contains("ephemeral_5m_input_tokens"));
+    }
+
+    #[test]
+    fn candidate_accepts_both_finish_reason_spellings() {
+        for field in ["finishReason", "finish_reason"] {
+            let candidate: Candidate =
+                serde_json::from_value(serde_json::json!({field: "MAX_TOKENS"})).unwrap();
+            assert_eq!(candidate.finish_reason.as_deref(), Some("MAX_TOKENS"));
         }
     }
 }

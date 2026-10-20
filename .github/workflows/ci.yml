@@ -141,12 +141,24 @@ jobs:
         if: startsWith(matrix.platform, 'ubuntu')
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib --no-run
 
-      - name: Test upstream diagnostics
+      - name: Test gateway sync regressions
         if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
         run: |
-          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib upstream_diagnostics
-          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib actual_mappers_monitor_and_stats_keep_partial_raw_usage_and_totals
-          cargo test --manifest-path src-tauri/Cargo.toml --locked --lib lazy_body_dispatch_uses_the_same_capture_and_keeps_only_its_own_usage
+          for filter in \
+            upstream_diagnostics \
+            proxy::middleware::monitor:: \
+            proxy::model_specs:: \
+            proxy::pipeline:: \
+            proxy::mappers:: \
+            proxy::common::session:: \
+            proxy::session_manager:: \
+            proxy::thinking_store:: \
+            modules::token_stats:: \
+            modules::proxy_db:: \
+            modules::user_token_db::; do
+            cargo test --manifest-path src-tauri/Cargo.toml --locked --lib "$filter" -- --test-threads=1
+          done
 
       - name: Stage Linux validation executables
         if: startsWith(matrix.platform, 'ubuntu')

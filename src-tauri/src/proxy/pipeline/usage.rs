@@ -131,7 +131,7 @@ impl CanonicalUsage {
         let (canonical_total_input, uncached_input) = if let Some(input) = total_input {
             (
                 Some(input),
-                Some(cached.map_or(input, |cached| input.saturating_sub(cached))),
+                cached.map(|cached| input.saturating_sub(cached)),
             )
         } else if cache_read_input_tokens.is_some() || cache_creation_input_tokens.is_some() {
             (
@@ -206,7 +206,12 @@ impl CanonicalUsage {
                 let sc_cache = (scaled_total as f64 * cache_ratio) as u32;
                 (Some(scaled_total.saturating_sub(sc_cache)), Some(sc_cache))
             } else {
-                (Some(scaled_total), None)
+                (
+                    self.uncached_input_tokens.map(|uncached| {
+                        (scaled_total as f64 * uncached as f64 / total_input as f64) as u32
+                    }),
+                    None,
+                )
             }
         } else {
             (self.uncached_input_tokens, self.cached_tokens)
@@ -225,6 +230,30 @@ impl CanonicalUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_gemini_cache_does_not_turn_total_input_into_uncached_input() {
+        for total in [0, 100, 100_000] {
+            let usage = CanonicalUsage::from_gemini(&json!({"promptTokenCount":total}));
+            assert_eq!(usage.total_input_tokens, Some(total));
+            assert_eq!(usage.uncached_input_tokens, None);
+            assert_eq!(usage.cached_tokens, None);
+            for scaling in [false, true] {
+                let claude = usage.to_claude_usage(scaling, 1_000_000);
+                assert!(claude["input_tokens"].is_null());
+                assert!(claude["cache_read_input_tokens"].is_null());
+            }
+            let zero_cache = CanonicalUsage::from_gemini(&json!({
+                "promptTokenCount":total,"cachedContentTokenCount":0
+            }));
+            assert_eq!(zero_cache.uncached_input_tokens, Some(total));
+            assert_eq!(zero_cache.cached_tokens, Some(0));
+        }
+        let native =
+            CanonicalUsage::from_gemini(&json!({"input_tokens":20,"cache_read_input_tokens":80}));
+        assert_eq!(native.uncached_input_tokens, Some(20));
+        assert_eq!(native.to_claude_usage(false, 1_000_000)["input_tokens"], 20);
+    }
 
     #[test]
     fn reported_components_do_not_invent_missing_usage() {

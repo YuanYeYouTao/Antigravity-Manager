@@ -2,16 +2,6 @@
 use super::models::*;
 use serde_json::Value;
 
-/// 标准化并清洗 shell / PowerShell / DSH (DeepSeek Harness) 等工具参数
-/// 1. 将 cmd / code / script / shell_command / input 等别名重命名为 command
-/// 2. [DSH tool-pwsh / tool-bash & WorkBuddy]：
-///    - DSH 严格校验 `command` (string) 和 `description` (string) 两个字段必须都存在且非空。
-///    - 若模型将实际命令写在 description / text / prompt 中，且 command 缺失，则优先提取恢复为真实 command。
-///    - 若 command 存在但缺失 description，则基于 command 自动推导截取生成 description。
-///    - 若两者皆无，则填充安全占位命令并保证 description 完整，防止客户端崩溃 (Issue #3430 & #3440)。
-/// 3. [DSH tool-workflow]：
-///    - DSH 严格校验 `script` (string) 和 `meta` (object with `name` and `description`)。
-///    - 若模型返回扁平结构的 `name` / `description`，自动归拢装配进 `meta` 对象中，确保运行期校验通过。
 /// 纯透传协议工具参数，不进行任何字段截断、生成或改写
 pub fn normalize_and_sanitize_tool_args(tool_name: &str, args: &mut Value) {
     if let Some(obj) = args.as_object() {
@@ -252,7 +242,10 @@ pub fn transform_openai_response(
                 }
             }
 
-            let raw_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str());
+            let raw_finish_reason = candidate
+                .get("finishReason")
+                .or_else(|| candidate.get("finish_reason"))
+                .and_then(Value::as_str);
 
             // 规范化 finish_reason：若包含工具调用，强制遵循 OpenAI 规范映射为 tool_calls
             let finish_reason = if !tool_calls.is_empty() {
@@ -307,7 +300,7 @@ pub fn transform_openai_response(
         }
     }
 
-    // 如果 candidates 为空，但存在 promptFeedback（被安全拦截），伪造一个被拒绝的 choice
+    // 将上游实际 promptFeedback 映射为 OpenAI refusal 字段。
     if choices.is_empty() {
         if let Some(feedback) = raw.get("promptFeedback") {
             let reason = feedback
@@ -380,6 +373,20 @@ pub fn transform_openai_response(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn non_streaming_accepts_both_finish_reason_spellings() {
+        for field in ["finishReason", "finish_reason"] {
+            let response = json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "partial answer"}]},
+                    field: "MAX_TOKENS"
+                }]
+            });
+            let mapped = transform_openai_response(&response, None, 1, None);
+            assert_eq!(mapped.choices[0].finish_reason.as_deref(), Some("length"));
+        }
+    }
 
     #[test]
     fn test_transform_openai_response() {

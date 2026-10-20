@@ -302,8 +302,9 @@ fn record_user_token_usage(
             &identity.token_id,
             log.client_ip.as_deref().unwrap_or("127.0.0.1"),
             log.model.as_deref().unwrap_or("unknown"),
-            log.input_tokens.unwrap_or(0) as i32,
-            log.output_tokens.unwrap_or(0) as i32,
+            log.input_tokens,
+            log.output_tokens,
+            log.total_tokens,
             log.status as u16,
             user_agent,
         );
@@ -437,6 +438,7 @@ fn consolidate_non_streaming_response(
     log: &ProxyRequestLog,
     headers_map: &serde_json::Map<String, Value>,
     captured_usage: Option<&serde_json::Map<String, Value>>,
+    upstream_attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
 ) -> Option<Value> {
     // 若本就已是统一的 consolidated 格式 (例如带有顶层 thinking/tool_calls 且无 choices/candidates)，直接返回 None
     if (raw_json.get("thinking").is_some()
@@ -625,6 +627,7 @@ fn consolidate_non_streaming_response(
         "norm_ms",
         "thinking_ms",
         "ttft_ms",
+        "ttft_overhead_ms",
         "stream_ms",
         "total_ms",
     ] {
@@ -634,6 +637,26 @@ fn consolidate_non_streaming_response(
                 let out_key = key.replace("_ms", "_s");
                 timing_obj.insert(out_key, serde_json::json!(n / 1000.0));
             }
+        }
+    }
+    if let (Some(ttft), Some(overhead)) = (
+        timing_obj.get("ttft_s").and_then(|v| v.as_f64()),
+        timing_obj.get("ttft_overhead_s").and_then(|v| v.as_f64()),
+    ) {
+        if overhead > 0.0 {
+            timing_obj.insert(
+                "ttft_total_wait_s".to_string(),
+                serde_json::json!(ttft + overhead),
+            );
+        }
+    }
+
+    if let Some(attempts) = upstream_attempts {
+        if !attempts.is_empty() {
+            timing_obj.insert(
+                "ttft_attempts".to_string(),
+                serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+            );
         }
     }
     if !timing_obj.contains_key("total_s") {
@@ -663,7 +686,9 @@ fn consolidate_non_streaming_response(
     let cached_toks = log
         .cached_tokens
         .or_else(|| usage_source.and_then(extract_cached_tokens));
-    let reasoning_toks = usage_source.and_then(extract_reasoning_tokens).unwrap_or(0);
+    let reasoning_toks = log
+        .reasoning_tokens
+        .or_else(|| usage_source.and_then(extract_reasoning_tokens));
 
     let total_in = input_toks;
     let total_toks = log.total_tokens.or_else(|| {
@@ -689,7 +714,7 @@ fn consolidate_non_streaming_response(
             );
         }
     }
-    if reasoning_toks > 0 {
+    if let Some(reasoning_toks) = reasoning_toks {
         usage_obj.insert(
             "reasoning_tokens".to_string(),
             serde_json::json!(reasoning_toks),
@@ -853,6 +878,7 @@ async fn monitor_request(
         .await;
     let upstream_request_body = upstream_holder.take();
     let upstream_request_headers = upstream_holder.take_headers();
+    let upstream_attempts = upstream_holder.take_attempts();
     let response_headers_json =
         crate::proxy::payload_audit::headers_to_redacted_json(response.headers());
 
@@ -961,6 +987,7 @@ async fn monitor_request(
         let mut stream = body.into_data_stream();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let start_instant = start;
+        let attempts_for_stream = upstream_attempts.clone();
 
         tokio::spawn(crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.scope(upstream_holder.clone(), async move {
             let stream_start = std::time::Instant::now();
@@ -980,6 +1007,7 @@ async fn monitor_request(
                 }
             }
             drop(stream);
+            let attempts_for_stream = upstream_holder.take_attempts().or(attempts_for_stream);
             log.physical_requests = upstream_holder.physical_requests();
             log.upstream_request_body = upstream_holder.take().or(log.upstream_request_body);
             log.upstream_request_headers = upstream_holder.take_headers().or(log.upstream_request_headers);
@@ -1363,9 +1391,40 @@ async fn monitor_request(
                         timing_obj.insert("thinking_s".to_string(), serde_json::json!(n / 1000.0));
                     }
                 }
+                let mut ttft_val = 0.0;
                 if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
                     if let Ok(n) = ttft.parse::<f64>() {
-                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(n / 1000.0));
+                        ttft_val = n / 1000.0;
+                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                    }
+                }
+                if let Some(oh) = headers_map
+                    .get("x-timing-ttft-overhead-ms")
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(n) = oh.parse::<f64>() {
+                        let overhead_s = n / 1000.0;
+                        if overhead_s > 0.0 {
+                            timing_obj.insert(
+                                "ttft_overhead_s".to_string(),
+                                serde_json::json!(overhead_s),
+                            );
+                            if ttft_val > 0.0 {
+                                timing_obj.insert(
+                                    "ttft_total_wait_s".to_string(),
+                                    serde_json::json!(ttft_val + overhead_s),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(attempts) = attempts_for_stream {
+                    if !attempts.is_empty() {
+                        timing_obj.insert(
+                            "ttft_attempts".to_string(),
+                            serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+                        );
                     }
                 }
                 timing_obj.insert(
@@ -1427,7 +1486,7 @@ async fn monitor_request(
                     let input_toks = log.input_tokens;
                     let output_toks = log.output_tokens;
                     let cached_toks = log.cached_tokens;
-                    let reasoning_toks = log.reasoning_tokens.unwrap_or(0);
+                    let reasoning_toks = log.reasoning_tokens;
 
                     let total_in = input_toks;
                     let total_toks = log.total_tokens;
@@ -1449,7 +1508,7 @@ async fn monitor_request(
                             );
                         }
                     }
-                    if reasoning_toks > 0 {
+                    if let Some(reasoning_toks) = reasoning_toks {
                         usage_obj.insert(
                             "reasoning_tokens".to_string(),
                             serde_json::json!(reasoning_toks),
@@ -1538,6 +1597,9 @@ async fn monitor_request(
                     .take_headers()
                     .or(log.upstream_request_headers);
                 let captured_usage = upstream_holder.usage();
+                let upstream_attempts = upstream_holder
+                    .take_attempts()
+                    .or_else(|| upstream_attempts.clone());
                 if let Ok(s) = std::str::from_utf8(&bytes) {
                     if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         if let Some(mv) = json
@@ -1586,6 +1648,7 @@ async fn monitor_request(
                             &log,
                             &headers_map,
                             captured_usage.as_ref(),
+                            upstream_attempts.clone(),
                         ) {
                             log.response_body = serde_json::to_string_pretty(&canonical)
                                 .ok()
@@ -2153,9 +2216,14 @@ mod tests {
             "content":[{"type":"text","text":"Known fixture answer"}],
             "usage":{"input_tokens":20,"cache_read_input_tokens":80,"output_tokens":2}
         });
-        let response =
-            super::consolidate_non_streaming_response(&raw, &log, &serde_json::Map::new(), None)
-                .unwrap();
+        let response = super::consolidate_non_streaming_response(
+            &raw,
+            &log,
+            &serde_json::Map::new(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(response["usage"]["input_tokens"], 20);
         assert_eq!(response["usage"]["cache_read_input_tokens"], 80);
         assert_eq!(super::extract_input_tokens(&response["usage"]), Some(100));
@@ -2187,6 +2255,7 @@ mod tests {
                 &raw,
                 &log,
                 &serde_json::Map::new(),
+                None,
                 None,
             )
             .unwrap();
@@ -2257,6 +2326,38 @@ mod tests {
     }
 
     #[test]
+    fn consolidated_response_keeps_attempt_timings_and_raw_zero_usage() {
+        let log = crate::proxy::monitor::prompt_log_tests::sample_log("attempt-usage", 0);
+        let raw = serde_json::json!({
+            "candidates":[{"content":{"parts":[{"text":"Current answer"}]}}],
+            "usageMetadata":{"promptTokenCount":999,"cachedContentTokenCount":900}
+        });
+        let actual = serde_json::json!({"cachedContentTokenCount":0,"thoughtsTokenCount":0});
+        let attempt = crate::proxy::upstream::client::FallbackAttemptLog {
+            endpoint_name: "fixture".into(),
+            endpoint_url: "https://fixture.invalid".into(),
+            status: Some(200),
+            duration_s: 1.5,
+            switch_delay_s: None,
+            error: String::new(),
+            is_effective: true,
+        };
+        let response = super::consolidate_non_streaming_response(
+            &raw,
+            &log,
+            &serde_json::Map::new(),
+            actual.as_object(),
+            Some(vec![attempt]),
+        )
+        .unwrap();
+        assert!(response["usage"]["input_tokens"].is_null());
+        assert!(response["usage"]["total_tokens"].is_null());
+        assert_eq!(response["usage"]["cached_tokens"], 0);
+        assert_eq!(response["usage"]["reasoning_tokens"], 0);
+        assert_eq!(response["_timing"]["ttft_attempts"][0]["duration_s"], 1.5);
+    }
+
+    #[test]
     fn non_stream_timing_uses_handler_header_names() {
         let mut log = crate::proxy::monitor::prompt_log_tests::sample_log("timing-fixture", 0);
         log.duration = 9999;
@@ -2276,6 +2377,7 @@ mod tests {
             &log,
             headers.as_object().unwrap(),
             None,
+            None,
         )
         .expect("non-stream content is consolidated");
         assert_eq!(consolidated["content"], "Fixture output");
@@ -2290,6 +2392,7 @@ mod tests {
             &response,
             &log,
             &serde_json::Map::new(),
+            None,
             None,
         )
         .unwrap();

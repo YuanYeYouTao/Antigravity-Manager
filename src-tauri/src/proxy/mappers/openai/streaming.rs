@@ -113,6 +113,7 @@ pub struct OpenAIChatStreamHandler {
     pub has_content: bool,
     pub has_thinking: bool,
     pub is_thinking_active: bool,
+    pub has_emitted_finish_reason: bool,
 }
 
 impl ProtocolStreamHandler for OpenAIChatStreamHandler {
@@ -312,7 +313,10 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                         }
                     }
 
-                    let raw_finish_reason = candidate.get("finishReason").and_then(|f| f.as_str());
+                    let raw_finish_reason = candidate
+                        .get("finishReason")
+                        .or_else(|| candidate.get("finish_reason"))
+                        .and_then(|f| f.as_str());
 
                     let gemini_finish_reason = raw_finish_reason.map(|f| match f {
                         "STOP" => "stop",
@@ -355,6 +359,9 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
                         self.is_thinking_active = false;
                         if !content_out.is_empty() {
                             self.has_content = true;
+                        }
+                        if finish_reason.is_some() {
+                            self.has_emitted_finish_reason = true;
                         }
                         let delta = if !content_out.is_empty() {
                             json!({ "content": content_out })
@@ -415,6 +422,42 @@ impl ProtocolStreamHandler for OpenAIChatStreamHandler {
 
     fn emit_finalize(&mut self) -> Vec<Bytes> {
         let mut chunks = Vec::new();
+
+        // [收尾保底防御 Fixes #3716]
+        // 若流已产生正文或工具调用，但上游在未显式下发 finishReason 的情况下关闭了连接 (EOF) 或仅下发了 usageMetadata：
+        // 严格遵循 OpenAI 流式契约，在发射 [DONE] 之前补发带有终态 finish_reason ("stop" 或 "tool_calls") 的收尾块。
+        // 防止下游客户端（如 OpenCode、Cline）判定为 finish=unknown 并错误触发空 assistant 续步导致上游 400 报错。
+        if !self.has_emitted_finish_reason
+            && (self.has_content || !self.emitted_tool_calls.is_empty())
+        {
+            self.has_emitted_finish_reason = true;
+            let final_reason = if !self.emitted_tool_calls.is_empty() {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            let mut finish_chunk = json!({
+                "id": &self.stream_id,
+                "object": "chat.completion.chunk",
+                "created": self.created_ts,
+                "model": &self.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": final_reason
+                }]
+            });
+            if !self.include_usage {
+                if let Some(usage) = self.final_usage.take() {
+                    finish_chunk["usage"] = serde_json::to_value(usage).unwrap_or_default();
+                }
+            }
+            chunks.push(Bytes::from(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&finish_chunk).unwrap_or_default()
+            )));
+        }
+
         if self.include_usage {
             if let Some(usage) = self.final_usage.take() {
                 let usage_chunk = json!({
@@ -497,6 +540,7 @@ where
         has_content: false,
         has_thinking: false,
         is_thinking_active: false,
+        has_emitted_finish_reason: false,
     };
 
     let config =
@@ -2195,66 +2239,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hermes_stream_without_include_usage_never_emits_empty_choices() {
-        // Simulates real Gemini streaming where finishReason arrives in chunk 1,
-        // and usageMetadata arrives in chunk 2 without candidates.
-        let chunk1_json = json!({
-            "candidates": [{
-                "finishReason": "STOP",
-                "content": {
-                    "parts": [{ "text": "Task complete." }]
+    async fn test_late_usage_respects_include_usage_without_repeating_finish() {
+        for include_usage in [false, true] {
+            // Simulates real Gemini streaming where finishReason arrives in chunk 1,
+            // and usageMetadata arrives in chunk 2 without candidates.
+            let chunk1_json = json!({
+                "candidates": [{
+                    "finishReason": "STOP",
+                    "content": {
+                        "parts": [{ "text": "Task complete." }]
+                    }
+                }]
+            });
+
+            let chunk2_json = json!({
+                "usageMetadata": {
+                    "promptTokenCount": 20,
+                    "candidatesTokenCount": 8,
+                    "totalTokenCount": 28
                 }
-            }]
-        });
+            });
 
-        let chunk2_json = json!({
-            "usageMetadata": {
-                "promptTokenCount": 20,
-                "candidatesTokenCount": 8,
-                "totalTokenCount": 28
-            }
-        });
+            let items: Vec<Result<Bytes, reqwest::Error>> = vec![
+                Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
+                Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
+            ];
 
-        let items: Vec<Result<Bytes, reqwest::Error>> = vec![
-            Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
-            Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
-        ];
+            let gemini_stream = Box::pin(stream::iter(items));
 
-        let gemini_stream = Box::pin(stream::iter(items));
+            // Hermes / standard OpenAI Python SDK default: include_usage = false
+            let mut openai_stream = create_openai_sse_stream(
+                gemini_stream,
+                "gemini-1.5-flash".to_string(),
+                "hermes-session".to_string(),
+                0,
+                None,
+                include_usage,
+            );
 
-        // Hermes / standard OpenAI Python SDK default: include_usage = false
-        let mut openai_stream = create_openai_sse_stream(
-            gemini_stream,
-            "gemini-1.5-flash".to_string(),
-            "hermes-session".to_string(),
-            0,
-            None,
-            false,
-        );
-
-        let mut chunks = Vec::new();
-        while let Some(result) = openai_stream.next().await {
-            if let Ok(bytes) = result {
-                let s = String::from_utf8_lossy(&bytes).to_string();
-                for line in s.lines() {
-                    if line.starts_with("data: ") && !line.contains("[DONE]") {
-                        chunks.push(line.to_string());
+            let mut chunks = Vec::new();
+            while let Some(result) = openai_stream.next().await {
+                if let Ok(bytes) = result {
+                    let s = String::from_utf8_lossy(&bytes).to_string();
+                    for line in s.lines() {
+                        if line.starts_with("data: ") && !line.contains("[DONE]") {
+                            chunks.push(line.to_string());
+                        }
                     }
                 }
             }
-        }
 
-        // CRITICAL: Ensure NO chunk has empty choices: []!
-        // Hermes iterates `chunk.choices[0]`. An empty choices: [] chunk crashes Hermes with IndexError!
-        for chunk_str in &chunks {
-            let json_str = chunk_str.trim_start_matches("data: ").trim();
-            let json: Value = serde_json::from_str(json_str).unwrap();
-            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-                assert!(
-                    !choices.is_empty(),
-                    "Crash hazard! Found empty choices: [] chunk when include_usage=false: {}",
-                    json_str
-                );
+            let mut finish_count = 0;
+            // Only clients requesting usage receive a separate usage chunk.
+            // Hermes iterates `chunk.choices[0]`. An empty choices: [] chunk crashes Hermes with IndexError!
+            for chunk_str in &chunks {
+                let json_str = chunk_str.trim_start_matches("data: ").trim();
+                let json: Value = serde_json::from_str(json_str).unwrap();
+                if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                    finish_count += choices
+                        .iter()
+                        .filter(|choice| choice["finish_reason"].is_string())
+                        .count();
+                    if !include_usage {
+                        assert!(!choices.is_empty());
+                        assert!(json.get("usage").is_none());
+                    }
+                }
+            }
+            assert_eq!(finish_count, 1);
+            if include_usage {
+                let last: Value =
+                    serde_json::from_str(chunks.last().unwrap().trim_start_matches("data: "))
+                        .unwrap();
+                assert_eq!(last["choices"], json!([]));
+                assert_eq!(last["usage"]["prompt_tokens"], 20);
+                assert_eq!(last["usage"]["completion_tokens"], 8);
+                assert_eq!(last["usage"]["total_tokens"], 28);
+                assert!(last["usage"].get("prompt_tokens_details").is_none());
             }
         }
     }
@@ -2399,5 +2460,155 @@ mod tests {
             all_content
         );
         assert_eq!(final_finish_reason, Some("stop".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_openai_stream_emits_fallback_finish_reason_when_upstream_omits_it() {
+        // [Fixes #3716] 模拟上游只吐了文本且随流关闭正常 EOF，未显式发送 finishReason 候选块
+        let chunk1_json = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "Hello, this is a response." }]
+                }
+            }]
+        });
+
+        // 第二帧只发送 usage，没有 candidates
+        let chunk2_json = json!({
+            "usageMetadata": {
+                "promptTokenCount": 15,
+                "candidatesTokenCount": 6,
+                "totalTokenCount": 21
+            }
+        });
+
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
+            Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
+        ];
+
+        let gemini_stream = Box::pin(stream::iter(items));
+
+        let mut openai_stream = create_openai_sse_stream(
+            gemini_stream,
+            "gemini-3.8-flash-high".to_string(),
+            "session-3716".to_string(),
+            0,
+            None,
+            false,
+        );
+
+        let mut finish_reasons = Vec::new();
+        let mut got_done = false;
+
+        while let Some(result) = openai_stream.next().await {
+            if let Ok(bytes) = result {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                for line in s.lines() {
+                    if line.starts_with("data: ") {
+                        if line.contains("[DONE]") {
+                            got_done = true;
+                        } else {
+                            let json_str = line.trim_start_matches("data: ").trim();
+                            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                                if let Some(choices) =
+                                    json.get("choices").and_then(|c| c.as_array())
+                                {
+                                    for choice in choices {
+                                        if let Some(fr) =
+                                            choice.get("finish_reason").and_then(|f| f.as_str())
+                                        {
+                                            finish_reasons.push(fr.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(got_done, "Stream must terminate with [DONE]");
+        // 关键断言：即使上游未显式发送 finishReason，网关在终态必须补发带有 finish_reason: 'stop' 的收尾块
+        assert_eq!(
+            finish_reasons,
+            vec!["stop".to_string()],
+            "Must emit finish_reason 'stop' before stream end to avoid finish=unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_unterminated_frame_is_consumed_before_eof_and_finishes_once() {
+        for (candidate, expected_reason) in [
+            (
+                json!({"content": {"parts": [{"text": "EOF answer"}]}}),
+                "stop",
+            ),
+            (
+                json!({
+                    "content": {"parts": [{"text": "EOF answer"}]},
+                    "finish_reason": "MAX_TOKENS"
+                }),
+                "length",
+            ),
+            (
+                json!({"content": {"parts": [{"functionCall": {
+                    "id": "call_eof", "name": "inspect", "args": {"path": "a.txt"}
+                }}]}}),
+                "tool_calls",
+            ),
+        ] {
+            let source = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(format!(
+                "data: {}",
+                json!({
+                    "candidates": [candidate],
+                    "usageMetadata": {"promptTokenCount": 15, "cachedContentTokenCount": 0}
+                })
+            )))]);
+            let mut output = create_openai_sse_stream(
+                Box::pin(source),
+                "gemini-3.8-flash".to_string(),
+                format!("unterminated-openai-{}", uuid::Uuid::new_v4()),
+                1,
+                None,
+                false,
+            );
+            let mut frames = Vec::new();
+            let mut done_count = 0;
+            while let Some(chunk) = output.next().await {
+                let chunk = chunk.unwrap();
+                for line in std::str::from_utf8(&chunk).unwrap().lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data == "[DONE]" {
+                            done_count += 1;
+                        } else {
+                            frames.push(serde_json::from_str::<Value>(data).unwrap());
+                        }
+                    }
+                }
+            }
+            let terminal: Vec<_> = frames
+                .iter()
+                .filter(|frame| frame["choices"][0]["finish_reason"].is_string())
+                .collect();
+            assert_eq!(done_count, 1);
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0]["choices"][0]["finish_reason"], expected_reason);
+            assert_eq!(terminal[0]["usage"]["prompt_tokens"], 15);
+            assert_eq!(
+                terminal[0]["usage"]["prompt_tokens_details"]["cached_tokens"],
+                0
+            );
+            assert!(terminal[0]["usage"].get("completion_tokens").is_none());
+            if expected_reason == "tool_calls" {
+                assert_eq!(
+                    frames[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
+                    "call_eof"
+                );
+            } else {
+                assert_eq!(frames[0]["choices"][0]["delta"]["content"], "EOF answer");
+            }
+        }
     }
 }

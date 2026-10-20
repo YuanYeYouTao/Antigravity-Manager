@@ -14,13 +14,26 @@ where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
-    collect_stream_to_json_with_anchor(stream, session_id, None).await
+    collect_stream_to_json_with_anchor_and_count(stream, session_id, None, 1).await
 }
 
 pub async fn collect_stream_to_json_with_anchor<S, E>(
+    stream: S,
+    session_id: &str,
+    anchor: Option<&str>,
+) -> Result<Value, String>
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    collect_stream_to_json_with_anchor_and_count(stream, session_id, anchor, 1).await
+}
+
+pub async fn collect_stream_to_json_with_anchor_and_count<S, E>(
     mut stream: S,
     session_id: &str,
     anchor: Option<&str>,
+    message_count: usize,
 ) -> Result<Value, String>
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Unpin,
@@ -92,17 +105,21 @@ where
                 }
                 if let Some(parts) = content.get("parts").and_then(Value::as_array) {
                     for part in parts {
-                        // Only plain text chunks can be coalesced. Signed or
-                        // extended parts retain their original fields and order.
-                        if part.as_object().is_some_and(|obj| obj.len() == 1) {
+                        // Coalesce only matching plain text/thought chunks. Signed
+                        // or extended parts retain their original fields and order.
+                        let is_plain = |part: &Value| {
+                            part.as_object().is_some_and(|obj| {
+                                obj.keys().all(|key| key == "text" || key == "thought")
+                            })
+                        };
+                        if is_plain(part) {
                             if let Some(text) = part.get("text").and_then(Value::as_str) {
                                 if let Some(last) = content_parts.last_mut() {
-                                    if last.as_object().is_some_and(|obj| obj.len() == 1) {
-                                        if let Some(last_text) =
-                                            last.get("text").and_then(Value::as_str)
+                                    if is_plain(last) && last.get("thought") == part.get("thought")
+                                    {
+                                        if let Some(Value::String(last_text)) = last.get_mut("text")
                                         {
-                                            let merged = format!("{}{}", last_text, text);
-                                            last["text"] = json!(merged);
+                                            last_text.push_str(text);
                                             continue;
                                         }
                                     }
@@ -144,6 +161,7 @@ where
     if content_parts.is_empty()
         && collected_response["candidates"][0]
             .get("finishReason")
+            .or_else(|| collected_response["candidates"][0].get("finish_reason"))
             .and_then(Value::as_str)
             .is_none()
     {
@@ -162,7 +180,11 @@ where
     if !content_parts.is_empty() {
         for part in &content_parts {
             if let Some(sig) = part.get("thoughtSignature").and_then(Value::as_str) {
-                SignatureCache::global().cache_session_signature(session_id, sig.to_string(), 1);
+                SignatureCache::global().cache_session_signature(
+                    session_id,
+                    sig.to_string(),
+                    message_count.max(1),
+                );
                 debug!(
                     "[Gemini-AutoConverter] Cached signature (len: {}) for session: {}",
                     sig.len(),
@@ -494,6 +516,119 @@ mod tests {
             } else {
                 assert_eq!(result["candidates"][0], frame["response"]["candidates"][0]);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_collect_unsigned_thinking_chunks_merged() {
+        let chunk1 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Thinking part 1. \",\"thought\":true}],\"role\":\"model\"},\"index\":0}]}\n\n";
+        let chunk2 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Thinking part 2.\",\"thought\":true}],\"role\":\"model\"},\"index\":0}]}\n\n";
+        let chunk3 = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Final answer.\"}],\"role\":\"model\"},\"finishReason\":\"STOP\",\"index\":0}]}\n\n";
+
+        let chunks = vec![
+            Ok::<Bytes, io::Error>(Bytes::from(chunk1)),
+            Ok::<Bytes, io::Error>(Bytes::from(chunk2)),
+            Ok::<Bytes, io::Error>(Bytes::from(chunk3)),
+        ];
+
+        let byte_stream = stream::iter(chunks);
+        let result = collect_stream_to_json(byte_stream, "test_session_thinking_merge").await;
+        assert!(result.is_ok());
+
+        let resp = result.unwrap();
+        let parts = resp["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            parts.len(),
+            2,
+            "Expected 2 parts: 1 merged thinking part and 1 answer part, got: {:?}",
+            parts
+        );
+        assert_eq!(parts[0]["text"], "Thinking part 1. Thinking part 2.");
+        assert_eq!(parts[0]["thought"], true);
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["text"], "Final answer.");
+    }
+
+    #[tokio::test]
+    async fn alternate_finish_reason_is_retained_without_inventing_native_fields() {
+        let result = replay(&[json!({"candidates": [{"finish_reason": "MAX_TOKENS"}]})]).await;
+        assert_eq!(result["candidates"][0]["finish_reason"], "MAX_TOKENS");
+        assert!(result["candidates"][0].get("finishReason").is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_thinking_parts_remain_original_and_cache_at_actual_message_count() {
+        let session = format!("collector-signed-{}", uuid::Uuid::new_v4());
+        let signature = "s".repeat(96);
+        let signed = json!({
+            "text": "signed thought",
+            "thought": true,
+            "thoughtSignature": signature,
+            "futurePart": {"opaque": true}
+        });
+        let parts = json!([
+            {"text": "before", "thought": true},
+            signed,
+            {"text": "after", "thought": true}
+        ]);
+        let frame = json!({"candidates": [{
+            "content": {"parts": parts},
+            "finishReason": "STOP"
+        }]});
+        let source = stream::iter(vec![Ok::<Bytes, io::Error>(Bytes::from(format!(
+            "data: {}",
+            frame
+        )))]);
+        let response = collect_stream_to_json_with_anchor_and_count(source, &session, None, 17)
+            .await
+            .unwrap();
+        assert_eq!(response["candidates"][0]["content"]["parts"], parts);
+        let cache = SignatureCache::global();
+        assert_eq!(
+            cache.get_session_signature_at(&session, 17),
+            Some(signature)
+        );
+        assert!(cache.get_session_signature_at(&session, 1).is_none());
+        cache.delete_session_signature(&session);
+    }
+
+    #[tokio::test]
+    async fn failed_stream_does_not_replace_previous_session_signature() {
+        for transport_error in [false, true] {
+            let session = format!("collector-failed-{}", uuid::Uuid::new_v4());
+            let previous_signature = "p".repeat(96);
+            let cache = SignatureCache::global();
+            cache.cache_session_signature(&session, previous_signature.clone(), 4);
+            let signed_frame = json!({"candidates": [{"content": {"parts": [{
+                "thought": true,
+                "text": "incomplete thought",
+                "thoughtSignature": "n".repeat(96)
+            }]}}]});
+            let failure = if transport_error {
+                Err(io::Error::other("connection reset"))
+            } else {
+                Ok(Bytes::from("data: {\"error\":{\"code\":503}}\n\n"))
+            };
+            let source = stream::iter(vec![
+                Ok(Bytes::from(format!("data: {}\n\n", signed_frame))),
+                failure,
+            ]);
+            let result =
+                collect_stream_to_json_with_anchor_and_count(source, &session, None, 17).await;
+            if transport_error {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap()["error"]["code"], 503);
+            }
+            assert_eq!(
+                cache.get_session_signature_at(&session, 4),
+                Some(previous_signature)
+            );
+            assert!(cache.get_session_signature_at(&session, 17).is_none());
+            cache.delete_session_signature(&session);
         }
     }
 }

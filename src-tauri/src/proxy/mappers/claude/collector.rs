@@ -288,13 +288,6 @@ where
         }
     }
 
-    // [FIX #3359] Guarantee at least one content block if upstream returned empty
-    if response.content.is_empty() {
-        response.content.push(ContentBlock::Text {
-            text: ".".to_string(),
-        });
-    }
-
     Ok(response)
 }
 
@@ -302,6 +295,54 @@ where
 mod tests {
     use super::*;
     use futures::stream;
+
+    #[tokio::test]
+    async fn cache_creation_and_unknown_usage_survive_partial_sse_updates() {
+        let initial = json!({
+            "type": "message_start",
+            "message": {
+                "id": "cache-creation-replay",
+                "model": "test-model",
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 80,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 80,
+                        "ephemeral_1h_input_tokens": 0
+                    }
+                }
+            }
+        });
+        let update = json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 0}
+        });
+        let chunks: Vec<Result<Bytes, io::Error>> = vec![initial, update]
+            .into_iter()
+            .map(|frame| {
+                Ok(Bytes::from(format!(
+                    "event: {}\ndata: {}\n\n",
+                    frame["type"].as_str().unwrap(),
+                    frame
+                )))
+            })
+            .collect();
+        let response = collect_stream_to_json(stream::iter(chunks)).await.unwrap();
+        assert_eq!(response.usage.input_tokens, Some(100));
+        assert_eq!(response.usage.output_tokens, Some(0));
+        assert_eq!(response.usage.cache_read_input_tokens, Some(0));
+        assert_eq!(response.usage.cache_creation_input_tokens, Some(80));
+        assert_eq!(
+            response.usage.cache_creation,
+            Some(json!({
+                "ephemeral_5m_input_tokens": 80,
+                "ephemeral_1h_input_tokens": 0
+            }))
+        );
+        assert!(response.usage.output_tokens_details.is_none());
+    }
 
     #[tokio::test]
     async fn test_collect_simple_text_response() {
@@ -415,7 +456,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collect_empty_stream_fallback() {
+    async fn test_collect_empty_stream_preserves_original_empty_response() {
         // [FIX #3359] 模拟仅包含 message_start 和 message_stop 的空内容流（如单点探测请求）
         let sse_data = vec![
             "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_empty\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gemini-3.7-flash\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
@@ -434,12 +475,11 @@ mod tests {
 
         let response = result.unwrap();
         assert_eq!(response.id, "msg_empty");
-        assert_eq!(response.content.len(), 1);
-        if let ContentBlock::Text { text } = &response.content[0] {
-            assert_eq!(text, ".");
-        } else {
-            panic!("Expected fallback Text block");
-        }
+        assert!(response.content.is_empty());
+        assert_eq!(response.stop_reason, "end_turn");
+        assert_eq!(response.usage.input_tokens, Some(1));
+        assert_eq!(response.usage.output_tokens, Some(0));
+        assert!(response.usage.cache_read_input_tokens.is_none());
     }
 
     #[tokio::test]

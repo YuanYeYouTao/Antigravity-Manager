@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.9.4)
+> 专业级 AI 账号管理与协议代理系统 (v4.9.8)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.9.4-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.9.8-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -321,6 +321,27 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
 claude
 ```
 
+### 终端原生切号工具 (`at` / `antigravity-tools`) 使用说明
+Antigravity 内置原生轻量级 CLI 切号套件，专为终端开发者打造，支持秒级轮换系统 Keychain 账号，并可在切换后自动接续 `agy` 交互式会话：
+
+```bash
+# 1. 查看所有账号列表、当前激活指示符 (👉) 与状态
+at list
+
+# 2. 查看当前在 agy CLI (Keychain)、IDE 分别生效的账号邮箱
+at current
+
+# 3. 切换账号 (支持序号、邮箱完整或前缀、账号别名)
+at switch 2                      # 切到序号 #2 的账号
+at switch work@gmail.com         # 按邮箱切号
+at switch work                   # 按邮箱前缀模糊切号
+at switch "工作号"               # 按账号别名切号
+at switch                        # 无参自动环形轮换 (Round-Robin) 至下一可用账号
+
+# 4. 切号并自动接续 agy 会话 (恢复上一次问答上下文)
+at switch 2 -c                   # -c 等价于 --continue
+```
+
 ### 如何接入 OpenCode?
 1.  进入 **API 反代**页面 → **外部 Providers** → 点击 **OpenCode Sync** 卡片。
 2.  点击 **Sync** 按钮，将自动生成 `~/.config/opencode/opencode.json` 配置文件：
@@ -494,7 +515,7 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v4.9.4**（2026-10-04）：引入自适应思考预算协商状态机与意图识别架构，废除过早 return 旁路，从协议根源上彻底解决 `maxOutputTokens <= thinkingBudget` 引发的 Google 400 违背报错；首创 6 倍反差极速意图识别（当思考预算 `t >= 6 * m` 时自动压缩预算秒回，杜绝轻量问答被深度思考拖慢），常规深度推理在官方容量足够时优先智能扩充总输出预算以保全用户思考智商，超大预算触顶时收敛留出 1024 正文空间兜底（PR #3599，感谢 @cubelikeplayDaniel）；全面继承 4.9.3 底层 HTTP/2 稳态重构与 Chrome 123 基线回归，终结长任务自杀断流。
+> 最新版本 **v4.9.8**（2026-10-17）：Antigravity 经典款配额耗尽/低于阈值全自动无感热切换与双核算力池监控（Ref #3509）；原生全面演进支持 Antigravity CLI (`agy`)，自动 Shell Wrapper 注入与模型思考档位智能拆解，三端（经典款 / IDE / CLI）活动账号独立探查与情境化多端徽章（Ref #3686, Ref #3630）；403 错误详情全量捕获与动作链接提取（人机验证/申诉），临时验证与永久禁用严格解耦，配额恢复全自动闭环自愈（Ref #3630, Ref #3684）；对齐 Claude Code 2.1.301 协议规范与 Agent SDK 开场白防 WAF 身份清洗，全链路下行注入 `request-id`，录入 Claude 5 全系 8 个核心模型（PR #3689, Ref #3684, Ref #3686）；JSON Schema 活跃引用追踪阻断循环展开指数爆炸杜绝 Linux VPS OOM (SIGKILL 137) 崩溃，规范化数组非法 properties 与终态 ARRAY 守卫规避 Gemini 400 报错，推理/思考模型流式首包 Peek 超时自适应放宽至 60s/90s/120s 杜绝 30s 误杀，账号池两阶段原子同步加载彻底消除并发 503 闪断，限流防倒退校验与 RPC details 全量遍历（PR #3694, Fixes #3690, Ref #3682, Ref #3693）；彻底剔除 100% 报 429 的 Prod 生产公共端点，流式接口首包超时保底放宽至 120s，Responses 格式数组 input 完整还原多轮角色边界，根除 0ms 乐观重置风暴（PR #3691, PR #3672, PR #3687, PR #3685, Fixes #3506, Ref #3525）；流量监控报文详情重构为 Postman 风格单 Tab 视窗、正文「结构化拆分」与「原始代码」双视图、两列键值对表格与 Bearer 掩码脱敏、标准双链路 HAR 1.2 导出，全量覆盖 12 种系统语言（感谢 @cubelikeplayDaniel, @EricZhou05, @blackdm666, @jeikl）。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 
@@ -503,6 +524,8 @@ response = client.chat.completions.create(
 
 <a href="https://github.com/lbjlaq"><img src="https://github.com/lbjlaq.png" width="50px" style="border-radius: 50%;" alt="lbjlaq"/></a>
 <a href="https://github.com/jeikl"><img src="https://github.com/jeikl.png" width="50px" style="border-radius: 50%;" alt="jeikl"/></a>
+<a href="https://github.com/cubelikeplayDaniel"><img src="https://github.com/cubelikeplayDaniel.png" width="50px" style="border-radius: 50%;" alt="cubelikeplayDaniel"/></a>
+<a href="https://github.com/diannaaav"><img src="https://github.com/diannaaav.png" width="50px" style="border-radius: 50%;" alt="diannaaav"/></a>
 <a href="https://github.com/XinXin622"><img src="https://github.com/XinXin622.png" width="50px" style="border-radius: 50%;" alt="XinXin622"/></a>
 <a href="https://github.com/llsenyue"><img src="https://github.com/llsenyue.png" width="50px" style="border-radius: 50%;" alt="llsenyue"/></a>
 <a href="https://github.com/salacoste"><img src="https://github.com/salacoste.png" width="50px" style="border-radius: 50%;" alt="salacoste"/></a>
