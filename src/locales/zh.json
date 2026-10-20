@@ -217,7 +217,11 @@
         "health_available_rate": "健康可用率",
         "circuit_break": "熔断",
         "health_all_green": "全绿无风险",
-        "abnormal_badge": "{{count}} 异常"
+        "abnormal_badge": "{{count}} 异常",
+        "no_client_account": "该应用当前暂无登录或绑定的账号",
+        "go_switch_account": "前往切换账号",
+        "switch_best_to_target": "一键切换最佳账号到 {{target}}",
+        "switch_this_to_target": "一键将此账号切换到 {{target}}"
     },
     "accounts": {
         "account": "账号",
@@ -247,6 +251,12 @@
         "delete_selected": "删除 ({{count}})",
         "current": "当前",
         "current_badge": "当前",
+        "client_classic": "经典款",
+        "client_classic_tooltip": "当前 Antigravity 经典款客户端登录账号",
+        "client_ide": "IDE",
+        "client_ide_tooltip": "当前 Antigravity IDE 客户端登录账号",
+        "client_cli": "CLI",
+        "client_cli_tooltip": "当前 Antigravity CLI (agy) 登录账号",
         "disabled": "已禁用",
         "disabled_tooltip": "账号已被禁用（例如 refresh_token 被撤销/过期）。重新授权或更新 Token 后可恢复。",
         "proxy_disabled": "反代已禁用",
@@ -351,6 +361,7 @@
         "quota_window_weekly_short": "周配额",
         "quota_group_gemini": "Gemini 模型",
         "quota_group_claude": "Claude & GPT 模型",
+        "quota_group_argon": "Gemini 4 Argon",
         "weekly_exhausted_tooltip": "周配额已耗尽 (0%)，等待周重置",
         "weekly_constrained_tooltip": "受到周配额短板压制",
         "weekly_tokens": "本周期 Token",
@@ -403,13 +414,9 @@
                 "batch_fail": "导入失败"
             },
             "import": {
-                "scheme_a": "方案 A: 自动扫描本地已登录账号",
-                "scheme_a_desc": "自动对本地系统 Keyring/Keychain、Antigravity IDE、插件版及 CLI 进行全量扫描并批量导入已登录账号。",
-                "btn_db": "一键导入所有本地已登录账号",
-                "or": "或者",
-                "scheme_b": "方案 B: 从 V1 版本备份",
-                "scheme_b_desc": "扫描 ~/.antigravity-agent 目录，批量导入旧版本的账号数据。",
-                "btn_v1": "从 V1 备份批量导入",
+                "scheme_a": "自动扫描本地已登录账号",
+                "scheme_a_desc": "自动对本地系统 Keyring/Keychain、Antigravity IDE、经典款及 CLI 进行全量扫描并批量导入已登录账号。",
+                "btn_db": "一键扫描并导入所有本地账号",
                 "btn_custom_db": "从自定义 DB 导入"
             },
             "btn_cancel": "取消",
@@ -504,7 +511,18 @@
             "refresh_interval": "刷新间隔（分钟）",
             "auto_sync": "自动获取当前账号",
             "auto_sync_desc": "定期自动刷新当前活动账号的信息",
-            "sync_interval": "同步间隔（分钟）"
+            "sync_interval": "同步间隔（分钟）",
+            "auto_switch_classic": "经典款自动热切换",
+            "auto_switch_classic_badge": "仅限经典款",
+            "auto_switch_classic_desc": "后台定时巡检发现经典款原生客户端当前账号配额低于阈值时，自动从账号池挑选高额度可用账号无感热切换（仅支持经典款原生客户端，IDE 款与 CLI 受官方客户端机制限制暂不支持无感热切）。",
+            "auto_switch_threshold_label": "触发换号阈值",
+            "auto_switch_threshold_hint": "任一监控算力池剩余配额 ≤ {{pct}}% 时触发自动换号",
+            "auto_switch_models_label": "监控额度池",
+            "auto_switch_models_hint": "至少选择一个，任一所选池额度低于阈值即自动换号",
+            "auto_switch_gemini": "Gemini 算力池",
+            "auto_switch_gemini_desc": "包含 Pro / Flash / 绘图",
+            "auto_switch_third_party": "第三方模型池",
+            "auto_switch_third_party_desc": "包含 Claude 3.7 / 3.5 / GPT"
         },
         "warmup": {
             "title": "7天周配额智能预热",
@@ -953,6 +971,10 @@
                 },
                 "max_wait": "最大等待时长 (秒)",
                 "max_wait_tooltip": "仅在“缓存优先”模式下生效：如果账号限流重置时间小于此值，则原地等待而非切换账号。",
+                "max_spillover_accounts": "分流并发账号上限",
+                "max_spillover_accounts_tooltip": "当启动多个子代理或高并发多会话时，最多允许同时调用的健康账号数量。设为 0 表示不限制（全池空闲账号皆可外溢加速）；设为正整数（如 2）则限制最多同时使用该数量的账号，超出时在已有账号间负载均衡，防止子代理占用过多额外账号。",
+                "spillover_unlimited": "不限制 (全池可用)",
+                "spillover_count": "{{count}} 个账号",
                 "clear_bindings": "清除会话绑定",
                 "clear_bindings_tooltip": "立即断开所有会话与账号的绑定关系，强制下一次请求重新分配账号。",
                 "clear_rate_limits": "清除限流记录",
@@ -1166,6 +1188,19 @@
             },
             "agent_settings": {
                 "title": "特定 Agent 配置 (Specific Agent Settings)"
+            },
+            "hub": {
+                "title": "官方 Hub 客户端指纹",
+                "tooltip": "出站流量对齐 Google 官方 Antigravity Hub 原生客户端特征，自动维护版本号与构建 CL 编号以规避 429 配额限制。",
+                "source_custom": "自定义",
+                "source_remote": "远端探测",
+                "source_local": "本地应用",
+                "source_baseline": "稳态基准",
+                "detect_button": "动态探测",
+                "detect_success": "已成功探测并同步官方最新 Hub: v{{version}} (CL: {{cl}})",
+                "detect_failed": "探测失败: {{error}}",
+                "version_label": "Hub 版本号 (Version)",
+                "cl_label": "Piper 构建编号 (CL)"
             }
         },
         "stream_timeouts": {
@@ -1402,7 +1437,19 @@
             "model_name": "模型名称",
             "model_id": "模型 ID",
             "description": "描述",
-            "action": "操作"
+            "status": "状态 / 连通性",
+            "action": "操作",
+            "test_connectivity": "测活",
+            "batch_test": "批量测活",
+            "stop_test": "停止",
+            "auto_dispatch": "🤖 自动调度 (反代号池)",
+            "select_account": "指定测试账号",
+            "view_detail": "查看请求明细与耗时",
+            "retired": "已退役",
+            "untested": "未测试",
+            "testing": "测试中...",
+            "success": "正常",
+            "rate_limited": "限流"
         },
         "cli_sync": {
             "title": "Agent工具一键配置",
@@ -1437,10 +1484,14 @@
             },
             "toast": {
                 "sync_success": "同步成功！{{name}} 已准备就绪。",
-                "sync_error": "同步失败：{{error}}"
+                "sync_error": "同步失败：{{error}}",
+                "sync_success_with_model": "同步成功！{{name}} 已同步模型: {{model}}"
             },
             "sync_confirm_title": "同步确认",
-            "sync_confirm_message": "即将为您同步 {{name}} 的配置。⚠️ 注意：此操作将覆盖您本地已有的配置文件（如登录状态、API Key 等）。确定要继续吗？"
+            "sync_confirm_message": "即将为您同步 {{name}} 的配置。⚠️ 注意：此操作将覆盖您本地已有的配置文件（如登录状态、API Key 等）。确定要继续吗？",
+            "apps": {
+                "gemini": "Antigravity CLI (agy)"
+            }
         },
         "hermes_sync": {
             "modal_title": "在 Hermes 中配置 Antigravity Manager",
@@ -1707,16 +1758,29 @@
         },
         "timing": {
             "title": "耗时分类诊断",
-            "clean": "初始会话清洗",
+            "clean": "会话清洗",
             "clean_desc": "清理缓存控制 / 合并同角色 / 破损思考过滤 / 提纯去噪",
             "norm": "中转归一",
             "norm_desc": "模型路由 / 账号调度 / 协议转Gemini格式",
-            "thinking": "Thinking块、签名填充",
-            "thinking_desc": "ThinkingStore回填 / 补全思维块与哨兵签名",
-            "ttft": "等待首包（思考首ssetoken或者工具ssetoken或正文ssetoken）",
+            "thinking": "思维块、签名",
+            "thinking_desc": "思维链持久化与哨兵签名回填",
+            "ttft": "等待首包",
             "ttft_desc": "网关发出请求至接收到上游首个有效数据块",
-            "stream": "首包到这个包响应完的时间",
+            "ttft_pure": "等待首包",
+            "ttft_pure_desc": "最终命中端点发出请求至首个有效数据块到达",
+            "fallback_overhead": "降级损耗",
+            "fallback_overhead_desc": "端点故障超时转移与切换延迟开销",
+            "fallback_badge": "已降级",
+            "direct_badge": "直连",
+            "switch_delay": "切换延迟",
+            "attempt": "尝试",
+            "effective_hit": "首包命中",
+            "stream": "持续响应总时长",
             "stream_desc": "首个数据块到达至整条响应流结束",
+            "fault_degraded": "故障降级",
+            "success": "成功",
+            "raw_error_payload": "报文",
+            "timeout_or_failover": "端点连接超时或故障转移",
             "total": "总耗时",
             "copy_timing": "复制耗时分类",
             "copied_timing": "已复制耗时",
@@ -1771,6 +1835,9 @@
     },
     "token_stats": {
         "title": "Token 消费统计",
+        "minute": "分钟",
+        "minute_1h": "1小时 (1m)",
+        "minute_24h": "24小时 (5m)",
         "hourly": "小时",
         "daily": "日",
         "weekly": "周",
@@ -1929,7 +1996,13 @@
         "cockpit_saved_badge": "节省",
         "reasoning_short": "思",
         "cockpit_thinking_share": "思考占比",
-        "cockpit_avg_thinking_per_req": "均次思考"
+        "cockpit_avg_thinking_per_req": "均次思考",
+        "cockpit_user_rank": "用户排行",
+        "cockpit_no_user_activity": "暂无用户 Key 消耗活动",
+        "cockpit_view_detail": "详情",
+        "cockpit_tab_accounts": "账号",
+        "cockpit_tab_models": "模型",
+        "cockpit_tab_users": "用户"
     },
     "errors": {
         "stream": {
@@ -2074,7 +2147,24 @@
         "custom_expires_required": "请选择自定义过期时间",
         "expires_custom": "自定义时间",
         "custom_expires_at": "自定义到期时间",
-        "hint_custom_expires": "设置 Token 的精确到期时间点"
+        "hint_custom_expires": "设置 Token 的精确到期时间点",
+        "view_stats": "用量统计",
+        "bound_ips": "客户端 IP 数",
+        "recent_ips": "活跃客户端 IP 与最近活动",
+        "no_ips": "暂无 IP 绑定记录",
+        "enabled": "启用",
+        "disabled": "禁用",
+        "range_24h": "24小时",
+        "range_7d": "近7天",
+        "range_30d": "近30天",
+        "range_all": "全部",
+        "success_rate": "成功率",
+        "avg_per_request": "平均单次 Token",
+        "est_throughput": "每请求吞吐估算",
+        "calls_unit": "次调用",
+        "records_unit": "个记录",
+        "no_trend_data": "该时段内暂无走势数据",
+        "no_model_data": "暂无模型数据"
     },
     "apiKeyFun": {
         "title": "APIKEY.FUN 中转站",

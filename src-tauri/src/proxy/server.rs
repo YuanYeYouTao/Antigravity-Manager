@@ -607,6 +607,12 @@ impl AxumServer {
         let proxy_routes = Router::new()
             .route("/health", get(health_check_handler))
             .route("/healthz", get(health_check_handler))
+            // Version endpoints (vLLM / Hermes / Agent compatibility)
+            .route("/version", get(handlers::openai::handle_version))
+            .route("/v1/version", get(handlers::openai::handle_version))
+            // Props endpoints (llama.cpp / Hermes / Local probe compatibility)
+            .route("/props", get(handlers::openai::handle_props))
+            .route("/v1/props", get(handlers::openai::handle_props))
             // OpenAI Protocol (Chat & Universal Models)
             .route("/v1/models", get(handlers::openai::handle_list_models))
             .route(
@@ -1024,7 +1030,9 @@ impl AxumServer {
                 get(admin_list_user_tokens).post(admin_create_user_token),
             )
             .route("/user-tokens/summary", get(admin_get_user_token_summary))
+            .route("/user-tokens/ranking", get(admin_get_user_tokens_ranking))
             .route("/user-tokens/:id/renew", post(admin_renew_user_token))
+            .route("/user-tokens/:id/stats", get(admin_get_user_token_stats))
             .route(
                 "/user-tokens/:id",
                 delete(admin_delete_user_token).patch(admin_update_user_token),
@@ -1567,15 +1575,22 @@ async fn admin_switch_account(
         *switching = true;
     }
 
-    let account_id = payload.account_id.clone();
+    let resolved_account_id = match account::resolve_account_summary(
+        Some(&payload.account_id),
+        payload.target_ide.as_deref(),
+    ) {
+        Ok(summary) => summary.id,
+        Err(_) => payload.account_id.clone(),
+    };
+
     logger::log_info(&format!(
-        "[API] Starting account switch: {} (target_ide: {:?})",
-        account_id, payload.target_ide
+        "[API] Starting account switch: {} (resolved: {}) (target_ide: {:?})",
+        payload.account_id, resolved_account_id, payload.target_ide
     ));
 
     let result = state
         .account_service
-        .switch_account(&account_id, payload.target_ide.as_deref())
+        .switch_account(&resolved_account_id, payload.target_ide.as_deref())
         .await;
 
     {
@@ -1585,7 +1600,10 @@ async fn admin_switch_account(
 
     match result {
         Ok(()) => {
-            logger::log_info(&format!("[API] Account switch successful: {}", account_id));
+            logger::log_info(&format!(
+                "[API] Account switch successful: {}",
+                resolved_account_id
+            ));
 
             // [FIX #1166] 账号切换后立即同步内存状态
             state.token_manager.clear_all_sessions();
@@ -2489,6 +2507,40 @@ async fn admin_update_user_token(
             )
         })?;
     Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct TokenStatsQuery {
+    time_range: Option<String>,
+}
+
+async fn admin_get_user_token_stats(
+    Path(id): Path<String>,
+    Query(query): Query<TokenStatsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let stats = crate::commands::user_token::get_user_token_stats(id, query.time_range)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+    Ok(Json(stats))
+}
+
+async fn admin_get_user_tokens_ranking(
+    Query(query): Query<TokenStatsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let list = crate::commands::user_token::get_user_tokens_ranking(query.time_range)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+    Ok(Json(list))
 }
 
 async fn admin_should_check_updates() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>

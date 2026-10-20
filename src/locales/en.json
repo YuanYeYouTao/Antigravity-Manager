@@ -219,7 +219,11 @@
         "health_available_rate": "Healthy Availability",
         "circuit_break": "Tripped",
         "health_all_green": "All Healthy",
-        "abnormal_badge": "{{count}} Abnormal"
+        "abnormal_badge": "{{count}} Abnormal",
+        "no_client_account": "No active or bound account for this application",
+        "go_switch_account": "Go to Switch Account",
+        "switch_best_to_target": "Switch Best Account to {{target}}",
+        "switch_this_to_target": "Switch this account to {{target}}"
     },
     "accounts": {
         "account": "Account",
@@ -249,6 +253,12 @@
         "delete_selected": "Delete ({{count}})",
         "current": "Current",
         "current_badge": "Current",
+        "client_classic": "Classic",
+        "client_classic_tooltip": "Active account in Antigravity Classic",
+        "client_ide": "IDE",
+        "client_ide_tooltip": "Active account in Antigravity IDE",
+        "client_cli": "CLI",
+        "client_cli_tooltip": "Active account in Antigravity CLI (agy)",
         "disabled": "Disabled",
         "disabled_tooltip": "Account is disabled (e.g. refresh_token revoked/expired). Reauthorize or update token to re-enable.",
         "proxy_disabled": "Proxy Disabled",
@@ -353,6 +363,7 @@
         "quota_window_weekly_short": "Weekly",
         "quota_group_gemini": "Gemini Models",
         "quota_group_claude": "Claude & GPT Models",
+        "quota_group_argon": "Gemini 4 Argon",
         "weekly_exhausted_tooltip": "Weekly quota exhausted (0%); waiting for weekly reset",
         "weekly_constrained_tooltip": "Constrained by weekly limit",
         "weekly_tokens": "Cycle tokens",
@@ -405,13 +416,9 @@
                 "batch_fail": "Import failed"
             },
             "import": {
-                "scheme_a": "Plan A: From IDE DB",
-                "scheme_a_desc": "Auto-read current logged-in account from local Antigravity DB.",
-                "btn_db": "Import Current Account",
-                "or": "OR",
-                "scheme_b": "Plan B: From V1 Backup",
-                "scheme_b_desc": "Scan ~/.antigravity-agent for V1 account data.",
-                "btn_v1": "Batch Import V1",
+                "scheme_a": "Auto-Scan Local Accounts",
+                "scheme_a_desc": "Scan local Keyring/Keychain, Antigravity IDE, Classic, and CLI credentials to import all logged-in accounts.",
+                "btn_db": "Scan & Import All Local Accounts",
                 "btn_custom_db": "Import Custom DB"
             },
             "btn_cancel": "Cancel",
@@ -506,7 +513,18 @@
             "refresh_interval": "Refresh Interval (minutes)",
             "auto_sync": "Auto Sync Current Account",
             "auto_sync_desc": "Automatically sync current active account information periodically",
-            "sync_interval": "Sync Interval (minutes)"
+            "sync_interval": "Sync Interval (minutes)",
+            "auto_switch_classic": "Classic Auto Hot-Switch",
+            "auto_switch_classic_badge": "Classic Only",
+            "auto_switch_classic_desc": "When background inspection detects the active account quota in Antigravity Classic falls below threshold, automatically hot-switch to a healthy account from the pool (Exclusive to Classic Standalone; IDE and CLI do not support seamless hot-switching due to client architecture limitations).",
+            "auto_switch_threshold_label": "Trigger Threshold",
+            "auto_switch_threshold_hint": "Trigger switch when any monitored quota pool is ≤ {{pct}}%",
+            "auto_switch_models_label": "Monitored Quota Pools",
+            "auto_switch_models_hint": "Select at least one. Triggers switch when any selected pool falls below threshold.",
+            "auto_switch_gemini": "Gemini Pool",
+            "auto_switch_gemini_desc": "Includes Pro / Flash / Image generation",
+            "auto_switch_third_party": "Third-Party Models",
+            "auto_switch_third_party_desc": "Includes Claude 3.7 / 3.5 / GPT"
         },
         "warmup": {
             "title": "7-Day Weekly Reset Warmup",
@@ -962,6 +980,10 @@
                 },
                 "max_wait": "Max Wait (sec)",
                 "max_wait_tooltip": "Only used in 'Cache First' mode: wait instead of switching if the rate limit reset time is below this value.",
+                "max_spillover_accounts": "Spillover Account Cap",
+                "max_spillover_accounts_tooltip": "Maximum number of accounts allowed for concurrent traffic spillover when running multiple sub-agents or parallel sessions. Set to 0 for unlimited (all healthy accounts available); set to a positive integer (e.g. 2) to cap active accounts and prevent excessive spillover across accounts.",
+                "spillover_unlimited": "Unlimited (All available)",
+                "spillover_count": "{{count}} accounts",
                 "clear_bindings": "Clear Session Bindings",
                 "clear_bindings_tooltip": "Hard reset all session-account bindings, forcing accounts to be re-assigned on next request.",
                 "clear_rate_limits": "Clear Rate Limit Records",
@@ -1175,6 +1197,19 @@
             },
             "agent_settings": {
                 "title": "Specific Agent Settings"
+            },
+            "hub": {
+                "title": "Official Hub Client Fingerprint",
+                "tooltip": "Aligns outbound egress with Google official Antigravity Hub signatures, dynamically maintaining version and CL numbers to avoid 429 quota exhaustion.",
+                "source_custom": "Custom",
+                "source_remote": "Remote Detected",
+                "source_local": "Local App",
+                "source_baseline": "Stable Baseline",
+                "detect_button": "Detect",
+                "detect_success": "Successfully detected and synced official Hub: v{{version}} (CL: {{cl}})",
+                "detect_failed": "Detection failed: {{error}}",
+                "version_label": "Hub Version",
+                "cl_label": "Piper Build Number (CL)"
             }
         },
         "stream_timeouts": {
@@ -1411,7 +1446,19 @@
             "model_name": "Model Name",
             "model_id": "Model ID",
             "description": "Description",
-            "action": "Action"
+            "status": "Status / Probe",
+            "action": "Action",
+            "test_connectivity": "Probe",
+            "batch_test": "Probe All",
+            "stop_test": "Stop",
+            "auto_dispatch": "🤖 Auto Dispatch (Pool)",
+            "select_account": "Select Account",
+            "view_detail": "View Request & Timing Details",
+            "retired": "Retired",
+            "untested": "Untested",
+            "testing": "Testing...",
+            "success": "OK",
+            "rate_limited": "429 Limited"
         },
         "cli_sync": {
             "title": "One-Click Agent Tools Configuration",
@@ -1446,10 +1493,14 @@
             },
             "toast": {
                 "sync_success": "Sync successful! {{name}} is ready.",
-                "sync_error": "Sync failed: {{error}}"
+                "sync_error": "Sync failed: {{error}}",
+                "sync_success_with_model": "Successfully synced {{name}} with model: {{model}}"
             },
             "sync_confirm_title": "Sync Confirmation",
-            "sync_confirm_message": "Ready to sync {{name}} configuration. ⚠️ Warning: This will overwrite your existing local configuration files (e.g. login tokens, API Keys). Are you sure you want to continue?"
+            "sync_confirm_message": "Ready to sync {{name}} configuration. ⚠️ Warning: This will overwrite your existing local configuration files (e.g. login tokens, API Keys). Are you sure you want to continue?",
+            "apps": {
+                "gemini": "Antigravity CLI (agy)"
+            }
         },
         "hermes_sync": {
             "modal_title": "Configure Antigravity Manager in Hermes",
@@ -1721,8 +1772,21 @@
             "thinking_desc": "ThinkingStore hydration / sentinel signature injection",
             "ttft": "Time To First Token (TTFT)",
             "ttft_desc": "Gateway dispatch to first thinking/tool/content SSE chunk",
-            "stream": "Stream Transfer Duration",
+            "ttft_pure": "Time To First Token (Pure TTFT)",
+            "ttft_pure_desc": "Effective endpoint request dispatch to first SSE token chunk arrival",
+            "fallback_overhead": "Fallback Overhead",
+            "fallback_overhead_desc": "Timeout, retry, and switch latency across failed endpoints",
+            "fallback_badge": "Degraded",
+            "direct_badge": "Direct",
+            "switch_delay": "Fallback Switch Latency",
+            "attempt": "Attempt",
+            "effective_hit": "First Token Hit",
+            "stream": "Stream Duration",
             "stream_desc": "First chunk arrival to stream completion",
+            "fault_degraded": "Degraded",
+            "success": "Success",
+            "raw_error_payload": "Payload",
+            "timeout_or_failover": "Endpoint connection timeout or failover",
             "total": "Total Duration",
             "copy_timing": "Copy Timing",
             "copied_timing": "Copied",
@@ -1805,6 +1869,9 @@
     },
     "token_stats": {
         "title": "Token Consumption Stats",
+        "minute": "Minute",
+        "minute_1h": "1h (1m)",
+        "minute_24h": "24h (5m)",
         "hourly": "Hour",
         "daily": "Day",
         "weekly": "Week",
@@ -1963,7 +2030,13 @@
         "cockpit_saved_badge": "Saved",
         "reasoning_short": "Thk",
         "cockpit_thinking_share": "Thinking Share",
-        "cockpit_avg_thinking_per_req": "Avg Thinking / req"
+        "cockpit_avg_thinking_per_req": "Avg Thinking / req",
+        "cockpit_user_rank": "User Rank",
+        "cockpit_no_user_activity": "No user Key consumption activity",
+        "cockpit_view_detail": "Details",
+        "cockpit_tab_accounts": "Accounts",
+        "cockpit_tab_models": "Models",
+        "cockpit_tab_users": "Users"
     },
     "errors": {
         "stream": {
@@ -2108,7 +2181,24 @@
         "custom_expires_required": "Please select custom expiration time",
         "expires_custom": "Custom Time",
         "custom_expires_at": "Custom Expiration At",
-        "hint_custom_expires": "Set precise expiration timestamp for this token"
+        "hint_custom_expires": "Set precise expiration timestamp for this token",
+        "view_stats": "Usage Statistics",
+        "bound_ips": "Client IPs",
+        "recent_ips": "Active Client IPs & Recent Activity",
+        "no_ips": "No IP binding records found",
+        "enabled": "Active",
+        "disabled": "Disabled",
+        "range_24h": "24h",
+        "range_7d": "7 Days",
+        "range_30d": "30 Days",
+        "range_all": "All",
+        "success_rate": "Success Rate",
+        "avg_per_request": "Avg Tokens/Req",
+        "est_throughput": "Est. tokens per request",
+        "calls_unit": "calls",
+        "records_unit": "records",
+        "no_trend_data": "No trend data in this period",
+        "no_model_data": "No model data available"
     },
     "apiKeyFun": {
         "title": "APIKEY.FUN Hub",

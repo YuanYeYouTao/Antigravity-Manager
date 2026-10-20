@@ -42,6 +42,8 @@ mod tests {
             validation_url: None,
             model_quotas: Default::default(),
             model_limits: Default::default(),
+            available_models: std::collections::HashSet::new(),
+            model_metadata: std::collections::HashMap::new(),
         };
         for generation in [0, 1] {
             let expected = crate::proxy::common::session::derive_session_scoped(

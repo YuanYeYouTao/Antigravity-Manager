@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v4.9.4)
+> Professional Account Management & Protocol Proxy System for AI Services (v4.9.8)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.9.4-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.9.8-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -320,6 +320,27 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8045"
 claude
 ```
 
+### Native CLI Account Switcher (`at` / `antigravity-tools`)
+Antigravity includes a lightweight native CLI suite designed for terminal developers. It enables instant system Keychain credential rotation and seamless session continuation with `agy`:
+
+```bash
+# 1. List all accounts with status and active indicators (👉)
+at list
+
+# 2. Inspect currently active accounts across agy CLI (Keychain) and IDE
+at current
+
+# 3. Switch account (supports 1-based index, email, prefix, or alias)
+at switch 2                      # Switch to account #2
+at switch work@gmail.com         # Switch by email
+at switch work                   # Switch by email prefix
+at switch "WorkAccount"          # Switch by account name
+at switch                        # Auto round-robin to next normal account
+
+# 4. Switch and automatically resume agy session
+at switch 2 -c                   # -c is short for --continue
+```
+
 ### How to use with OpenCode?
 1. Go to **API Proxy** → **External Providers** → click the **OpenCode Sync** card.
 2. Click **Sync** to generate `~/.config/opencode/opencode.json`:
@@ -493,7 +514,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v4.9.4** (2026-10-04): Introduced an adaptive thinking budget negotiation state machine with user-intent recognition, eliminating early return bypasses to fundamentally resolve Google 400 violations caused by `maxOutputTokens <= thinkingBudget`; pioneered 6x ratio fast & concise intent recognition (automatically compressing thinking budget when `t >= 6 * m` to avoid lengthy reasoning on quick queries), while intelligently expanding output budgets during deep reasoning when official capacities allow to preserve model IQ, and clamping to 1024 output tokens as an ultimate physical ceiling fallback (PR #3599, thanks to @cubelikeplayDaniel); inherits 4.9.3's robust HTTP/2 architecture and native Chrome 123 baseline to end long-task dropouts.
+> Latest version **v4.9.8** (2026-10-17): Automatic seamless hot-switch for Antigravity Classic upon quota depletion or threshold breach with streamlined dual-pool cards (Ref #3509); native evolution supporting Antigravity CLI (`agy`) with automatic shell wrapper injection, thinking effort disassembly, and independent 3-client active account detection with contextual badges (Ref #3686, Ref #3630); comprehensive 403 error body capture and action URL extraction (captcha verification/appeal) with closed-loop self-healing recovery (Ref #3630, Ref #3684); Claude Code 2.1.301 protocol alignment with anti-WAF identity sanitization, full-link `request-id` injection, and Claude 5 model family integration (PR #3689, Ref #3684, Ref #3686); active reference tracking in JSON Schema recursive flattening to eliminate exponential replication and Linux VPS OOM (SIGKILL 137) crashes, array schema normalization with terminal ARRAY items guards to prevent Gemini 400 errors, adaptive first-chunk Peek timeout extension to 60s/90s/120s for reasoning models, zero-downtime atomic pool reload eliminating 503 errors, and anti-regression rate limit protection (PR #3694, Fixes #3690, Ref #3682, Ref #3693); complete removal of 100% 429-yielding Prod endpoints, relaxed streaming first-chunk watchdog to 120s baseline, multi-turn role preservation for Responses array inputs, and elimination of 0ms optimistic reset storms (PR #3691, PR #3672, PR #3687, PR #3685, Fixes #3506, Ref #3525); traffic monitor inspector overhaul with Postman-style single-tab view, structured vs raw code views, key-value headers tables with Bearer masking, standard dual-link HAR 1.2 export, and 12-language localization coverage (thanks to @cubelikeplayDaniel, @EricZhou05, @blackdm666, @jeikl).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 
@@ -502,6 +523,8 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 <a href="https://github.com/lbjlaq"><img src="https://github.com/lbjlaq.png" width="50px" style="border-radius: 50%;" alt="lbjlaq"/></a>
 <a href="https://github.com/jeikl"><img src="https://github.com/jeikl.png" width="50px" style="border-radius: 50%;" alt="jeikl"/></a>
+<a href="https://github.com/cubelikeplayDaniel"><img src="https://github.com/cubelikeplayDaniel.png" width="50px" style="border-radius: 50%;" alt="cubelikeplayDaniel"/></a>
+<a href="https://github.com/diannaaav"><img src="https://github.com/diannaaav.png" width="50px" style="border-radius: 50%;" alt="diannaaav"/></a>
 <a href="https://github.com/XinXin622"><img src="https://github.com/XinXin622.png" width="50px" style="border-radius: 50%;" alt="XinXin622"/></a>
 <a href="https://github.com/llsenyue"><img src="https://github.com/llsenyue.png" width="50px" style="border-radius: 50%;" alt="llsenyue"/></a>
 <a href="https://github.com/salacoste"><img src="https://github.com/salacoste.png" width="50px" style="border-radius: 50%;" alt="salacoste"/></a>

@@ -352,6 +352,15 @@ impl SystemIntegration for DesktopIntegration {
 
         if !hot_switch && running {
             process::close_antigravity(20, effective_target)?;
+            // 完整重启路径必须在彻底终止主进程之后重新断言写入凭据，
+            // 消除外部客户端退出钩子在关机瞬间回写陈旧 Session Token 的竞态
+            apply_account_credentials(
+                account,
+                effective_target,
+                is_ide,
+                active_exe_path.as_deref(),
+            )?;
+            credentials_applied = true;
         }
         if effective_target != target_ide
             && target_ide.is_some()
@@ -360,7 +369,7 @@ impl SystemIntegration for DesktopIntegration {
             process::close_antigravity(20, target_ide)?;
         }
 
-        // 凭据写入（热切号已在终止子进程之前完成，避免重复写入；完整重启路径保持「先杀后写」）
+        // 若此前从未写入凭据（例如客户端未处于运行状态）：此时写入凭据
         if !credentials_applied {
             apply_account_credentials(
                 account,
@@ -388,6 +397,13 @@ impl SystemIntegration for DesktopIntegration {
                 "[Desktop] Hot switch degraded: language_server did not respawn within timeout; performing a full restart.",
             );
             process::close_antigravity(20, effective_target)?;
+            // 彻底杀死主窗口后重新断言写入凭据，消除退出钩子回写旧 token
+            let _ = apply_account_credentials(
+                account,
+                effective_target,
+                is_ide,
+                active_exe_path.as_deref(),
+            );
         }
 
         if let Err(e) = process::start_antigravity_with_fallback_path(
@@ -424,7 +440,7 @@ impl SystemIntegration for DesktopIntegration {
 }
 
 /// 辅助方法：向宿主操作系统的 Keychain/Credentials Manager 写入 Token
-fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
+pub(crate) fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
     // 1. 构建 Token 的 JSON Payload，并将过期时间戳格式化为符合 RFC3339 的带微秒格式
     let expiry_secs = if account.token.expiry_timestamp > 10_000_000_000 {
         account.token.expiry_timestamp / 1000
@@ -913,6 +929,42 @@ fn read_from_file_credentials() -> Result<crate::modules::migration::ImportedOAu
     })
 }
 
+/// 读取 Antigravity CLI (agy) 原生与备份文件凭据，严格限制仅扫描 Antigravity
+pub fn read_antigravity_cli_credentials() -> Vec<crate::modules::migration::ImportedOAuthState> {
+    let mut states = Vec::new();
+    let Some(home) = dirs::home_dir() else {
+        return states;
+    };
+
+    let cli_dir = home.join(".gemini").join("antigravity-cli");
+    let candidate_files = [
+        cli_dir.join("antigravity-oauth-token"),
+        cli_dir.join("antigravity-oauth-token.antigravity.bak"),
+        cli_dir.join("antigravity-oauth-token.bak"),
+    ];
+
+    let mut seen_tokens = std::collections::HashSet::new();
+    for path in &candidate_files {
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(path) {
+                if let Ok(state) = parse_keyring_payload(&content) {
+                    if !state.refresh_token.is_empty()
+                        && seen_tokens.insert(state.refresh_token.clone())
+                    {
+                        crate::modules::logger::log_info(&format!(
+                            "[CLI-Scan] Discovered Antigravity CLI OAuth state in {:?}",
+                            path
+                        ));
+                        states.push(state);
+                    }
+                }
+            }
+        }
+    }
+
+    states
+}
+
 /// 辅助方法：从宿主操作系统的 Keychain/Credentials Manager 读取 Token
 pub fn read_from_system_keyring() -> Result<crate::modules::migration::ImportedOAuthState, String> {
     read_system_credentials(true)
@@ -1144,11 +1196,74 @@ impl SystemIntegration for HeadlessIntegration {
     }
 }
 
+/// CLI 模式实现：支持向宿主操作系统的 Keychain/Keyring 写入凭据（用于终端命令行切号）
+pub struct CliIntegration;
+
+impl SystemIntegration for CliIntegration {
+    async fn on_account_switch(
+        &self,
+        account: &crate::models::Account,
+        target_ide: Option<&str>,
+    ) -> Result<(), String> {
+        if target_ide == Some("agy") {
+            write_to_system_keyring(account)?;
+            let stored = read_from_system_keyring_only()?;
+            verify_agy_credentials(&account.token.refresh_token, &stored.refresh_token)?;
+
+            if let Ok(storage_path) = device::get_storage_path(target_ide) {
+                if let Some(ref profile) = account.device_profile {
+                    let _ = device::write_profile(&storage_path, profile);
+                }
+            }
+            return Ok(());
+        }
+
+        let classic_running = process::is_antigravity_running(None);
+        let ide_running = process::is_antigravity_running(Some("ide"));
+        let classic_exe = process::get_antigravity_executable_path(Some("classic"));
+        let ide_exe = process::get_antigravity_executable_path(Some("ide"));
+        let ide_exe_str = ide_exe.as_ref().map(|p| p.to_string_lossy().to_string());
+
+        let (_is_ide, effective_target) = resolve_effective_target(
+            target_ide,
+            classic_running,
+            ide_running,
+            classic_exe.is_some(),
+            ide_exe_str.as_deref(),
+        );
+
+        let _ = write_to_system_keyring(account);
+        if let Ok(db_path) = db::get_db_path(effective_target) {
+            if db_path.exists() {
+                let _ = db::inject_token(
+                    &db_path,
+                    &account.token.access_token,
+                    &account.token.refresh_token,
+                    account.token.expiry_timestamp,
+                    &account.email,
+                    account.token.is_gcp_tos,
+                    account.token.project_id.as_deref(),
+                    account.token.id_token.as_deref(),
+                    account.token.oauth_client_key.as_deref(),
+                    effective_target,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn update_tray(&self) {}
+    fn show_notification(&self, title: &str, body: &str) {
+        crate::modules::logger::log_info(&format!("[CLI Notification] {}: {}", title, body));
+    }
+}
+
 /// 系统集成管理器：替代 Arc<dyn SystemIntegration> 以解决 async trait 的 dyn 兼容性问题
 #[derive(Clone)]
 pub enum SystemManager {
     Desktop(tauri::AppHandle),
     Headless,
+    Cli,
 }
 
 impl SystemManager {
@@ -1166,6 +1281,10 @@ impl SystemManager {
             }
             SystemManager::Headless => {
                 let integration = HeadlessIntegration;
+                integration.on_account_switch(account, target_ide).await
+            }
+            SystemManager::Cli => {
+                let integration = CliIntegration;
                 integration.on_account_switch(account, target_ide).await
             }
         }
@@ -1192,6 +1311,10 @@ impl SystemManager {
                 let integration = HeadlessIntegration;
                 integration.show_notification(title, body);
             }
+            SystemManager::Cli => {
+                let integration = CliIntegration;
+                integration.show_notification(title, body);
+            }
         }
     }
 }
@@ -1202,18 +1325,7 @@ impl SystemIntegration for SystemManager {
         account: &crate::models::Account,
         target_ide: Option<&str>,
     ) -> Result<(), String> {
-        match self {
-            SystemManager::Desktop(handle) => {
-                let integration = DesktopIntegration {
-                    app_handle: handle.clone(),
-                };
-                integration.on_account_switch(account, target_ide).await
-            }
-            SystemManager::Headless => {
-                let integration = HeadlessIntegration;
-                integration.on_account_switch(account, target_ide).await
-            }
-        }
+        self.on_account_switch(account, target_ide).await
     }
 
     fn update_tray(&self) {

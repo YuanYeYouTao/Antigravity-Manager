@@ -38,6 +38,7 @@ pub fn to_claude_usage(
             .as_u64()
             .map(|v| v as u32),
         server_tool_use: None,
+        ..Default::default()
     }
 }
 
@@ -61,8 +62,9 @@ mod tests {
         };
 
         let claude_usage = to_claude_usage(&usage, true, 1_000_000);
-        // 100 tokens is < 30k, minimal scaling
-        assert_eq!(claude_usage.input_tokens, Some(100));
+        // Total input alone does not report the uncached input required by Claude.
+        assert_eq!(claude_usage.input_tokens, None);
+        assert_eq!(claude_usage.cache_read_input_tokens, None);
         assert_eq!(claude_usage.output_tokens, Some(50));
 
         // 测试 50% 负载 (500k) - 应该显示 ~30%
@@ -71,7 +73,7 @@ mod tests {
             prompt_token_count: Some(500_000),
             candidates_token_count: Some(10),
             total_token_count: Some(500_010),
-            cached_content_token_count: None,
+            cached_content_token_count: Some(0),
         };
         let res_50 = to_claude_usage(&usage_50, true, 1_000_000);
         // 50% * 0.6 = 30% of 195k = 58,500
@@ -83,7 +85,7 @@ mod tests {
             prompt_token_count: Some(700_000),
             candidates_token_count: Some(10),
             total_token_count: Some(700_010),
-            cached_content_token_count: None,
+            cached_content_token_count: Some(0),
         };
         let res_70 = to_claude_usage(&usage_70, true, 1_000_000);
         // 50% of 195k = 97,500
@@ -95,7 +97,7 @@ mod tests {
             prompt_token_count: Some(850_000),
             candidates_token_count: Some(10),
             total_token_count: Some(850_010),
-            cached_content_token_count: None,
+            cached_content_token_count: Some(0),
         };
         let res_85 = to_claude_usage(&usage_85, true, 1_000_000);
         // 70% of 195k = 136,500
@@ -107,7 +109,7 @@ mod tests {
             prompt_token_count: Some(1_000_000),
             candidates_token_count: Some(10),
             total_token_count: Some(1_000_010),
-            cached_content_token_count: None,
+            cached_content_token_count: Some(0),
         };
         let res_100 = to_claude_usage(&usage_100, true, 1_000_000);
         // 97% of 195k = 189,150

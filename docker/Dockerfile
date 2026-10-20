@@ -59,8 +59,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get -o Acquire::
 ENV CARGO_HTTP_MULTIPLEXING=false
 RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
     echo "Using Aliyun mirror for Cargo..."; \
-    mkdir -p /root/.cargo && \
-    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > /root/.cargo/config.toml; \
+    mkdir -p "$CARGO_HOME" && \
+    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > "$CARGO_HOME/config.toml"; \
     else \
     echo "Using default Cargo registry..."; \
     fi
@@ -80,8 +80,8 @@ COPY --from=frontend-builder /app/dist ./dist
 
 # Build the Rust backend in release mode (with BuildKit cache)
 WORKDIR /app/src-tauri
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
     cargo build --release --locked --jobs 2 --bin antigravity-tools && \
     cp target/release/antigravity-tools /tmp/antigravity-tools
@@ -90,6 +90,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 FROM debian:bookworm-slim
 COPY --from=rust:1-slim-bookworm /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 ARG USE_MIRROR=auto
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/YuanYeYouTao/Antigravity-Manager" \
+      org.opencontainers.image.revision=$SOURCE_REVISION \
+      org.opencontainers.image.version="4.9.9-beta.2" \
+      org.opencontainers.image.base.revision="54fd90b036a50a7a8772cb9b7d79a74e2c62a149"
 WORKDIR /app
 
 # Conditionally use Aliyun mirror for APT

@@ -26,7 +26,7 @@ pub trait ProtocolStreamHandler: Send + 'static {
     /// 返回需要向下游发送的字节块序列
     fn process_line(&mut self, line: &str) -> Vec<Bytes>;
 
-    /// 检查是否已有正文内容输出给下游（用于判断中断时是优雅截断还是首包不可重试错误）
+    /// 检查是否已有正文或工具调用输出给下游。
     fn has_content(&self) -> bool;
 
     /// 可选：检查是否已有思考内容输出（例如 Claude 的 thinking 块，用于后思考恢复通道）
@@ -96,6 +96,7 @@ impl StreamLifecycleConfig {
         }
     }
 
+    #[cfg(test)]
     pub fn with_timeouts(
         mut self,
         initial_ttft_secs: u64,
@@ -105,6 +106,12 @@ impl StreamLifecycleConfig {
         self.initial_ttft_secs = initial_ttft_secs;
         self.transition_secs = transition_secs;
         self.streaming_sliding_secs = streaming_sliding_secs;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_heartbeat_secs(mut self, heartbeat_secs: u64) -> Self {
+        self.heartbeat_secs = heartbeat_secs;
         self
     }
 }
@@ -258,35 +265,7 @@ where
                                 }
                             }
                         }
-                        None => {
-                            // [关键契约守卫] 若上游到达 EOF 时未处于终止态，且从未产生任何正文或工具调用（无论是否产生了思考）：
-                            // 严禁作为正常 EOF 终结或伪造收尾帧！如实作为 Err 透传底层中断，
-                            // 促使 Claude Code 等客户端状态机捕获 ConnectionLost 并自动触发原生重试。
-                            if !handler.is_terminal() && !handler.has_content() {
-                                let reason = if handler.has_thinking() {
-                                    "upstream stream ended after thinking without content"
-                                } else {
-                                    "upstream stream ended prematurely before emitting content"
-                                };
-                                let report = crate::proxy::mappers::error_classifier::report_stream_error(
-                                    config.adapter_name,
-                                    config.function_name,
-                                    &reason,
-                                    config.trace_info.clone(),
-                                );
-                                tracing::warn!(
-                                    "[{}] {} upstream stream reached EOF without content (has_thinking: {}): {}",
-                                    config.adapter_name,
-                                    config.function_name,
-                                    handler.has_thinking(),
-                                    report.client_message()
-                                );
-                                error_emitted = true;
-                                yield Err(report.client_message());
-                                break;
-                            }
-                            break; // 上游流正常到达 EOF
-                        }
+                        None => break,
                     }
                 }
                 _ = heartbeat_interval.tick() => {
@@ -353,6 +332,19 @@ where
             return;
         }
 
+        // [FIX #1732] 尾部数据安全 Flush：防止因末尾缺少换行符产生网络分片悬挂
+        if !handler.is_terminal() && !buffer.is_empty() {
+            let line_str = String::from_utf8_lossy(&buffer);
+            let line = line_str.trim();
+            if !line.is_empty() {
+                let chunks = handler.process_line(line);
+                for out_chunk in chunks {
+                    yield Ok(out_chunk);
+                }
+            }
+            buffer.clear();
+        }
+
         // [关键契约守卫] 若流结束时未处于终止态且未产生任何正文/工具调用（无论是否产生了思考）：
         // 严禁下发伪造终结帧，如实透传 Err 促使客户端原生重试
         if !handler.is_terminal() && !handler.has_content() {
@@ -386,23 +378,8 @@ where
             return;
         }
 
-        // [FIX #1732] 尾部数据安全 Flush：防止因末尾缺少换行符产生网络分片悬挂
-        if !buffer.is_empty() {
-            let line_str = String::from_utf8_lossy(&buffer);
-            let line = line_str.trim();
-            if !line.is_empty() {
-                let chunks = handler.process_line(line);
-                for out_chunk in chunks {
-                    yield Ok(out_chunk);
-                }
-            }
-            buffer.clear();
-        }
-
-        // 正常收尾
-        let final_chunks = handler.emit_finalize();
-        for c in final_chunks {
-            yield Ok(c);
+        for chunk in handler.emit_finalize() {
+            yield Ok(chunk);
         }
 
         handler.on_finish();
@@ -566,6 +543,46 @@ mod tests {
             "Must NOT emit initial error when content exists"
         );
         assert!(error_received, "Stream must propagate Err on interruption");
+    }
+
+    #[tokio::test]
+    async fn test_lifecycle_idle_timeout_after_content_propagates_error_without_finalize() {
+        let mock_stream = async_stream::stream! {
+            yield Ok::<_, String>(Bytes::from("data: partial content\n"));
+            // 保持静默超过稳态滑动超时 (streaming_sliding_secs = 1s)
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            yield Ok::<_, String>(Bytes::from("data: unreachable\n"));
+        };
+
+        let handler = MockHandler::new(false, false);
+        let config =
+            StreamLifecycleConfig::new("test", "test_fn", "trace_idle_after_content".to_string())
+                .with_timeouts(5, 5, 1)
+                .with_heartbeat_secs(1);
+        let mut stream = run_stream_lifecycle(Box::pin(mock_stream), handler, config);
+
+        let mut output = Vec::new();
+        let mut error_received = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(b) => output.push(String::from_utf8_lossy(&b).to_string()),
+                Err(_) => {
+                    error_received = true;
+                }
+            }
+        }
+
+        let full_output = output.join("");
+        assert!(full_output.contains("processed:data: partial content"));
+        assert!(
+            !full_output.contains("[finalized]"),
+            "Must not finalize when a real idle timeout interrupts content"
+        );
+        assert!(
+            error_received,
+            "Must propagate the real idle timeout after content"
+        );
+        assert!(!full_output.contains("unreachable"));
     }
 
     #[tokio::test]

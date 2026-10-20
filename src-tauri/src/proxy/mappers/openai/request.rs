@@ -373,6 +373,10 @@ pub fn transform_openai_request_with_session(
                     &name
                 };
                 tool_id_to_name.insert(call.id.clone(), final_name.to_string());
+                let norm_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
+                if norm_id.as_ref() != call.id {
+                    tool_id_to_name.insert(norm_id.into_owned(), final_name.to_string());
+                }
             }
         }
     }
@@ -673,16 +677,18 @@ pub fn transform_openai_request_with_session(
 
             // Handle tool response
             if msg.role == "tool" || msg.role == "function" {
-                let name = msg.name.as_deref().unwrap_or("unknown");
-                // 优先从紧邻的前置 assistant 消息中查找匹配该 tool_call_id 的工具名称 (精准杜绝长会话 ID 碰撞时全局 Map 覆盖错误)
+                let name = msg.name.as_deref().unwrap_or("");
+                // 优先从前置 assistant 消息中查找匹配该 tool_call_id 的工具名称 (精准杜绝长会话 ID 碰撞时全局 Map 覆盖错误)
                 let matched_preceding_name = if let Some(ref target_id) = msg.tool_call_id {
+                    let norm_target_id = crate::proxy::common::utils::normalize_tool_id(target_id);
                     let mut found = None;
                     for prev_idx in (0..msg_index).rev() {
                         if let Some(prev_msg) = request.messages.get(prev_idx) {
                             if prev_msg.role == "assistant" {
                                 if let Some(ref calls) = prev_msg.tool_calls {
                                     for call in calls {
-                                        if call.id == *target_id {
+                                        let norm_call_id = crate::proxy::common::utils::normalize_tool_id(&call.id);
+                                        if call.id == *target_id || norm_call_id.as_ref() == norm_target_id.as_ref() {
                                             found = if let Some(ref func) = call.function {
                                                 Some(if func.name == "local_shell_call" { "shell".to_string() } else { func.name.clone() })
                                             } else if call.operation.is_some() || call.r#type == "apply_patch_call" {
@@ -694,9 +700,9 @@ pub fn transform_openai_request_with_session(
                                         }
                                     }
                                 }
-                                break;
-                            } else if prev_msg.role != "tool" && prev_msg.role != "function" {
-                                break;
+                                if found.is_some() {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -710,9 +716,16 @@ pub fn transform_openai_request_with_session(
                 } else if name == "local_shell_call" {
                     "shell"
                 } else if let Some(id) = &msg.tool_call_id {
-                    tool_id_to_name.get(id).map(|s| s.as_str()).unwrap_or(name)
-                } else {
+                    let norm_id = crate::proxy::common::utils::normalize_tool_id(id);
+                    tool_id_to_name
+                        .get(id)
+                        .or_else(|| tool_id_to_name.get(norm_id.as_ref()))
+                        .map(|s| s.as_str())
+                        .unwrap_or(if name.is_empty() { "unknown" } else { name })
+                } else if !name.is_empty() {
                     name
+                } else {
+                    "unknown"
                 };
 
                 let mut extra_parts = Vec::new();
@@ -781,17 +794,10 @@ pub fn transform_openai_request_with_session(
                     None => "".to_string()
                 };
 
-                // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉与 Gemini 400 校验异常
-                let final_content = if content_val.trim().is_empty() {
-                    "Command executed successfully.".to_string()
-                } else {
-                    content_val
-                };
-
                 let mut fr_part = json!({
                     "functionResponse": {
                        "name": final_name,
-                       "response": { "output": final_content },
+                       "response": { "output": content_val },
                        "id": msg.tool_call_id.clone().unwrap_or_default()
                     }
                 });
@@ -1390,6 +1396,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_tool_receipt_is_preserved_without_success_text() {
+        for output in ["", "  \n"] {
+            let req: OpenAIRequest = serde_json::from_value(json!({
+                "model": "gemini-3.8-flash",
+                "messages": [
+                    {"role": "user", "content": "Inspect"},
+                    {"role": "assistant", "tool_calls": [{
+                        "id": "call_empty_receipt", "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_empty_receipt", "content": output}
+                ]
+            }))
+            .unwrap();
+            let (body, _, _, _) =
+                transform_openai_request(&req, "test-project", "gemini-3.8-flash", None);
+            let receipt = body["request"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|turn| turn["parts"].as_array().unwrap())
+                .find_map(|part| part.get("functionResponse"))
+                .unwrap();
+            assert_eq!(receipt["name"], "inspect");
+            assert_eq!(receipt["response"]["output"], output);
+        }
+    }
+
+    #[test]
+    fn orphan_tool_receipt_does_not_borrow_the_only_declared_tool() {
+        let req: OpenAIRequest = serde_json::from_value(json!({
+            "model": "gemini-3.8-flash",
+            "messages": [
+                {"role": "user", "content": "Inspect"},
+                {"role": "tool", "tool_call_id": "call_orphan", "content": "original receipt"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "unrelated_declared_tool", "parameters": {"type": "object", "properties": {}}
+            }}]
+        })).unwrap();
+        let (body, _, _, _) =
+            transform_openai_request(&req, "test-project", "gemini-3.8-flash", None);
+        let receipt = body["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["parts"].as_array().unwrap())
+            .filter_map(|part| part["text"].as_str())
+            .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+            .find(|value| value["response"]["output"] == "original receipt")
+            .unwrap();
+        assert_eq!(receipt["name"], "unknown");
+    }
+
+    #[test]
     fn test_openai_aliases_max_completion_tokens_and_reasoning_max_tokens() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
@@ -1466,7 +1527,7 @@ mod tests {
     fn prompt_log_identity_cleanup_only_changes_system_instructions() {
         // 身份声明归一化由协议无关的流水线节点承担（`PromptSanitizer::sanitize_gemini_payload`），
         // 适配层只产出原样系统提示词。本用例校验「适配层产出 → 流水线清洗」的真实链路：
-        // 系统提示词块内的身份声明被统一归一化为中性身份，user / tool 文本逐字保留。
+        // 系统提示词块内的身份声明统一为官方 Antigravity 身份，user / tool 文本逐字保留。
         for old in [
             "You are Codex, an agent based on GPT-5.",
             "You are Codex, a coding agent based on GPT-5.",
@@ -1491,6 +1552,7 @@ mod tests {
             assert!(body["request"]["systemInstruction"]
                 .to_string()
                 .contains(old));
+            let original_contents = body["request"]["contents"].clone();
 
             crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
                 &mut body,
@@ -1498,10 +1560,12 @@ mod tests {
 
             let system = body["request"]["systemInstruction"].to_string();
             assert!(!system.contains(old));
-            assert!(system.contains("Top-level: You are an AI Agent."));
-            assert!(system.contains("System: You are an AI Agent."));
-            assert!(system.contains("<model_switch>You are an AI Agent.</model_switch>"));
+            let identity = crate::proxy::mappers::prompt_sanitizer::OFFICIAL_ANTIGRAVITY_IDENTITY;
+            assert!(system.contains(&format!("Top-level: {identity}")));
+            assert!(system.contains(&format!("System: {identity}")));
+            assert!(system.contains(&format!("<model_switch>{identity}</model_switch>")));
             // 用户提问与工具消息（含管道自身提示词）零改动
+            assert_eq!(body["request"]["contents"], original_contents);
             let contents = body["request"]["contents"].to_string();
             assert_eq!(contents.matches(old).count(), 2);
         }
@@ -1519,16 +1583,19 @@ mod tests {
     }
 
     #[test]
-    fn tiered_flash_ignores_client_effort_and_keeps_include_thoughts_only() {
+    fn tiered_flash_preserves_model_and_applies_real_budget_minimum() {
         let _lock = crate::proxy::config::TEST_CONFIG_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // Server-authoritative: client reasoning.effort must not set thinkingLevel, but populates thinkingBudget per tier.
-        for model in ["gemini-3.8-flash-tiered", "gemini-9.9-flash-tiered"] {
+        // Effort maps to a numeric budget; Gemini >= 4 requires at least 1024 for positive budgets.
+        for (model, low_budget) in [
+            ("gemini-3.8-flash-tiered", 1000),
+            ("gemini-9.9-flash-tiered", 1024),
+        ] {
             assert!(is_tiered_flash_model(model));
             for (effort, expected_budget) in [
                 (None, -1),
-                (Some("low"), 1000),
+                (Some("low"), low_budget),
                 (Some("medium"), 4000),
                 (Some("high"), -1),
                 (Some("xhigh"), -1),

@@ -1965,12 +1965,17 @@ pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
     }
 
     // 防御 2: 修复历史/中间轮次中可能存在的 parts 为空
-    for turn in contents.iter_mut() {
+    let total_turns = contents.len();
+    for (idx, turn) in contents.iter_mut().enumerate() {
         let is_model = turn
             .get("role")
             .and_then(|r| r.as_str())
             .map(|r| r == "model" || r == "assistant")
             .unwrap_or(false);
+        // model 尾轮属于客户端的续步状态，原样保留。
+        if is_model && idx == total_turns - 1 {
+            continue;
+        }
         if let Some(parts) = turn.get_mut("parts").and_then(|p| p.as_array_mut()) {
             if parts.is_empty() {
                 modified = true;
@@ -2060,20 +2065,24 @@ mod defense_tests {
     }
 
     #[test]
-    fn test_ensure_gemini_payload_ends_with_user_model_ending() {
-        // [谷歌新规则报文变动，暂时废弃] 允许末尾为 model 轮次，不再追加 user 垫片
-        let mut payload = json!({
-            "request": {
-                "contents": [
-                    { "role": "user", "parts": [{ "text": "hello" }] },
-                    { "role": "model", "parts": [{ "text": "hi there" }] }
-                ]
-            }
-        });
-        assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
-        let contents = payload["request"]["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 2);
-        assert_eq!(contents[1]["role"], "model");
+    fn model_tail_is_preserved_without_synthetic_user() {
+        for parts in [
+            json!([]),
+            json!([{"text": "  "}]),
+            json!([{"text": "hi there"}]),
+        ] {
+            let mut payload = json!({
+                "request": {
+                    "contents": [
+                        {"role": "user", "parts": [{"text": "hello"}]},
+                        {"role": "model", "parts": parts}
+                    ]
+                }
+            });
+            let original = payload.clone();
+            assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+            assert_eq!(payload, original);
+        }
     }
 
     #[test]
@@ -2102,7 +2111,7 @@ mod defense_tests {
 
     #[test]
     fn test_ensure_gemini_payload_ends_with_user_tool_turn_injected() {
-        // [谷歌新规则报文变动，暂时废弃] 末尾 model 轮（含工具轮与纯正文）均允许保留，不再注入假用户轮
+        // 包含 functionResponse 的工具回执轮次：官方合法收尾，严格保持原样绝不追加 user 垫片 (Fixes #3629)
         let mut payload = json!({
             "contents": [
                 { "role": "user", "parts": [{ "text": "run the tool" }] },
@@ -2119,25 +2128,26 @@ mod defense_tests {
                             "thoughtSignature": "AABBCC"
                         }
                     ]
+                },
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "id": "call_1",
+                                "name": "run_command",
+                                "response": { "output": "hi\n" }
+                            }
+                        }
+                    ]
                 }
             ]
         });
         assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
         let contents = payload["contents"].as_array().unwrap();
-        assert_eq!(contents.len(), 2);
-        assert_eq!(contents[1]["role"], "model");
-
-        // 末尾 model 轮为纯正文（非工具轮）→ 同样允许保留
-        let mut payload2 = json!({
-            "contents": [
-                { "role": "user", "parts": [{ "text": "hello" }] },
-                { "role": "model", "parts": [{ "text": "hi there" }] }
-            ]
-        });
-        assert!(!ensure_gemini_payload_ends_with_user(&mut payload2));
-        let contents2 = payload2["contents"].as_array().unwrap();
-        assert_eq!(contents2.len(), 2);
-        assert_eq!(contents2[1]["role"], "model");
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[2]["role"], "model");
+        assert!(contents[2]["parts"][0].get("functionResponse").is_some());
     }
 
     #[test]

@@ -292,6 +292,22 @@ pub fn run() {
 
     // Check for headless mode
     let args: Vec<String> = std::env::args().collect();
+
+    // Check for CLI subcommands (switch, list, current, etc.)
+    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        match runtime.block_on(modules::cli_handler::try_handle_cli(&args)) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("\x1b[31m[Antigravity CLI Error]\x1b[0m {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let is_headless = args.iter().any(|arg| arg == "--headless");
 
     // Increase file descriptor limit (macOS only)
@@ -440,6 +456,12 @@ pub fn run() {
                         }
                     }
 
+                    // Initialize Hub fingerprint from config or detection
+                    crate::modules::hub_version::update_hub_fingerprint(
+                        config.proxy.hub_version.as_deref(),
+                        config.proxy.hub_cl.as_deref(),
+                    );
+
                     // Start proxy service
                     if let Err(e) = commands::proxy::internal_start_proxy_service(
                         config.proxy,
@@ -541,6 +563,10 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 // Load config
                 if let Ok(config) = modules::config::load_app_config() {
+                    crate::modules::hub_version::update_hub_fingerprint(
+                        config.proxy.hub_version.as_deref(),
+                        config.proxy.hub_cl.as_deref(),
+                    );
                     let state = handle.state::<commands::proxy::ProxyServiceState>();
                     let cf_state = handle.state::<commands::cloudflared::CloudflaredState>();
                     let integration =
@@ -597,6 +623,8 @@ pub fn run() {
 
             apply_login_launch_policy(app);
 
+            ensure_cli_symlinks();
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -652,6 +680,7 @@ pub fn run() {
             commands::delete_device_version,
             commands::open_device_folder,
             commands::get_current_account,
+            commands::get_active_clients_status,
             // Quota commands
             commands::fetch_account_quota,
             commands::refresh_all_quotas,
@@ -717,6 +746,7 @@ pub fn run() {
             commands::proxy::clear_thinking_store,
             commands::proxy::get_thinking_store_count,
             commands::proxy::get_proxy_db_disk_size,
+            commands::proxy::test_model_connectivity,
             commands::proxy::generate_api_key,
             commands::proxy::reload_proxy_accounts,
             commands::proxy::update_model_mapping,
@@ -727,6 +757,8 @@ pub fn run() {
             commands::proxy::clear_proxy_session_bindings,
             commands::proxy::set_preferred_account,
             commands::proxy::get_preferred_account,
+            commands::proxy::get_hub_fingerprint,
+            commands::proxy::detect_remote_hub_fingerprint,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
             // Proxy Pool Binding commands
@@ -746,14 +778,17 @@ pub fn run() {
             commands::get_http_api_settings,
             commands::save_http_api_settings,
             // Token 统计命令
+            commands::get_token_stats_minute,
             commands::get_token_stats_hourly,
             commands::get_token_stats_daily,
             commands::get_token_stats_weekly,
             commands::get_token_stats_by_account,
             commands::get_token_stats_summary,
             commands::get_token_stats_by_model,
+            commands::get_token_stats_model_trend_minute,
             commands::get_token_stats_model_trend_hourly,
             commands::get_token_stats_model_trend_daily,
+            commands::get_token_stats_account_trend_minute,
             commands::get_token_stats_account_trend_hourly,
             commands::get_token_stats_account_trend_daily,
             proxy::cli_sync::get_cli_sync_status,
@@ -820,6 +855,8 @@ pub fn run() {
             commands::user_token::renew_user_token,
             commands::user_token::get_token_ip_bindings,
             commands::user_token::get_user_token_summary,
+            commands::user_token::get_user_token_stats,
+            commands::user_token::get_user_tokens_ranking,
             commands::query_transit_info,
             // Patch commands
             commands::patch_agy_binary,
@@ -895,3 +932,22 @@ pub fn run() {
             }
         });
 }
+
+#[cfg(unix)]
+fn ensure_cli_symlinks() {
+    if let (Some(home), Ok(current_exe)) = (dirs::home_dir(), std::env::current_exe()) {
+        let local_bin = home.join(".local/bin");
+        if !local_bin.exists() {
+            let _ = std::fs::create_dir_all(&local_bin);
+        }
+        for name in &["antigravity-tools", "at"] {
+            let link = local_bin.join(name);
+            if !link.exists() {
+                let _ = std::os::unix::fs::symlink(&current_exe, &link);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_cli_symlinks() {}

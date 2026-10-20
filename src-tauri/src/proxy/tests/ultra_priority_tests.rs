@@ -32,7 +32,7 @@ fn create_test_token(
 ) -> ProxyToken {
     let mut model_quotas = HashMap::new();
     // 模拟配额：所有支持的模型都给予相同的剩余配额
-    for m in supported_models {
+    for m in &supported_models {
         model_quotas.insert(m.to_string(), remaining_quota.unwrap_or(100));
     }
 
@@ -57,6 +57,8 @@ fn create_test_token(
         validation_url: None,
         model_quotas,
         model_limits: std::collections::HashMap::new(),
+        available_models: supported_models.iter().map(|s| s.to_lowercase()).collect(),
+        model_metadata: std::collections::HashMap::new(),
     }
 }
 

@@ -9,8 +9,8 @@
  */
 
 export interface ConcisePayloadLog {
-    input_tokens?: number;
-    output_tokens?: number;
+    input_tokens?: number | null;
+    output_tokens?: number | null;
     cached_tokens?: number | null;
     total_tokens?: number | null;
 }
