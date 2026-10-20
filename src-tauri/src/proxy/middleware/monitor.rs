@@ -2140,19 +2140,27 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-            for mapped in [
-                reported,
-                serde_json::to_value(chat_usage).unwrap(),
-                responses,
-                serde_json::to_value(claude.usage).unwrap(),
+            // Claude input_tokens 表示未缓存输入，缺少 cache 时不能由总输入反推。
+            // 原始 Gemini 总量仍由监控的物理响应捕获保存。
+            for (mapped, mapped_input) in [
+                (reported, input),
+                (serde_json::to_value(chat_usage).unwrap(), input),
+                (responses, input),
+                (
+                    serde_json::to_value(claude.usage).unwrap(),
+                    input.filter(|_| cached.is_some()),
+                ),
             ] {
                 let mut log =
                     crate::proxy::monitor::prompt_log_tests::sample_log("protocol-usage", 0);
                 super::merge_reported_usage(&mut log, &mut serde_json::Map::new(), &mapped);
-                assert_eq!(log.input_tokens, input, "mapped usage: {mapped}");
+                assert_eq!(log.input_tokens, mapped_input, "mapped usage: {mapped}");
                 assert_eq!(log.output_tokens, output, "mapped usage: {mapped}");
                 assert_eq!(log.cached_tokens, cached, "mapped usage: {mapped}");
-                assert_eq!(log.input_tokens.zip(log.output_tokens), input.zip(output));
+                assert_eq!(
+                    log.input_tokens.zip(log.output_tokens),
+                    mapped_input.zip(output)
+                );
             }
         }
     }
